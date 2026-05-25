@@ -2212,6 +2212,7 @@ async def update_user_permissions(
         my_permissions = set(current_user.permissions or [])
         my_project_perms = current_user.project_permissions or {}
         my_projects = current_user.projects or []
+        is_all_projects = len(my_projects) == 0
         
         # تطبيع أسماء المشاريع للمدير لسهولة البحث
         norm_my_projects = {normalize_arabic(p): p for p in my_projects}
@@ -2238,11 +2239,11 @@ async def update_user_permissions(
                 norm_proj = normalize_arabic(proj)
                 
                 # 1. المشروع يجب أن يكون ضمن مشاريع المستوى 2 المسموح بها (باستخدام التطبيع)
-                if norm_proj not in norm_my_projects:
+                if not is_all_projects and norm_proj not in norm_my_projects:
                     raise HTTPException(status_code=403, detail=f"لا يمكنك تعديل صلاحيات مشروع {proj} لأنه غير مسند إليك")
                 
                 # جلب اسم المشروع الأصلي كما هو عند المدير
-                original_proj_name = norm_my_projects[norm_proj]
+                original_proj_name = norm_my_projects.get(norm_proj, proj)
                 
                 # 2. التحقق من كل صلاحية داخل هذا المشروع
                 existing_proj_perms = set(existing_pp.get(proj) or [])
@@ -2252,11 +2253,11 @@ async def update_user_permissions(
                 my_perms_for_this_proj = set(current_user.permissions or []) | set(my_project_perms.get(original_proj_name) or [])
                 
                 for p in new_proj_perms:
-                    if p not in my_perms_for_this_proj:
+                    if p not in my_perms_for_this_proj and p not in my_all_perms:
                         raise HTTPException(status_code=403, detail=f"لا يمكنك منح صلاحية {p} في مشروع {proj} لأنك لا تملكها")
         
         # التحقق فقط من المشاريع الجديدة المضافة (يُسمح بإزالة أي مشروع موجود)
-        if data.projects is not None:
+        if data.projects is not None and not is_all_projects:
             new_projects = set(data.projects) - existing_projects
             norm_my_projs_set = set(norm_my_projects.keys())
             
@@ -2571,7 +2572,7 @@ async def create_report(
         "updated_at": datetime.now(timezone.utc),
         "closed_at": closed_at_dt,
         "deleted_at": None,
-        "is_deleted": {"$ne": True},
+        "is_deleted": False,
         "review_status": "قيد المراجعة",
         "reviewed_by": None,
         "reviewed_at": None
