@@ -4251,7 +4251,8 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
             
         # للمستوى الثالث العادي، يرون فقط بلاغاتهم بانتظار المراجعة
         permissions = getattr(current_user, 'permissions', [])
-        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions:
+        has_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_review:
             query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
             count = await db.reports.count_documents(query)
             return {"count": count}
@@ -4294,8 +4295,8 @@ async def get_pending_review_by_governorate(current_user: User = Depends(get_cur
         
         if current_user.role == "admin":
             query = base
-        elif not current_user.can_create_subusers:
-            # للمستوى الثالث (لا يمكنهم إنشاء مستخدمين)، يرون فقط بلاغاتهم
+        elif not current_user.can_create_subusers and not ("reports_review" in getattr(current_user, 'permissions', []) or len(get_projects_with_permission(current_user, "reports_review")) > 0):
+            # للمستوى الثالث العادي (لا يملكون صلاحية مراجعة)، يرون فقط بلاغاتهم
             query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
         else:
             # جلب المشاريع التي يملك فيها المستخدم أي صلاحية (رؤية أو مراجعة أو إضافة)
