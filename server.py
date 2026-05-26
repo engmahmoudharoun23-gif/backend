@@ -4548,8 +4548,7 @@ async def get_seen_reports(current_user: User = Depends(get_current_user)):
     يستبعد البلاغات التي حذفها المستخدم من الإشعارات
     """
     try:
-        # المشاريع التي يملك فيها المستخدم صلاحية إشعارات البلاغات
-        allowed_projects = get_projects_with_permission(current_user, "reports_notifications")
+        allowed_projects = list(set(get_projects_with_permission(current_user, "reports_notifications") + get_projects_with_permission(current_user, "reports_review")))
         
         if current_user.role != "admin" and not allowed_projects:
             return {"total": 0, "reports": []}
