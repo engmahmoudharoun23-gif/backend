@@ -5184,15 +5184,14 @@ async def update_report_review_status(
                     authorized_users.append(u.get("full_name") or u.get("username"))
             
             if authorized_users:
-                names = "، ".join(authorized_users)
                 raise HTTPException(
                     status_code=403, 
-                    detail=f"لا يمكنك المراجعة، فقط {names} لديه صلاحية مراجعة بلاغات هذا المشروع"
+                    detail="لا يمكنك المراجعه فقط م/محمود هارون مهندس نظم المعلومات وتحليل البيانات لديه صلاحيه مراجعه بلاغات هذا المشروع"
                 )
             else:
                 raise HTTPException(
                     status_code=403, 
-                    detail="ليس لديك صلاحية مراجعة بلاغات هذا المشروع - يرجى التواصل مع بيت الخبرة"
+                    detail="لا يمكنك المراجعه فقط م/محمود هارون مهندس نظم المعلومات وتحليل البيانات لديه صلاحيه مراجعه بلاغات هذا المشروع"
                 )
     
     # تحديث حالة المراجعة
