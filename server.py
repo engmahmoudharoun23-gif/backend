@@ -4049,7 +4049,13 @@ async def get_reports_last_72_hours(
                     query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
             if current_user.projects:
                 if project:
-                    if project not in current_user.projects:
+                    has_proj_perm = False
+                    for up in current_user.projects:
+                        up_kws = [k for k in up.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        p_kws = [k for k in project.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        if any(k in project for k in up_kws) or any(k in up for k in p_kws):
+                            has_proj_perm = True; break
+                    if not has_proj_perm:
                         return {"governorate": governorate, "count": 0} if governorate else []
                 else:
                     query["project"] = {"$in": current_user.projects}
@@ -4057,7 +4063,13 @@ async def get_reports_last_72_hours(
             # Level 2 and above
             if current_user.projects:
                 if project:
-                    if project not in current_user.projects:
+                    has_proj_perm = False
+                    for up in current_user.projects:
+                        up_kws = [k for k in up.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        p_kws = [k for k in project.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        if any(k in project for k in up_kws) or any(k in up for k in p_kws):
+                            has_proj_perm = True; break
+                    if not has_proj_perm:
                         return {"governorate": governorate, "count": 0} if governorate else []
                 else:
                     query["project"] = {"$in": current_user.projects}
