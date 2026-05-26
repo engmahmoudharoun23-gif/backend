@@ -4009,7 +4009,8 @@ async def get_reports_last_72_hours(
     
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
-        if not current_user.can_create_subusers:
+        permissions = getattr(current_user, 'permissions', [])
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions:
             query["created_by"] = {"$in": [current_user.id, current_user.username]}
             conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
@@ -4220,8 +4221,9 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
             count = await db.reports.count_documents(base)
             return {"count": count}
             
-        # للمستوى الثالث (لا يمكنهم إنشاء مستخدمين)، يرون فقط بلاغاتهم بانتظار المراجعة
-        if not current_user.can_create_subusers:
+        # للمستوى الثالث العادي، يرون فقط بلاغاتهم بانتظار المراجعة
+        permissions = getattr(current_user, 'permissions', [])
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions:
             query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
             count = await db.reports.count_documents(query)
             return {"count": count}
