@@ -3841,7 +3841,7 @@ async def get_reports_last_72_hours_list(
     if project:
         query["project"] = get_flexible_project_query(project)
             
-    if governorate:
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
         query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
     
     # التصفية الهرمية حسب الصلاحيات
@@ -3881,7 +3881,7 @@ async def get_reports_last_72_hours_list(
         if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
             query['created_by'] = {'$in': [current_user.id, current_user.username]}
             if not has_all_govs and user_governorates:
-                if governorate:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
                     norm_req = normalize_arabic(governorate)
                     if not any(normalize_arabic(g) == norm_req for g in user_governorates):
                         return {"reports": []}
@@ -3893,7 +3893,7 @@ async def get_reports_last_72_hours_list(
             if has_all_govs:
                 pass
             elif user_governorates:
-                if governorate:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
                     norm_req = normalize_arabic(governorate)
                     if not any(normalize_arabic(g) == norm_req for g in user_governorates):
                         return {"reports": []}
@@ -4029,7 +4029,7 @@ async def get_reports_last_72_hours(
     if project:
         conn_query["project"] = get_flexible_project_query(project)
             
-    if governorate:
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
         conn_query["area"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'} 
     
     # التصفية الهرمية حسب الصلاحيات
@@ -4040,7 +4040,7 @@ async def get_reports_last_72_hours(
             query["created_by"] = {"$in": [current_user.id, current_user.username]}
             conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
-                if governorate:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
                     norm_req = normalize_arabic(governorate)
                     if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
                         return {"governorate": governorate, "count": 0} if governorate else []
@@ -4075,7 +4075,7 @@ async def get_reports_last_72_hours(
                     query["project"] = {"$in": current_user.projects}
             
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
-                if governorate:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
                     norm_req = normalize_arabic(governorate)
                     if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
                         return {"governorate": governorate, "count": 0}
@@ -4084,7 +4084,7 @@ async def get_reports_last_72_hours(
                     query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
     
     # إذا تم تحديد محافظة، نرجع العدد مباشرة
-    if governorate:
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
         count = await db.reports.count_documents(query)
         return {"governorate": governorate, "count": count, "project": project}
     
