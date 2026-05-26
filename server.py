@@ -3646,8 +3646,21 @@ async def get_governorate_48h_counts(
     # حساب الوقت قبل 72 ساعة بالضبط
     seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
-    # بناء الاستعلام الأساسي
+    # بناء الاستعلام الأساسي مع فلتر زمني لمنع تجاوز الحد الأقصى للجلب
     query = {"is_deleted": {"$ne": True}}
+    date_query = {
+        "$or": [
+            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"created_at": {"$gte": seventy_two_hours_ago}},
+            {"added_at": {"$gte": seventy_two_hours_ago}},
+            {"added_at": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"start_date": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"start_date": {"$gte": seventy_two_hours_ago}},
+            {"report_date": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"report_date": {"$gte": seventy_two_hours_ago}}
+        ]
+    }
+    query.update(date_query)
     
     # إضافة فلتر المشروع - بحث مرن جداً بالكلمات المفتاحية
     if project:
@@ -3676,24 +3689,22 @@ async def get_governorate_48h_counts(
         
         # التصفية الهرمية
         user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
-        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
         
         # تجميع معرفات المستخدمين (المسؤول + التابعين له هرمياً)
+        # تطبيق الفلترة الهرمية الشاملة (Recursive)
         hierarchy_filter = await get_hierarchy_filter(current_user)
         
-        # تطبيق الفلترة الصارمة للمستوى 3
-        if not current_user.can_create_subusers:
-            query['created_by'] = {'$in': [current_user.id, current_user.username]}
-            if not has_all_govs and len(user_governorates) > 0:
-                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
+        if len(user_governorates) > 0:
+            gov_patterns = []
+            for g in user_governorates:
+                p = normalize_arabic_regex(g)
+                gov_patterns.append(p)
+            gov_regex = f"({'|'.join(gov_patterns)})"
+            
+            query.update(hierarchy_filter)
+            query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
         else:
-            if len(user_governorates) > 0 and not has_all_govs:
-                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                query.update(hierarchy_filter)
-                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
-            else:
-                query.update(hierarchy_filter)
+            query.update(hierarchy_filter)
     
     # تحديد ما إذا كان المشروع مخصص للتوصيلات
     is_connection_only = False
@@ -3820,8 +3831,21 @@ async def get_reports_last_72_hours_list(
     # حساب الوقت قبل 72 ساعة بالضبط
     seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
-    # بناء الاستعلام الأساسي (بدون فلتر التاريخ - سنفلتر يدوياً)
+    # بناء الاستعلام الأساسي مع فلتر زمني لمنع تجاوز الحد الأقصى للجلب
     query = {"is_deleted": {"$ne": True}}
+    date_query = {
+        "$or": [
+            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"created_at": {"$gte": seventy_two_hours_ago}},
+            {"added_at": {"$gte": seventy_two_hours_ago}},
+            {"added_at": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"start_date": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"start_date": {"$gte": seventy_two_hours_ago}},
+            {"report_date": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"report_date": {"$gte": seventy_two_hours_ago}}
+        ]
+    }
+    query.update(date_query)
     
     # إضافة فلاتر المشروع والمحافظة (مع البحث المرن)
     if project:
