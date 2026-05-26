@@ -4230,6 +4230,12 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
         if current_user.role == "admin":
             count = await db.reports.count_documents(base)
             return {"count": count}
+            
+        # للمستوى الثالث (لا يمكنهم إنشاء مستخدمين)، يرون فقط بلاغاتهم بانتظار المراجعة
+        if not current_user.can_create_subusers:
+            query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
+            count = await db.reports.count_documents(query)
+            return {"count": count}
         
         # المشاريع التي يملك فيها المستخدم صلاحية reports_review
         allowed_projects = get_projects_with_permission(current_user, "reports_review")
@@ -4269,6 +4275,9 @@ async def get_pending_review_by_governorate(current_user: User = Depends(get_cur
         
         if current_user.role == "admin":
             query = base
+        elif not current_user.can_create_subusers:
+            # للمستوى الثالث (لا يمكنهم إنشاء مستخدمين)، يرون فقط بلاغاتهم
+            query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
         else:
             # جلب المشاريع التي يملك فيها المستخدم أي صلاحية (رؤية أو مراجعة أو إضافة)
             allowed_projects = set(get_projects_with_permission(current_user, "reports_view")) | \
