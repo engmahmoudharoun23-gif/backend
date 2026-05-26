@@ -3847,6 +3847,7 @@ async def get_reports_last_72_hours_list(
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
         user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
         
         # 1. التحقق من صلاحية المشروع بمرونة
         if current_user.projects:
@@ -4042,7 +4043,8 @@ async def get_reports_last_72_hours(
                     if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
                         return {"governorate": governorate, "count": 0} if governorate else []
                 else:
-                    query["governorate"] = {"$in": current_user.governorates}
+                    gov_patterns = [normalize_arabic_regex(g) for g in current_user.governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
             if current_user.projects:
                 if project:
                     if project not in current_user.projects:
@@ -4064,7 +4066,8 @@ async def get_reports_last_72_hours(
                     if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
                         return {"governorate": governorate, "count": 0}
                 else:
-                    query["governorate"] = {"$in": current_user.governorates}
+                    gov_patterns = [normalize_arabic_regex(g) for g in current_user.governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
     
     # إذا تم تحديد محافظة، نرجع العدد مباشرة
     if governorate:
