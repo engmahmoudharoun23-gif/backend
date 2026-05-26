@@ -1362,11 +1362,22 @@ async def get_hierarchy_filter(current_user: User) -> dict:
     if has_all_govs and has_all_projects:
         return {}  # يعامل كمدير عام يرى جميع البلاغات
         
+    # بناء فلتر المحافظات
+    gov_filter = {}
+    if not has_all_govs and len(user_governorates) > 0:
+        gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+        gov_filter = {'governorate': {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}}
+        
     # المستوى الثاني (مدير منطقة/محافظة) يرى جميع بلاغات المحافظات والمشاريع المسندة إليه
     if getattr(current_user, 'can_create_subusers', False):
-        return {}
+        return gov_filter
         
-    # المستوى الثالث يرى بلاغاته فقط، نجلب معرفاته
+    # المستوى الثالث: إذا كان يمتلك صلاحية عرض البلاغات، يرى جميع البلاغات في محافظته
+    permissions = getattr(current_user, 'permissions', [])
+    if permissions and "reports_view" in permissions:
+        return gov_filter
+        
+    # المستوى الثالث العادي يرى بلاغاته فقط، نجلب معرفاته
     all_subordinate_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
     
     # تجميع كل المعرفات الممكنة (IDs و Usernames) للتوافق مع طرق التخزين المختلفة
