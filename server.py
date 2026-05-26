@@ -3676,22 +3676,24 @@ async def get_governorate_48h_counts(
         
         # التصفية الهرمية
         user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
         
         # تجميع معرفات المستخدمين (المسؤول + التابعين له هرمياً)
-        # تطبيق الفلترة الهرمية الشاملة (Recursive)
         hierarchy_filter = await get_hierarchy_filter(current_user)
         
-        if len(user_governorates) > 0:
-            gov_patterns = []
-            for g in user_governorates:
-                p = normalize_arabic_regex(g)
-                gov_patterns.append(p)
-            gov_regex = f"({'|'.join(gov_patterns)})"
-            
-            query.update(hierarchy_filter)
-            query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
+        # تطبيق الفلترة الصارمة للمستوى 3
+        if not current_user.can_create_subusers:
+            query['created_by'] = {'$in': [current_user.id, current_user.username]}
+            if not has_all_govs and len(user_governorates) > 0:
+                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
         else:
-            query.update(hierarchy_filter)
+            if len(user_governorates) > 0 and not has_all_govs:
+                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                query.update(hierarchy_filter)
+                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
+            else:
+                query.update(hierarchy_filter)
     
     # تحديد ما إذا كان المشروع مخصص للتوصيلات
     is_connection_only = False
