@@ -3858,36 +3858,21 @@ async def get_reports_last_72_hours_list(
             if u.get("username"): sub_user_ids.append(u["username"])
         all_authorized_creators = [current_user.id, current_user.username] + sub_user_ids
 
-        # 3. التحقق من صلاحية "كل المحافظات"
-        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
-        
-        if has_all_govs:
-            # يرى جميع بلاغات المشروع
-            pass
-        elif current_user.can_create_subusers:
-            if len(user_governorates) > 0:
-                gov_patterns = []
-                for g in user_governorates:
-                    p = normalize_arabic_regex(g)
-                    gov_patterns.append(p)
-                gov_regex = f"({'|'.join(gov_patterns)})"
-                
-                query['created_by'] = {'$in': all_authorized_creators}
-                query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
-            else:
-                query['created_by'] = {'$in': all_authorized_creators}
+        # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته، والمستوى الثاني يرى تبعا لهيكليته
+        if not current_user.can_create_subusers:
+            query['created_by'] = {'$in': [current_user.id, current_user.username]}
+            if not has_all_govs and user_governorates:
+                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
         else:
-            if len(user_governorates) > 0:
-                gov_patterns = []
-                for g in user_governorates:
-                    p = normalize_arabic_regex(g)
-                    gov_patterns.append(p)
-                gov_regex = f"({'|'.join(gov_patterns)})"
-                
-                query['created_by'] = {'$in': [current_user.id, current_user.username]}
-                query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
+            if has_all_govs:
+                pass
+            elif user_governorates:
+                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                query['created_by'] = {'$in': all_authorized_creators}
+                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
             else:
-                query['created_by'] = {'$in': [current_user.id, current_user.username]}
+                query['created_by'] = {'$in': all_authorized_creators}
     
     # تحديد ما إذا كان المشروع مخصص للتوصيلات
     is_connection_only = False
@@ -4022,34 +4007,46 @@ async def get_reports_last_72_hours(
     
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
-        # تصفية حسب صلاحيات المشاريع
-        if current_user.projects:
-            if project:
-                # التأكد من أن المشروع المطلوب في صلاحيات المستخدم
-                if project not in current_user.projects:
-                    return {"governorate": governorate, "count": 0} if governorate else []
-            else:
-                query["project"] = {"$in": current_user.projects}
-        
-        # تصفية حسب صلاحيات المحافظات
-        if current_user.governorates:
-            if governorate:
-                # التأكد من أن المحافظة المطلوبة في صلاحيات المستخدم
-                if governorate not in current_user.governorates:
-                    return {"governorate": governorate, "count": 0}
-            else:
-                query["governorate"] = {"$in": current_user.governorates}
+        if not current_user.can_create_subusers:
+            query["created_by"] = {"$in": [current_user.id, current_user.username]}
+            conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
+            if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
+                if governorate:
+                    if governorate not in current_user.governorates:
+                        return {"governorate": governorate, "count": 0} if governorate else []
+                else:
+                    query["governorate"] = {"$in": current_user.governorates}
+            if current_user.projects:
+                if project:
+                    if project not in current_user.projects:
+                        return {"governorate": governorate, "count": 0} if governorate else []
+                else:
+                    query["project"] = {"$in": current_user.projects}
+        else:
+            # Level 2 and above
+            if current_user.projects:
+                if project:
+                    if project not in current_user.projects:
+                        return {"governorate": governorate, "count": 0} if governorate else []
+                else:
+                    query["project"] = {"$in": current_user.projects}
             
-            # حساب إجمالي عدد المحافظات في مشاريع المستخدم
-            total_govs = await get_total_governorates_count_for_projects(current_user.projects)
-            
-            # إذا كان لديه محافظات محدودة
-            if len(current_user.governorates) < (total_govs * 0.85):
+            if current_user.governorates:
+                if governorate:
+                    if governorate not in current_user.governorates:
+                        return {"governorate": governorate, "count": 0}
+                else:
+                    query["governorate"] = {"$in": current_user.governorates}
+                
+                total_govs = await get_total_governorates_count_for_projects(current_user.projects)
+                if len(current_user.governorates) < (total_govs * 0.85) and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
+                    allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+                    query["created_by"] = {"$in": allowed_user_ids}
+                    conn_query["created_by"] = {"$in": allowed_user_ids}
+            else:
                 allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
                 query["created_by"] = {"$in": allowed_user_ids}
-        else:
-            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            query["created_by"] = {"$in": allowed_user_ids}
+                conn_query["created_by"] = {"$in": allowed_user_ids}
     
     # إذا تم تحديد محافظة، نرجع العدد مباشرة
     if governorate:
