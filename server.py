@@ -3874,18 +3874,29 @@ async def get_reports_last_72_hours_list(
         all_authorized_creators = [current_user.id, current_user.username] + sub_user_ids
 
         # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته
-        if not getattr(current_user, 'can_create_subusers', False):
+        permissions = getattr(current_user, 'permissions', [])
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions:
             query['created_by'] = {'$in': [current_user.id, current_user.username]}
             if not has_all_govs and user_governorates:
-                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
+                if governorate:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
+                        return {"reports": []}
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
         else:
             # المستوى الثاني يرى كافة البلاغات في المحافظات المسندة إليه
             if has_all_govs:
                 pass
             elif user_governorates:
-                gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
+                if governorate:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
+                        return {"reports": []}
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
     
     # تحديد ما إذا كان المشروع مخصص للتوصيلات
     is_connection_only = False
@@ -4026,7 +4037,8 @@ async def get_reports_last_72_hours(
             conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
                 if governorate:
-                    if governorate not in current_user.governorates:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
                         return {"governorate": governorate, "count": 0} if governorate else []
                 else:
                     query["governorate"] = {"$in": current_user.governorates}
@@ -4047,7 +4059,8 @@ async def get_reports_last_72_hours(
             
             if current_user.governorates:
                 if governorate:
-                    if governorate not in current_user.governorates:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
                         return {"governorate": governorate, "count": 0}
                 else:
                     query["governorate"] = {"$in": current_user.governorates}
