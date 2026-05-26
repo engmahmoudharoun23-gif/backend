@@ -1360,9 +1360,13 @@ async def get_hierarchy_filter(current_user: User) -> dict:
     has_all_projects = len(user_projects) >= 3
     
     if has_all_govs and has_all_projects:
-        return {}  # يعامل كمدير (Level 2) يرى جميع البلاغات في مشاريعه ومحافظاته
+        return {}  # يعامل كمدير عام يرى جميع البلاغات
         
-    # جلب جميع المعرفات التابعة (بما في ذلك المستخدم نفسه) بشكل تكراري
+    # المستوى الثاني (مدير منطقة/محافظة) يرى جميع بلاغات المحافظات والمشاريع المسندة إليه
+    if getattr(current_user, 'can_create_subusers', False):
+        return {}
+        
+    # المستوى الثالث يرى بلاغاته فقط، نجلب معرفاته
     all_subordinate_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
     
     # تجميع كل المعرفات الممكنة (IDs و Usernames) للتوافق مع طرق التخزين المختلفة
@@ -3858,21 +3862,19 @@ async def get_reports_last_72_hours_list(
             if u.get("username"): sub_user_ids.append(u["username"])
         all_authorized_creators = [current_user.id, current_user.username] + sub_user_ids
 
-        # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته، والمستوى الثاني يرى تبعا لهيكليته
-        if not current_user.can_create_subusers:
+        # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته
+        if not getattr(current_user, 'can_create_subusers', False):
             query['created_by'] = {'$in': [current_user.id, current_user.username]}
             if not has_all_govs and user_governorates:
                 gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
                 query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
         else:
+            # المستوى الثاني يرى كافة البلاغات في المحافظات المسندة إليه
             if has_all_govs:
                 pass
             elif user_governorates:
                 gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                query['created_by'] = {'$in': all_authorized_creators}
                 query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
-            else:
-                query['created_by'] = {'$in': all_authorized_creators}
     
     # تحديد ما إذا كان المشروع مخصص للتوصيلات
     is_connection_only = False
@@ -4037,16 +4039,6 @@ async def get_reports_last_72_hours(
                         return {"governorate": governorate, "count": 0}
                 else:
                     query["governorate"] = {"$in": current_user.governorates}
-                
-                total_govs = await get_total_governorates_count_for_projects(current_user.projects)
-                if len(current_user.governorates) < (total_govs * 0.85) and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
-                    allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-                    query["created_by"] = {"$in": allowed_user_ids}
-                    conn_query["created_by"] = {"$in": allowed_user_ids}
-            else:
-                allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-                query["created_by"] = {"$in": allowed_user_ids}
-                conn_query["created_by"] = {"$in": allowed_user_ids}
     
     # إذا تم تحديد محافظة، نرجع العدد مباشرة
     if governorate:
