@@ -3842,7 +3842,7 @@ async def get_reports_last_72_hours_list(
         query["project"] = get_flexible_project_query(project)
             
     if governorate:
-        query["governorate"] = governorate
+        query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
     
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
@@ -4015,7 +4015,7 @@ async def get_reports_last_72_hours(
         query["project"] = get_flexible_project_query(project)
             
     if governorate:
-        query["governorate"] = governorate
+        query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
         
     # استعلام التوصيلات
     conn_query = {
@@ -4028,7 +4028,7 @@ async def get_reports_last_72_hours(
         conn_query["project"] = get_flexible_project_query(project)
             
     if governorate:
-        conn_query["area"] = governorate 
+        conn_query["area"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'} 
     
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
