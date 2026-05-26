@@ -3688,10 +3688,8 @@ async def get_governorate_48h_counts(
                 gov_patterns.append(p)
             gov_regex = f"({'|'.join(gov_patterns)})"
             
-            query['$or'] = [
-                hierarchy_filter,
-                {'governorate': {'$regex': gov_regex, '$options': 'i'}}
-            ]
+            query.update(hierarchy_filter)
+            query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
         else:
             query.update(hierarchy_filter)
     
@@ -3874,10 +3872,8 @@ async def get_reports_last_72_hours_list(
                     gov_patterns.append(p)
                 gov_regex = f"({'|'.join(gov_patterns)})"
                 
-                query['$or'] = [
-                    {'created_by': {'$in': all_authorized_creators}},
-                    {'governorate': {'$regex': gov_regex, '$options': 'i'}}
-                ]
+                query['created_by'] = {'$in': all_authorized_creators}
+                query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
             else:
                 query['created_by'] = {'$in': all_authorized_creators}
         else:
@@ -3888,10 +3884,8 @@ async def get_reports_last_72_hours_list(
                     gov_patterns.append(p)
                 gov_regex = f"({'|'.join(gov_patterns)})"
                 
-                query['$or'] = [
-                    {'created_by': {'$in': [current_user.id, current_user.username]}},
-                    {'governorate': {'$regex': gov_regex, '$options': 'i'}}
-                ]
+                query['created_by'] = {'$in': [current_user.id, current_user.username]}
+                query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
             else:
                 query['created_by'] = {'$in': [current_user.id, current_user.username]}
     
@@ -8263,6 +8257,14 @@ async def export_72h_reports_excel(
                 pass
             elif not governorate:
                 query["governorate"] = {"$in": current_user.governorates}
+                
+        # إذا لم يكن يملك صلاحية إنشاء مستخدمين (المستوى الثالث)، يعرض بلاغاته فقط
+        if not current_user.can_create_subusers:
+            query["created_by"] = {"$in": [current_user.id, current_user.username]}
+        else:
+            # إذا كان مستوى ثاني، نجمع البلاغات الخاصة به وبمستخدميه
+            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+            query["created_by"] = {"$in": allowed_user_ids}
     
     # جلب البلاغات
     all_reports = await db.reports.find(query, {"_id": 0, "images": 0}).sort("created_at", -1).to_list(1000)
