@@ -4060,7 +4060,7 @@ async def get_reports_last_72_hours(
                 else:
                     query["project"] = {"$in": current_user.projects}
             
-            if current_user.governorates:
+            if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
                 if governorate:
                     norm_req = normalize_arabic(governorate)
                     if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
