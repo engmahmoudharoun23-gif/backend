@@ -3877,7 +3877,8 @@ async def get_reports_last_72_hours_list(
 
         # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته
         permissions = getattr(current_user, 'permissions', [])
-        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions:
+        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
             query['created_by'] = {'$in': [current_user.id, current_user.username]}
             if not has_all_govs and user_governorates:
                 if governorate:
@@ -4034,7 +4035,8 @@ async def get_reports_last_72_hours(
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
         permissions = getattr(current_user, 'permissions', [])
-        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions:
+        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
             query["created_by"] = {"$in": [current_user.id, current_user.username]}
             conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
