@@ -3646,21 +3646,8 @@ async def get_governorate_48h_counts(
     # حساب الوقت قبل 72 ساعة بالضبط
     seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
-    # بناء الاستعلام الأساسي مع فلتر زمني لمنع تجاوز الحد الأقصى للجلب
+    # بناء الاستعلام الأساسي 
     query = {"is_deleted": {"$ne": True}}
-    date_query = {
-        "$or": [
-            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"created_at": {"$gte": seventy_two_hours_ago}},
-            {"added_at": {"$gte": seventy_two_hours_ago}},
-            {"added_at": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"start_date": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"start_date": {"$gte": seventy_two_hours_ago}},
-            {"report_date": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"report_date": {"$gte": seventy_two_hours_ago}}
-        ]
-    }
-    query.update(date_query)
     
     # إضافة فلتر المشروع - بحث مرن جداً بالكلمات المفتاحية
     if project:
@@ -3831,21 +3818,8 @@ async def get_reports_last_72_hours_list(
     # حساب الوقت قبل 72 ساعة بالضبط
     seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
-    # بناء الاستعلام الأساسي مع فلتر زمني لمنع تجاوز الحد الأقصى للجلب
+    # بناء الاستعلام الأساسي 
     query = {"is_deleted": {"$ne": True}}
-    date_query = {
-        "$or": [
-            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"created_at": {"$gte": seventy_two_hours_ago}},
-            {"added_at": {"$gte": seventy_two_hours_ago}},
-            {"added_at": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"start_date": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"start_date": {"$gte": seventy_two_hours_ago}},
-            {"report_date": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"report_date": {"$gte": seventy_two_hours_ago}}
-        ]
-    }
-    query.update(date_query)
     
     # إضافة فلاتر المشروع والمحافظة (مع البحث المرن)
     if project:
@@ -3910,7 +3884,7 @@ async def get_reports_last_72_hours_list(
     projection = {"_id": 0, "images": 0}
 
     if category in ['reports', 'all', None]:
-        reports_list = await db.reports.find(query, projection).sort("created_at", -1).to_list(1000)
+        reports_list = await db.reports.find(query, projection).sort("created_at", -1).to_list(10000)
         all_reports.extend(reports_list)
     
     # جلب التوصيلات خلال آخر 72 ساعة (مع التحقق من مشاريع الإيصال)
