@@ -4300,14 +4300,15 @@ async def get_pending_review_by_governorate(current_user: User = Depends(get_cur
             
             query = {**base, "$or": query_parts}
         
-        # Aggregation pipeline للحصول على العدد لكل محافظة ومشروع
+        # Aggregation pipeline للحصول على العدد لكل محافظة ومشروع ومستخدم
         pipeline = [
             {"$match": query},
             {
                 "$group": {
                     "_id": {
                         "governorate": "$governorate",
-                        "project": "$project"
+                        "project": "$project",
+                        "created_by": "$created_by"
                     },
                     "count": {"$sum": 1}
                 }
@@ -4318,14 +4319,29 @@ async def get_pending_review_by_governorate(current_user: User = Depends(get_cur
         result = await db.reports.aggregate(pipeline).to_list(100)
         
         # تحويل النتيجة
-        governorate_counts = [
-            {
+        governorate_counts = []
+        for item in result:
+            if not item.get('_id'):
+                continue
+                
+            # إيجاد اسم المستخدم إذا أمكن
+            created_by = item['_id'].get('created_by')
+            created_by_name = None
+            if created_by:
+                # إذا كان معرف، نجلب الاسم
+                user_obj = await db.users.find_one({"$or": [{"id": created_by}, {"username": created_by}]})
+                if user_obj:
+                    created_by_name = user_obj.get("full_name") or user_obj.get("username")
+                else:
+                    created_by_name = str(created_by)
+                    
+            governorate_counts.append({
                 "governorate": item['_id'].get('governorate', 'غير محدد'), 
                 "project": item['_id'].get('project', 'غير محدد'),
+                "created_by": created_by,
+                "created_by_name": created_by_name,
                 "count": item['count']
-            } 
-            for item in result if item['_id']
-        ]
+            })
         
         return {"data": governorate_counts, "total": sum(item['count'] for item in governorate_counts)}
         
