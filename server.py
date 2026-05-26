@@ -14352,9 +14352,7 @@ async def get_deleted_items(
     # فقط العناصر المحذوفة حديثاً (التي تحتوي على deleted_by)
     base_query = {"is_deleted": True, "deleted_by": {"$exists": True}}
     if current_user.role != "admin":
-        user_projects = current_user.projects or []
-        if user_projects:
-            base_query["$or"] = [{"project": {"$in": user_projects}}, {"deleted_by": current_user.id}]
+        base_query["deleted_by"] = current_user.id
     
     items = []
     skip = (page - 1) * limit
