@@ -494,6 +494,7 @@ ALL_PERMISSIONS = [
     {"key": "business_reports_edit", "label": "تعديل تقرير الأعمال", "group": "التقارير"},
     {"key": "business_reports_delete", "label": "حذف تقرير الأعمال", "group": "التقارير"},
     {"key": "business_reports_review", "label": "مراجعة تقارير الأعمال", "group": "التقارير"},
+    {"key": "consultant_close", "label": "إغلاق الرخصة بواسطة الاستشاري", "group": "البلاغات"},
 ]
 
 
@@ -509,7 +510,7 @@ PROJECT_SCOPED_PERMISSIONS = {
     "contractors", "projects", "users_manage", "team", "project_settings",
     "cars", "cars_manage", "fleet_maintenance", "hr_management",
     "dashboard", "trash", "settings", "support_messages",
-    "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review"
+    "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close"
 }
 
 
