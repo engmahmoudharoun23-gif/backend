@@ -3277,6 +3277,150 @@ async def delete_governorate(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@api_router.get("/dashboard/init-all")
+async def dashboard_init_all(
+    month: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    from datetime import datetime as dt
+    
+    # 1. Determine allowed projects
+    if current_user.role == "admin":
+        allowed_projects = [] # Admin gets all projects dynamically from DB
+        try:
+            projects_cursor = db.projects.find({"is_deleted": {"$ne": True}})
+            async for p in projects_cursor:
+                if "name" in p:
+                    allowed_projects.append(p["name"])
+        except Exception:
+            pass
+    else:
+        allowed_projects = list(set((getattr(current_user, 'projects', []) or []) + (getattr(current_user, 'assigned_projects', []) or [])))
+
+    # 2. Build filters
+    query_filter = {"is_deleted": {"$ne": True}}
+    hierarchy_filter = await get_hierarchy_filter(current_user)
+    query_filter.update(hierarchy_filter)
+    
+    if current_user.role != "admin" and allowed_projects:
+        query_filter.update(get_flexible_in_query(allowed_projects, "project"))
+
+    if month:
+        year, month_num = month.split('-')
+        date_from_obj = dt(int(year), int(month_num), 1, 0, 0, 0)
+        if int(month_num) == 12:
+            date_to_obj = dt(int(year) + 1, 1, 1, 0, 0, 0)
+        else:
+            date_to_obj = dt(int(year), int(month_num) + 1, 1, 0, 0, 0)
+            
+        start_str = f"{month}-01T00:00:00"
+        end_str = date_to_obj.strftime("%Y-%m-%dT00:00:00")
+        
+        date_filter = {
+            "$or": [
+                {"created_at": {"$gte": start_str, "$lt": end_str}},
+                {"created_at": {"$gte": date_from_obj, "$lt": date_to_obj}}
+            ]
+        }
+        if "$or" in query_filter:
+            query_filter["$and"] = [{"$or": query_filter.pop("$or")}, date_filter]
+        else:
+            query_filter.update(date_filter)
+
+    # 3. Aggregate Reports with single $group
+    pipeline = [
+        {'$match': query_filter},
+        {
+            '$group': {
+                '_id': {'project': '$project', 'report_type': '$report_type'},
+                'total': {'$sum': 1},
+                'fixed': {'$sum': {'$cond': [{'$eq': ['$status', 'تم الإصلاح']}, 1, 0]}},
+                'asphalt_remaining': {'$sum': {'$cond': [{'$in': ['$status', ['بانتظار الأسفلت', 'تم الإصلاح-بانتظار الأسفلت']]}, 1, 0]}},
+                'licensed': {'$sum': {'$cond': [{'$regexMatch': {'input': {'$ifNull': ['$license_number', '']}, 'regex': '[0-9]'}}, 1, 0]}},
+                'unlicensed': {'$sum': {'$cond': [{'$not': {'$regexMatch': {'input': {'$ifNull': ['$license_number', '']}, 'regex': '[0-9]'}}}, 1, 0]}},
+            }
+        }
+    ]
+    
+    grouped_results = await db.reports.aggregate(pipeline).to_list(None)
+    
+    # 4. Aggregate Connections
+    conn_filter = query_filter.copy()
+    conn_pipeline = [
+        {'$match': conn_filter},
+        {'$group': {'_id': '$project', 'count': {'$sum': 1}}}
+    ]
+    conn_results = await db.connections.aggregate(conn_pipeline).to_list(None)
+    
+    # Process results into output format
+    projects_data = {}
+    
+    for g in grouped_results:
+        proj = g.get('_id', {}).get('project', '')
+        if not proj: continue
+        if proj not in projects_data:
+            projects_data[proj] = {
+                'total': 0, 'fixed': 0, 'asphalt_remaining': 0,
+                'licensed': 0, 'unlicensed': 0,
+                'tile_licensed': 0, 'tile_unlicensed': 0,
+                'terrestrial_licensed': 0, 'terrestrial_unlicensed': 0,
+                'terrestrial': 0, 'tile': 0, 'asphalt': 0,
+                'by_type': {}, 'connections': 0, 'cards': []
+            }
+            if current_user.role == "admin" and proj not in allowed_projects:
+                allowed_projects.append(proj)
+                
+        p_data = projects_data[proj]
+        rtype = g.get('_id', {}).get('report_type', '')
+        
+        t = g.get('total', 0)
+        p_data['total'] += t
+        p_data['fixed'] += g.get('fixed', 0)
+        p_data['asphalt_remaining'] += g.get('asphalt_remaining', 0)
+        
+        if rtype:
+            p_data['by_type'][rtype] = t
+            
+        is_asphalt = rtype in ['أسفلت', 'اسفلت', 'asphalt', 'Asphalt']
+        is_tile = rtype in ['بلاط', 'tile', 'Tile']
+        is_terr = rtype in ['ترابي', 'terrestrial', 'Terrestrial']
+        
+        if is_asphalt:
+            p_data['asphalt'] += t
+            p_data['licensed'] += g.get('licensed', 0)
+            p_data['unlicensed'] += g.get('unlicensed', 0)
+        elif is_tile:
+            p_data['tile'] += t
+            p_data['tile_licensed'] += g.get('licensed', 0)
+            p_data['tile_unlicensed'] += g.get('unlicensed', 0)
+        elif is_terr:
+            p_data['terrestrial'] += t
+            p_data['terrestrial_licensed'] += g.get('licensed', 0)
+            p_data['terrestrial_unlicensed'] += g.get('unlicensed', 0)
+
+    for c in conn_results:
+        proj = c.get('_id', '')
+        if not proj: continue
+        if proj in projects_data:
+            projects_data[proj]['connections'] = c.get('count', 0)
+        else:
+            projects_data[proj] = {
+                'total': 0, 'fixed': 0, 'asphalt_remaining': 0,
+                'licensed': 0, 'unlicensed': 0,
+                'tile_licensed': 0, 'tile_unlicensed': 0,
+                'terrestrial_licensed': 0, 'terrestrial_unlicensed': 0,
+                'terrestrial': 0, 'tile': 0, 'asphalt': 0,
+                'by_type': {}, 'connections': c.get('count', 0), 'cards': []
+            }
+            if current_user.role == "admin" and proj not in allowed_projects:
+                allowed_projects.append(proj)
+
+    return {
+        "allowed_projects": allowed_projects,
+        "projects": projects_data
+    }
+
 @api_router.get("/reports/stats")
 async def get_reports_stats(
     project: Optional[str] = Query(None),
@@ -3608,59 +3752,23 @@ async def get_governorate_48h_counts(
     current_user: User = Depends(get_current_user)
 ):
     """جلب عدد البلاغات لكل محافظة في آخر 72 ساعة بناءً على timestamp"""
-    # جلب جميع المحافظات المتاحة للمستخدم لضمان ظهورها جميعاً حتى لو كان العدد 0
-    available_govs = []
-    try:
-        # جلب المحافظات من قاعدة البيانات
-        custom_govs = await db.project_governorates.find({}, {"_id": 0}).to_list(2000)
-        
-        # دمج المحافظات المخصصة
-        all_possible_govs = {}
-        for c in custom_govs:
-            p = c.get('project')
-            n = c.get('name')
-            if p and n:
-                if p not in all_possible_govs: all_possible_govs[p] = []
-                if n not in all_possible_govs[p]: all_possible_govs[p].append(n)
-        
-        # تحديد المشاريع المستهدفة بناءً على فلتر المستخدم وصلاحياته
-        target_projects = []
-        if current_user.role == "admin":
-            if project: target_projects = [project]
-            else: target_projects = list(all_possible_govs.keys())
-        else:
-            if project: target_projects = [project]
-            else: target_projects = current_user.projects or []
-            
-        for tp in target_projects:
-            # مطابقة مرنة للمشروع
-            for p_key, p_govs in all_possible_govs.items():
-                if tp == p_key or (project and tp in p_key):
-                    for g in p_govs:
-                        # التحقق من صلاحيات المحافظة للمستوى 3
-                        if current_user.role == "admin" or not current_user.governorates or g in current_user.governorates:
-                            if (g, p_key) not in available_govs:
-                                available_govs.append((g, p_key))
-    except Exception as e:
-        import logging
-        logging.error(f"Error building available govs list: {str(e)}")
-
-    from datetime import timedelta, datetime
+    start_time = None
+    end_time = None
     
-    # حساب الوقت المرجعي (الآن أو التاريخ المختار)
     if base_date:
         try:
             base_dt = datetime.fromisoformat(base_date.replace('Z', '+00:00'))
             if base_dt.tzinfo:
                 base_dt = base_dt.replace(tzinfo=None)
-            reference_time = base_dt
+            start_time = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_time = base_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
         except:
-            reference_time = datetime.utcnow()
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(hours=72)
     else:
-        reference_time = datetime.utcnow()
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=72)
 
-    # حساب الوقت قبل 72 ساعة بالضبط
-    seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
     # بناء الاستعلام الأساسي 
     query = {"is_deleted": {"$ne": True}}
@@ -3791,7 +3899,7 @@ async def get_governorate_48h_counts(
             report_date = added_at.replace(tzinfo=None) if added_at.tzinfo else added_at
         
         # التحقق من أن التاريخ ضمن 72 ساعة
-        if report_date and report_date >= seventy_two_hours_ago:
+        if report_date and start_time <= report_date <= end_time:
             key = (governorate, project_val)
             group_counts[key] = group_counts.get(key, 0) + 1
     
@@ -3818,21 +3926,23 @@ async def get_reports_last_72_hours_list(
 ):
     """جلب قائمة البلاغات خلال آخر 72 ساعة (بناءً على created_at timestamp)"""
     from datetime import timedelta, datetime
+    start_time = None
+    end_time = None
     
-    # حساب الوقت المرجعي
     if base_date:
         try:
             base_dt = datetime.fromisoformat(base_date.replace('Z', '+00:00'))
             if base_dt.tzinfo:
                 base_dt = base_dt.replace(tzinfo=None)
-            reference_time = base_dt
+            start_time = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_time = base_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
         except:
-            reference_time = datetime.utcnow()
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(hours=72)
     else:
-        reference_time = datetime.utcnow()
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=72)
 
-    # حساب الوقت قبل 72 ساعة بالضبط
-    seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
     # بناء الاستعلام الأساسي 
     query = {"is_deleted": {"$ne": True}}
@@ -3972,7 +4082,7 @@ async def get_reports_last_72_hours_list(
         if not report_date and isinstance(added_at, datetime):
             report_date = added_at.replace(tzinfo=None) if added_at.tzinfo else added_at
         
-        if report_date and report_date >= seventy_two_hours_ago:
+        if report_date and start_time <= report_date <= end_time:
             reports.append(report)
     
     # معالجة التواريخ للإرجاع
