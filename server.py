@@ -3910,7 +3910,7 @@ async def get_governorate_48h_counts(
     ]
     
     # إخفاء المحافظات التي عددها 0 لتقليل الزحام دائماً
-    result = [r for r in result if r['count'] > 0]
+    # result = [r for r in result if r['count'] > 0] # Removed as per user request to show 0 counts
         
     result.sort(key=lambda x: x['count'], reverse=True)
     return result
