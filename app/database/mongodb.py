@@ -7,7 +7,7 @@ load_dotenv()
 
 # MongoDB Configuration
 MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
-DB_NAME = os.environ.get("DB_NAME", "reports_db")
+DB_NAME = os.environ.get("DB_NAME", "wfm_reports")
 
 # MongoDB Client
 client = AsyncIOMotorClient(MONGO_URL)

@@ -66,7 +66,7 @@ async def toggle_active(user_id: str, current_user: User = Depends(get_current_u
 @router.put("/{user_id}/permissions")
 async def update_permissions(user_id: str, permissions_data: PermissionsUpdate, current_user: User = Depends(get_current_user)):
     """تحديث صلاحيات المستخدم"""
-    user = await update_user_permissions(user_id, permissions_data.permissions)
+    user = await update_user_permissions(user_id, permissions_data.model_dump(exclude_unset=True))
     if not user:
         raise HTTPException(status_code=404, detail="المستخدم غير موجود")
     return {"message": "تم تحديث الصلاحيات بنجاح"}

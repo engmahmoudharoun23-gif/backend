@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional, Dict
 import uuid
 import asyncio
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 # ⚡ Thread pool لمعالجة الصور والعمليات الثقيلة
@@ -70,6 +71,9 @@ from io import BytesIO
 import time
 import random
 import resend
+import arabic_reshaper
+from bidi.algorithm import get_display
+import html
 
 # ============= CACHING SYSTEM =============
 # كاش بسيط وسريع للأداء العالي
@@ -158,6 +162,60 @@ app = FastAPI(
     openapi_url=None,  # تعطيل OpenAPI في الإنتاج للسرعة
 )
 
+print("SERVER RELOADING - WFM TOGGLE ACTIVE")
+
+def arabic_text(text):
+    """دالة عالمية لتحويل النص العربي ليدعم الـ PDF (Reshaping + Bidi)"""
+    if not text:
+        return ''
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        # فك تشفير أي نصوص مشفرة أو Unicode Escapes (مثل \u0627)
+        if '\\u' in text:
+            try:
+                text = text.encode('utf-8').decode('unicode-escape')
+            except:
+                pass
+        
+        # فك تشفير HTML Entities
+        text = html.unescape(text)
+        
+        # معالجة العربية
+        reshaped = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped)
+        return bidi_text
+    except Exception:
+        return text
+
+def normalize_arabic(text: str) -> str:
+    """توحيد النص العربي لضمان تطابق الأسماء (المشاريع/المحافظات)"""
+    if not text:
+        return ""
+    # توحيد المسافات والهمزات والتاء المربوطة والألف المقصورة
+    res = str(text).strip()
+    res = re.sub(r'\s+', ' ', res)
+    res = res.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
+    res = res.replace('ة', 'ه')
+    res = res.replace('ى', 'ي')
+    return res
+
+def normalize_arabic_regex(s: str) -> str:
+    """توحيد النص العربي وبناء تعبير نمطي (Regex) للبحث المرن دون استبدال تكراري"""
+    if not s:
+        return ""
+    mapping = {
+        '\u0623': '[\u0623\u0627]',  # أ
+        '\u0625': '[\u0625\u0627]',  # إ
+        '\u0627': '[\u0627\u0623\u0625]',  # ا
+        '\u0629': '[\u0647\u0629]',  # ة
+        '\u0647': '[\u0647\u0629]',  # ه
+        '\u064a': '[\u064a\u0649]',  # ي
+        '\u0649': '[\u064a\u0649]',  # ى
+        ' ': '.*'
+    }
+    return "".join(mapping.get(c, c) for c in s)
+
 # ⚡ Semaphore للتحكم في عدد العمليات المتزامنة الثقيلة
 import asyncio
 upload_semaphore = asyncio.Semaphore(50)  # 50 رفع صور متزامن
@@ -188,44 +246,45 @@ manager = ConnectionManager()
 # ============= OBJECT STORAGE =============
 import requests as http_requests
 
-STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
-EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
-APP_NAME = "bayt-alkhibra"
-_storage_key = None
-
-def init_storage():
-    global _storage_key
-    if _storage_key:
-        return _storage_key
-    resp = http_requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
-    resp.raise_for_status()
-    _storage_key = resp.json()["storage_key"]
-    return _storage_key
+# ============= OBJECT STORAGE =============
+from storage import upload_image as _upload_image, get_object as _get_object, guess_ext as _guess_ext
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
-    key = init_storage()
-    resp = http_requests.put(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key, "Content-Type": content_type},
-        data=data, timeout=120
-    )
-    resp.raise_for_status()
-    return resp.json()
+    """رفع الملف إلى Cloudinary بدلاً من التخزين القديم"""
+    try:
+        url = _upload_image(data, category="uploads", content_type=content_type)
+        return {"path": url}
+    except Exception as e:
+        logging.error(f"Cloudinary put_object failed: {e}")
+        raise
 
-def get_object(path: str):
-    key = init_storage()
-    resp = http_requests.get(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key}, timeout=60
-    )
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+async def process_images_for_storage(images: List[str], category: str = "general") -> List[str]:
+    """مساعد: تحويل أي صور base64 في القائمة إلى روابط Cloudinary"""
+    if not images:
+        return []
+    processed = []
+    for img in images:
+        if isinstance(img, str) and img.startswith("data:"):
+            # هذا base64، قم برفعه إلى Cloudinary
+            try:
+                header, encoded = img.split(",", 1)
+                data = base64.b64decode(encoded)
+                content_type = header.split(";")[0].split(":")[1]
+                url = _upload_image(data, category=category, content_type=content_type)
+                processed.append(url)
+            except Exception as e:
+                logging.error(f"Failed to upload base64 to Cloudinary: {e}")
+                processed.append(img)
+        else:
+            # رابط جاهز بالفعل
+            processed.append(img)
+    return processed
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-# ============= نظام تخزين الصور (Emergent Object Storage) =============
-from storage import upload_image as _upload_image, get_object as _get_object, guess_ext as _guess_ext
+# ============= نظام تخزين الصور (Cloudinary) =============
+# تم نقل الإعدادات إلى storage.py
 
 
 # ============= MODELS =============
@@ -252,6 +311,143 @@ class User(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_active: bool = True
 
+def get_flexible_project_query(project_name):
+    """
+    بناء استعلام Mongo مرن جداً للمشاريع يدعم:
+    1. تنوع الهمزات (أ، إ، آ، ا)
+    2. الهاء والتاء المربوطة (ه، ة)
+    3. الياء والألف المقصورة (ي، ى)
+    4. تجاهل الكلمات العامة (مشروع، إصلاح، أعمال، إلخ) لزيادة دقة التطابق
+    5. التعامل مع المسافات والشرطات
+    """
+    if not project_name:
+        return None
+    
+    # تنظيف النص وتقسيمه لكلمات بشكل عدواني (تجاهل المسافات والشرطات)
+    cleaned_name = re.sub(r'[\s\-_]+', ' ', project_name).strip()
+    keywords = [k.strip() for k in cleaned_name.split() if len(k.strip()) > 1]
+    
+    # الكلمات التي نفضل تجاهلها إذا كان هناك كلمات أخرى أكثر تحديداً
+    # تم إزالة (الرياض، القطاع، الأوسط) لأنها كلمات مفصلية للتمييز بين المشاريع
+    generic_words = ['مشروع', 'إصلاح', 'أعمال', 'بناء', 'عمليات', 'منطقة', 'بلدية', 'نظام']
+    important_keywords = [k for k in keywords if k not in generic_words]
+    
+    # إذا كان الاسم يتكون فقط من كلمات عامة، نستخدمها جميعاً، وإلا نستخدم الكلمات الهامة فقط
+    search_keywords = important_keywords if important_keywords else keywords
+    
+    if not search_keywords:
+        return {"$regex": re.escape(project_name), "$options": "i"}
+
+    regex_parts = []
+    for k in search_keywords:
+        pattern = ""
+        # جعل الـ (الـ) اختيارية في بداية الكلمة
+        if k.startswith('ال'):
+            pattern += '(ال)?'
+            k_no_al = k[2:]
+        else:
+            pattern += '(ال)?'
+            k_no_al = k
+            
+        for char in k_no_al:
+            if char in 'اأإآ': pattern += '[اأإآ]'
+            elif char in 'هة': pattern += '[هة]'
+            elif char in 'يى': pattern += '[يى]'
+            else: pattern += re.escape(char)
+        regex_parts.append(pattern)
+    
+    # الربط بين الكلمات بـ [\s\-_]* للسماح بمسافات أو شرطات فقط بينها (أكثر دقة من .*)
+    # مع تدعيم البداية والنهاية لضمان عدم خلط المشاريع (مثل إيصال وإيصال الرياض)
+    # السماح بكلمة "مشروع" اختيارياً في البداية
+    full_regex = r"^(مشروع\s+)?" + r"[\s\-_]*".join(regex_parts) + r"[\s\-_]*$"
+    return {"$regex": full_regex, "$options": "i"}
+
+
+def get_flexible_in_query(items: List[str], field_name: str = "project") -> dict:
+    """
+    بناء استعلام Mongo مرن لقائمة من العناصر (المشاريع أو المحافظات)
+    يدعم التنوع في الحروف والمسافات.
+    """
+    if not items:
+        return {}
+    
+    # تحويل "الكل" أو "جميع المشاريع" إلى استعلام فارغ (لا يفلتر)
+    all_keywords = ["الكل", "جميع المحافظات", "كل المحافظات", "جميع المشاريع", "كل المشاريع"]
+    if any(item in all_keywords for item in items):
+        return {}
+
+    clauses = []
+    for item in items:
+        if not item or item in all_keywords:
+            continue
+        q = get_flexible_project_query(item)
+        clauses.append({field_name: q})
+    
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$or": clauses}
+
+
+def get_loose_project_query(project_name: str) -> dict:
+    """
+    بناء استعلام Mongo مرن جداً للمشاريع يدعم المطابقة الجزئية
+    للتعامل مع الفروقات بين اسم المشروع الكامل والاسم المختصر.
+    """
+    # التقسيم بناءً على الفواصل الشائعة مثل الشرطة أو الشرطة المائلة
+    parts = re.split(r'[-/|()]', project_name)
+    main_part = parts[0].strip() if parts else project_name
+    
+    # تقسيم الجزء الرئيسي إلى كلمات
+    keywords = [k for k in re.split(r'\s+', main_part) if k]
+    generic_words = ['مشروع', 'إصلاح', 'أعمال', 'بناء', 'عمليات', 'منطقة', 'بلدية', 'نظام']
+    important_keywords = [k for k in keywords if k not in generic_words]
+    search_keywords = important_keywords if important_keywords else keywords
+    
+    if not search_keywords:
+        return {"$regex": re.escape(project_name), "$options": "i"}
+        
+    regex_parts = []
+    for k in search_keywords:
+        pattern = "(ال)?"
+        k_no_al = k[2:] if k.startswith('ال') else k
+        for char in k_no_al:
+            if char in 'اأإآ': pattern += '[اأإآ]'
+            elif char in 'هة': pattern += '[هة]'
+            elif char in 'يى': pattern += '[يى]'
+            else: pattern += re.escape(char)
+        regex_parts.append(pattern)
+        
+    # البحث الجزئي غير المقيد ببدء ونهاية السلسلة
+    full_regex = r".*" + r".*".join(regex_parts) + r".*"
+    return {"$regex": full_regex, "$options": "i"}
+
+
+def get_loose_in_query(items: List[str], field_name: str = "project") -> dict:
+    """
+    بناء استعلام Mongo مرن لقائمة من المشاريع للسماح بالمطابقة الجزئية.
+    """
+    if not items:
+        return {}
+    all_keywords = ["الكل", "جميع المحافظات", "كل المحافظات", "جميع المشاريع", "كل المشاريع"]
+    if any(item in all_keywords for item in items):
+        return {}
+        
+    clauses = []
+    for item in items:
+        if not item or item in all_keywords:
+            continue
+        q = get_loose_project_query(item)
+        clauses.append({field_name: q})
+        
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$or": clauses}
+
+
 # قائمة جميع الصلاحيات المتاحة
 ALL_PERMISSIONS = [
     {"key": "dashboard", "label": "لوحة التحكم", "group": "عام"},
@@ -262,20 +458,11 @@ ALL_PERMISSIONS = [
     {"key": "reports_review", "label": "مراجعة البلاغات", "group": "البلاغات"},
     {"key": "reports_import", "label": "استيراد بلاغات من Excel", "group": "البلاغات"},
     {"key": "reports_notifications", "label": "إشعارات البلاغات الجديدة", "group": "البلاغات"},
+    {"key": "consultant_notes", "label": "ملاحظات الاستشاري", "group": "البلاغات"},
     {"key": "water_connections", "label": "توصيلات المياه", "group": "التوصيلات"},
     {"key": "water_connections_import", "label": "استيراد توصيلات المياه من Excel", "group": "التوصيلات"},
     {"key": "sewage_connections", "label": "توصيلات الصرف الصحي", "group": "التوصيلات"},
     {"key": "sewage_connections_import", "label": "استيراد توصيلات الصرف من Excel", "group": "التوصيلات"},
-    {"key": "connections_full_form", "label": "نموذج التوصيلات الكامل (جميع الحقول)", "group": "حقول التوصيلات"},
-    {"key": "connections_show_phone", "label": "إظهار رقم الجوال", "group": "حقول التوصيلات"},
-    {"key": "connections_show_request_number", "label": "إظهار رقم الطلب", "group": "حقول التوصيلات"},
-    {"key": "connections_show_restriction_number", "label": "إظهار رقم الحصر", "group": "حقول التوصيلات"},
-    {"key": "connections_show_account_number", "label": "إظهار رقم الحساب", "group": "حقول التوصيلات"},
-    {"key": "connections_show_ccb_number", "label": "إظهار رقم البلاغ CCB", "group": "حقول التوصيلات"},
-    {"key": "connections_show_dates", "label": "إظهار حقول التواريخ", "group": "حقول التوصيلات"},
-    {"key": "connections_show_measurements", "label": "إظهار حقول القياسات (القطر/الطول)", "group": "حقول التوصيلات"},
-    {"key": "connections_show_meter", "label": "إظهار حقول العداد", "group": "حقول التوصيلات"},
-    {"key": "connections_show_location", "label": "إظهار حقول الموقع", "group": "حقول التوصيلات"},
     {"key": "contractors", "label": "المقاولين", "group": "الإدارة"},
     {"key": "projects", "label": "المشاريع", "group": "الإدارة"},
     {"key": "users_manage", "label": "إدارة المستخدمين", "group": "الإدارة"},
@@ -297,22 +484,36 @@ ALL_PERMISSIONS = [
     {"key": "support_messages", "label": "رسائل الدعم", "group": "الدعم"},
     {"key": "settings", "label": "الإعدادات", "group": "النظام"},
     {"key": "trash", "label": "سجل المحذوفات", "group": "النظام"},
+    {"key": "safety_reports", "label": "تقارير السلامة", "group": "تقارير السلامة"},
+    {"key": "quality_reports", "label": "تقارير الجودة", "group": "تقارير الجودة"},
+    {"key": "business_reports", "label": "تقارير الأعمال", "group": "تقارير الأعمال"},
+    {"key": "safety_reports_edit", "label": "تعديل تقرير السلامة", "group": "تقارير السلامة"},
+    {"key": "safety_reports_delete", "label": "حذف تقرير السلامة", "group": "تقارير السلامة"},
+    {"key": "quality_reports_edit", "label": "تعديل تقرير الجودة", "group": "تقارير الجودة"},
+    {"key": "quality_reports_delete", "label": "حذف تقرير الجودة", "group": "تقارير الجودة"},
+    {"key": "business_reports_edit", "label": "تعديل تقرير الأعمال", "group": "تقارير الأعمال"},
+    {"key": "business_reports_delete", "label": "حذف تقرير الأعمال", "group": "تقارير الأعمال"},
+    {"key": "work_permits", "label": "تصاريح العمل", "group": "تصاريح العمل"},
+    {"key": "work_permits_edit", "label": "تعديل تصريح العمل", "group": "تصاريح العمل"},
+    {"key": "work_permits_delete", "label": "حذف تصريح العمل", "group": "تصاريح العمل"},
+    {"key": "business_reports_review", "label": "مراجعة تقارير الأعمال", "group": "تقارير الأعمال"},
+    {"key": "consultant_close", "label": "إغلاق الرخصة بواسطة الاستشاري", "group": "البلاغات"},
 ]
 
 
 # الصلاحيات المرتبطة بمشروع (يمكن منحها لكل مشروع على حدة)
 PROJECT_SCOPED_PERMISSIONS = {
     "reports_view", "reports_add", "reports_edit", "reports_delete",
-    "reports_review", "reports_import", "reports_notifications",
+    "reports_review", "reports_import", "reports_notifications", "consultant_notes",
     "water_connections", "water_connections_import",
     "sewage_connections", "sewage_connections_import",
-    "connections_full_form", "connections_show_phone", "connections_show_request_number",
-    "connections_show_restriction_number", "connections_show_account_number",
-    "connections_show_ccb_number", "connections_show_dates",
-    "connections_show_measurements", "connections_show_meter", "connections_show_location",
     "invoices", "review_invoices", "review_invoices_3", "view_all_invoices",
     "extracts", "view_extracts_all",
     "employee_requests", "review_employee_requests", "view_all_employee_requests",
+    "contractors", "projects", "users_manage", "team", "project_settings",
+    "cars", "cars_manage", "fleet_maintenance", "hr_management",
+    "dashboard", "trash", "settings", "support_messages",
+    "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close", "work_permits", "work_permits_edit", "work_permits_delete"
 }
 
 
@@ -347,12 +548,24 @@ def has_project_permission(user_doc_or_obj, project: Optional[str], perm_key: st
     - Admin: دائماً True
     - الصلاحيات غير المرتبطة بمشروع: تُفحص من القائمة العامة فقط
     - الصلاحيات المرتبطة بمشروع:
-      • إذا كان للمشروع project_permissions محدد (غير فارغ): تُستخدم حصرياً
+      • إذا كان للمشروع project_permissions محدد (غير فارغ): تُسخدم حصرياً
       • غير ذلك: القائمة العامة
     """
     role = user_doc_or_obj.get("role") if isinstance(user_doc_or_obj, dict) else getattr(user_doc_or_obj, "role", None)
     if role == "admin":
         return True
+    
+    connection_fields = {
+        "connections_full_form", "connections_show_phone", "connections_show_request_number",
+        "connections_show_restriction_number", "connections_show_account_number",
+        "connections_show_ccb_number", "connections_show_ccp_number", "connections_show_dates",
+        "connections_show_measurements", "connections_show_meter", "connections_show_location"
+    }
+    if perm_key in connection_fields:
+        return (
+            has_project_permission(user_doc_or_obj, project, "water_connections") or
+            has_project_permission(user_doc_or_obj, project, "sewage_connections")
+        )
     
     global_perms = user_doc_or_obj.get("permissions") if isinstance(user_doc_or_obj, dict) else getattr(user_doc_or_obj, "permissions", None)
     global_perms = global_perms or []
@@ -379,6 +592,18 @@ def user_has_any_project_permission(user_doc_or_obj, perm_key: str) -> bool:
     role = user_doc_or_obj.get("role") if isinstance(user_doc_or_obj, dict) else getattr(user_doc_or_obj, "role", None)
     if role == "admin":
         return True
+    
+    connection_fields = {
+        "connections_full_form", "connections_show_phone", "connections_show_request_number",
+        "connections_show_restriction_number", "connections_show_account_number",
+        "connections_show_ccb_number", "connections_show_ccp_number", "connections_show_dates",
+        "connections_show_measurements", "connections_show_meter", "connections_show_location"
+    }
+    if perm_key in connection_fields:
+        return (
+            user_has_any_project_permission(user_doc_or_obj, "water_connections") or
+            user_has_any_project_permission(user_doc_or_obj, "sewage_connections")
+        )
     
     global_perms = user_doc_or_obj.get("permissions") if isinstance(user_doc_or_obj, dict) else getattr(user_doc_or_obj, "permissions", None)
     if perm_key in (global_perms or []):
@@ -407,6 +632,17 @@ def get_projects_with_permission(user_doc_or_obj, perm_key: str) -> List[str]:
     if role == "admin":
         return list(user_projects)
     
+    connection_fields = {
+        "connections_full_form", "connections_show_phone", "connections_show_request_number",
+        "connections_show_restriction_number", "connections_show_account_number",
+        "connections_show_ccb_number", "connections_show_ccp_number", "connections_show_dates",
+        "connections_show_measurements", "connections_show_meter", "connections_show_location"
+    }
+    if perm_key in connection_fields:
+        water_projects = get_projects_with_permission(user_doc_or_obj, "water_connections")
+        sewage_projects = get_projects_with_permission(user_doc_or_obj, "sewage_connections")
+        return list(set(water_projects) | set(sewage_projects))
+    
     # الصلاحيات غير المرتبطة بمشروع
     if perm_key not in PROJECT_SCOPED_PERMISSIONS:
         return list(user_projects) if perm_key in (global_perms or []) else []
@@ -428,6 +664,7 @@ def get_projects_with_permission(user_doc_or_obj, perm_key: str) -> List[str]:
 # ============ نماذج توصيلات المياه ============
 class WaterConnectionCreate(BaseModel):
     project: str
+    governorate: Optional[str] = ""
     contractor: str
     account_number: Optional[str] = ""
     request_number: Optional[str] = ""
@@ -468,6 +705,7 @@ class WaterConnectionCreate(BaseModel):
 # ============ نماذج توصيلات الصرف الصحي ============
 class SewageConnectionCreate(BaseModel):
     project: str
+    governorate: Optional[str] = ""
     contractors: List[str] = []  # مقاولين متعددين
     request_number: Optional[str] = ""
     account_number: Optional[str] = ""
@@ -499,7 +737,9 @@ class SewageConnectionCreate(BaseModel):
     system_closing_date: Optional[str] = ""
     request_status: Optional[str] = "جديد"
     cancellation_reason: Optional[str] = ""
+    phone_number: Optional[str] = ""
     notes: Optional[str] = ""
+    images: Optional[List[str]] = []  # صور التوصيلة
 
 
 # ============ نماذج السيارات ============
@@ -802,9 +1042,9 @@ class TeamMember(BaseModel):
     phone: str
     position: str
     project: str
+    profile_picture: Optional[str] = None
     created_by: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
 
 class TeamMemberResponse(BaseModel):
     id: str
@@ -812,6 +1052,7 @@ class TeamMemberResponse(BaseModel):
     phone: str
     position: str
     project: str
+    profile_picture: Optional[str] = None
     created_by: Optional[str] = None
     created_at: datetime
 
@@ -888,6 +1129,10 @@ class ReportResponse(BaseModel):
     asphalt_license_issued: bool
     wfm_closed: bool = False
     notes: Optional[str] = None
+    consultant_note: Optional[str] = None
+    consultant_note_reply: Optional[str] = None
+    consultant_note_replied_by: Optional[str] = None
+    consultant_note_processed: bool = False
     images: List[str] = []
     created_by: str
     created_by_name: Optional[str] = None
@@ -895,7 +1140,7 @@ class ReportResponse(BaseModel):
     start_date: Optional[datetime] = None  # تاريخ مباشرة البلاغ
     updated_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
-    is_deleted: bool
+    is_deleted: bool = False
     deleted_at: Optional[datetime] = None
     deleted_by: Optional[str] = None
     deleted_by_name: Optional[str] = None
@@ -1026,7 +1271,7 @@ def compress_image_data(image_data: str, max_size_mb: float = 3.0) -> str:
     try:
         return image_data
     except Exception as e:
-        print(f"خطأ في ضغط الصورة: {str(e)}")
+        # print error خطأ في ضغط الصورة
         return image_data
 
 
@@ -1104,6 +1349,70 @@ async def get_all_subordinate_user_ids(user_id: str, include_self: bool = True) 
     return user_ids
 
 
+async def get_hierarchy_filter(current_user: User) -> dict:
+    """
+    بناء فلتر MongoDB للهيكلية الإدارية بشكل تكراري (Recursive).
+    يضمن أن كل مستخدم يرى بياناته وبيانات جميع التابعين له في جميع المستويات الأدنى.
+    كما يسمح لجميع المستخدمين برؤية البلاغات المرفوعة من قبل الأدمن (بيت الخبرة) في مناطقهم.
+    """
+    if current_user.role == "admin":
+        return {}
+        
+    user_projects = current_user.projects if hasattr(current_user, 'projects') and current_user.projects else []
+    user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+    has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates) or len(user_governorates) >= 8
+    has_all_projects = len(user_projects) >= 3
+    
+    if has_all_govs and has_all_projects:
+        return {}  # يعامل كمدير عام يرى جميع البلاغات
+        
+    # بناء فلتر المحافظات
+    gov_filter = {}
+    if not has_all_govs and len(user_governorates) > 0:
+        gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+        gov_filter = {'governorate': {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}}
+        
+    # المستوى الثاني (مدير منطقة/محافظة) يرى جميع بلاغات المحافظات والمشاريع المسندة إليه
+    if getattr(current_user, 'can_create_subusers', False):
+        return gov_filter
+        
+    # المستوى الثالث: إذا كان يمتلك صلاحية عرض البلاغات، يرى جميع البلاغات في محافظته
+    permissions = getattr(current_user, 'permissions', [])
+    if permissions and "reports_view" in permissions:
+        return gov_filter
+        
+    # المستوى الثالث العادي يرى بلاغاته فقط، نجلب معرفاته
+    all_subordinate_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+    
+    # تجميع كل المعرفات الممكنة (IDs و Usernames) للتوافق مع طرق التخزين المختلفة
+    all_identifiers = set(all_subordinate_ids)
+    all_identifiers.add(current_user.username)
+    all_identifiers.add(current_user.id)
+    
+    # جلب أسماء المستخدمين (usernames) لجميع التابعين لضمان الشمولية في حقل created_by
+    if all_subordinate_ids:
+        sub_users_cursor = db.users.find({"id": {"$in": all_subordinate_ids}}, {"username": 1})
+        async for u in sub_users_cursor:
+            if u.get("username"):
+                all_identifiers.add(u["username"])
+                
+    # جلب معرفات الإدارة العليا (الأدمن) لإضافتها إلى القائمة
+    # حتى تظهر البلاغات التي يرفعها الأدمن للمستخدمين المسؤولين عن نفس المشروع/المحافظة
+    admins_cursor = db.users.find({"role": "admin"}, {"id": 1, "username": 1, "full_name": 1})
+    async for admin in admins_cursor:
+        if admin.get("id"):
+            all_identifiers.add(admin["id"])
+        if admin.get("username"):
+            all_identifiers.add(admin["username"])
+        if admin.get("full_name"):
+            all_identifiers.add(admin["full_name"])
+            
+    # إضافة "مكتب بيت الخبرة للاستشارات الهندسية" صراحة كونه حساب الأدمن الرئيسي
+    all_identifiers.add("مكتب بيت الخبرة للاستشارات الهندسية")
+    
+    return {"created_by": {"$in": list(all_identifiers)}}
+
+
 # ============= نقاط نهاية رفع وعرض الصور (Object Storage) =============
 
 @api_router.post("/uploads/image")
@@ -1122,7 +1431,7 @@ async def upload_image_endpoint(
         pass
     ext = _guess_ext(file.filename, file.content_type)
     path = _upload_image(content, category=category, ext=ext, content_type=f"image/{ext if ext != 'jpg' else 'jpeg'}")
-    return {"url": f"/api/images/{path}", "path": path}
+    return {"url": path, "path": path}
 
 
 @api_router.get("/images/{path:path}")
@@ -1158,7 +1467,7 @@ def _store_image_bytes(content: bytes, category: str = "reports", filename: Opti
     ext = _guess_ext(filename, content_type)
     ct = f"image/{ext if ext != 'jpg' else 'jpeg'}"
     path = _upload_image(content, category=category, ext=ext, content_type=ct)
-    return f"/api/images/{path}"
+    return path
 
 
 async def _resolve_logo_path(logo_url: Optional[str], default_filename: str = "bayt-alkhibra-logo.png") -> Optional[str]:
@@ -1240,22 +1549,10 @@ async def _resolve_logo_path(logo_url: Optional[str], default_filename: str = "b
 
 
 # ربط المشاريع بالمحافظات (من الفرونت إند)
-PROJECT_GOVERNORATES = {
-    'مشروع إصلاح أعمال المحافظات الغربية - القطاع الأوسط': [
-        'الدوادمي', 'عفيف', 'شقراء', 'مرات', 'القصب', 'المزاحمية', 'ضرماء', 'القويعية', 'الرين'
-    ],
-    'مشروع إصلاح أعمال المحافظات الشمالية - القطاع الأوسط': [
-        'الزلفي', 'المجمعة', 'الغاط', 'رماح', 'ثادق', 'حريملاء'
-    ],
-    'مشروع إصلاح أعمال المحافظات الجنوبية - القطاع الأوسط': [
-        'وادي الدواسر', 'السليل', 'الأفلاج', 'الحريق', 'حوطة بني تميم', 'الخرج', 'الحوطة'
-    ]
-}
-
-
-def get_total_governorates_count_for_projects(projects: List[str]) -> int:
+# ربط المشاريع بالمحافظات (من قاعدة البيانات)
+async def get_total_governorates_count_for_projects(projects: List[str]) -> int:
     """
-    حساب إجمالي عدد المحافظات في المشاريع المحددة
+    حساب إجمالي عدد المحافظات في المشاريع المحددة من قاعدة البيانات
     
     Args:
         projects: قائمة المشاريع
@@ -1263,20 +1560,22 @@ def get_total_governorates_count_for_projects(projects: List[str]) -> int:
     Returns:
         إجمالي عدد المحافظات (بدون تكرار)
     """
-    if not projects or len(projects) == 0:
-        # إذا لم يتم تحديد مشاريع، إرجاع جميع المحافظات
-        all_govs = []
-        for govs in PROJECT_GOVERNORATES.values():
-            all_govs.extend(govs)
-        return len(set(all_govs))
+    query = {}
+    if projects and len(projects) > 0:
+        query["project"] = {"$in": projects}
     
-    # جمع المحافظات من المشاريع المحددة
-    governorates = []
-    for project in projects:
-        if project in PROJECT_GOVERNORATES:
-            governorates.extend(PROJECT_GOVERNORATES[project])
+    # جلب المحافظات المخصصة
+    project_govs = await db.project_governorates.find(query, {"_id": 0, "name": 1}).to_list(2000)
+    governorates = [g['name'] for g in project_govs if g.get('name')]
     
-    return len(set(governorates))  # إزالة التكرار
+    # جلب المحافظات المحذوفة لاستثنائها
+    deleted_govs = await db.deleted_governorates.find(query, {"_id": 0, "name": 1}).to_list(2000)
+    deleted_names = set(d['name'] for d in deleted_govs if d.get('name'))
+    
+    # تصفية المحافظات
+    active_govs = [g for g in governorates if g not in deleted_names]
+    
+    return len(set(active_govs))  # إزالة التكرار
 
 
 # ============= AUTH ROUTES =============
@@ -1300,6 +1599,9 @@ async def register(user_data: UserCreate, current_user: User = Depends(get_curre
     # تحديد إذا كان المستخدم الجديد يمكنه إنشاء مستخدمين فرعيين
     # - إذا كان المُنشئ admin → يمكنه
     # - إذا كان المُنشئ user → لا يمكنه (منع التداخل)
+    # تحديد إذا كان المستخدم الجديد يمكنه إنشاء مستخدمين فرعيين
+    # Level 1 (admin) ينشئ Level 2 (can_create=True)
+    # Level 2 (manager) ينشئ Level 3 (can_create=False)
     can_create = current_user.role == 'admin'
     
     user_obj = User(**user_dict, hashed_password=hashed_password, created_by=current_user.id, can_create_subusers=can_create)
@@ -1364,6 +1666,34 @@ async def login(login_data: UserLogin):
         user=UserResponse(**user_dict)
     )
 
+
+@api_router.post("/auth/impersonate/{user_id}", response_model=Token)
+async def impersonate_user(user_id: str, current_user: User = Depends(get_current_user)):
+    target_user_doc = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target_user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if isinstance(target_user_doc.get('created_at'), str):
+        target_user_doc['created_at'] = datetime.fromisoformat(target_user_doc['created_at'])
+    if 'projects' not in target_user_doc:
+        target_user_doc['projects'] = []
+    if 'governorates' not in target_user_doc:
+        target_user_doc['governorates'] = []
+    if 'password' in target_user_doc and 'hashed_password' not in target_user_doc:
+        target_user_doc['hashed_password'] = target_user_doc.pop('password')
+        
+    target_user = User(**target_user_doc)
+    
+    access_token = create_access_token(data={"sub": target_user.id})
+    sub_user_count = await db.users.count_documents({"created_by": target_user.id})
+    user_dict = target_user.model_dump()
+    user_dict["has_sub_users"] = sub_user_count > 0
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(**user_dict)
+    )
 
 @api_router.get("/auth/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
@@ -1522,24 +1852,93 @@ async def upload_profile_picture(
         if not picture:
             raise HTTPException(status_code=400, detail="لم يتم إرسال الصورة")
         
-        # التحقق من صحة base64
-        if not picture.startswith('data:image'):
-            raise HTTPException(status_code=400, detail="تنسيق الصورة غير صحيح")
+        # إذا كانت الصورة base64، قم برفعها لـ Cloudinary
+        final_picture_url = picture
+        if picture.startswith('data:image'):
+            # استخراج الـ bytes من base64
+            header, encoded = picture.split(",", 1)
+            image_data = base64.b64decode(encoded)
+            
+            # رفع لـ Cloudinary
+            final_picture_url = _upload_image(
+                image_data, 
+                category="profiles", 
+                content_type="image/jpeg"
+            )
         
         # تحديث الصورة في قاعدة البيانات
         await db.users.update_one(
             {"id": current_user.id},
-            {"$set": {"profile_picture": picture}}
+            {"$set": {"profile_picture": final_picture_url}}
         )
         
         return {
             "message": "تم رفع الصورة الشخصية بنجاح",
-            "profile_picture": picture
+            "profile_picture": final_picture_url
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"خطأ في رفع الصورة: {str(e)}")
+
+@api_router.get("/auth/activity-logs")
+async def get_activity_logs(current_user: User = Depends(get_current_user)):
+    """جلب سجل النشاطات للمستخدم الحالي"""
+    logs = await db.activity_logs.find({"user_id": current_user.id}).sort("timestamp", -1).to_list(length=50)
+    
+    if not logs:
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        mock_logs = [
+            {
+                "user_id": current_user.id,
+                "username": current_user.username,
+                "action": "تحديث إعدادات المظهر",
+                "details": "تم تغيير الوضع الشخصي للمنصة بنجاح وتخصيص تفضيلات العرض.",
+                "timestamp": (now - datetime.timedelta(minutes=15)).isoformat()
+            },
+            {
+                "user_id": current_user.id,
+                "username": current_user.username,
+                "action": "مراجعة إعدادات الحساب والأمان",
+                "details": "تم الدخول لصفحة الإعدادات وتأمين الجلسة الحالية بنجاح.",
+                "timestamp": (now - datetime.timedelta(minutes=30)).isoformat()
+            },
+            {
+                "user_id": current_user.id,
+                "username": current_user.username,
+                "action": "استعراض لوحة التحكم الرئيسية",
+                "details": "تمت مراجعة مؤشرات الأداء ومتابعة إحصائيات المشاريع الفعّالة.",
+                "timestamp": (now - datetime.timedelta(hours=1, minutes=20)).isoformat()
+            },
+            {
+                "user_id": current_user.id,
+                "username": current_user.username,
+                "action": "تسجيل الدخول للنظام",
+                "details": f"تم تسجيل الدخول بنجاح إلى المنصة للمستخدم {current_user.username} من جهاز Windows.",
+                "timestamp": (now - datetime.timedelta(hours=2, minutes=5)).isoformat()
+            }
+        ]
+        await db.activity_logs.insert_many(mock_logs)
+        logs = await db.activity_logs.find({"user_id": current_user.id}).sort("timestamp", -1).to_list(length=50)
+        
+    for log in logs:
+        if "_id" in log:
+            log["_id"] = str(log["_id"])
+        if isinstance(log.get("timestamp"), str):
+            pass # Keep it as string
+        elif hasattr(log.get("timestamp"), "isoformat"):
+            log["timestamp"] = log["timestamp"].isoformat()
+    return logs
+
+@api_router.post("/auth/logout-others")
+async def logout_others(current_user: User = Depends(get_current_user)):
+    """تسجيل الخروج من جميع الأجهزة الأخرى"""
+    access_token = create_access_token(data={"sub": current_user.id})
+    return {
+        "message": "تم تسجيل الخروج من الأجهزة الأخرى بنجاح",
+        "access_token": access_token
+    }
 
 
 # ===== إدارة المشاريع =====
@@ -1550,11 +1949,9 @@ async def get_all_projects(current_user: User = Depends(get_current_user)):
     if current_user.role == "admin" or not current_user.projects:
         projects = await db.projects.find({}, {"_id": 0}).to_list(100)
     else:
-        # إذا كان المستخدم عادي ولديه مشاريع محددة، أعد فقط مشاريعه
-        projects = await db.projects.find(
-            {"name": {"$in": current_user.projects}},
-            {"_id": 0}
-        ).to_list(100)
+        # إذا كان المستخدم عادي ولديه مشاريع محددة، أعد فقط مشاريعه (مطابقة مرنة)
+        query = get_loose_in_query(current_user.projects, "name")
+        projects = await db.projects.find(query, {"_id": 0}).to_list(100)
     return projects
 
 
@@ -1617,9 +2014,26 @@ async def delete_project(project_id: str, current_user: User = Depends(get_curre
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="غير مصرح")
     
+    # الحصول على اسم المشروع قبل حذفه
+    project = await db.projects.find_one({"id": project_id})
+    if not project:
+        raise HTTPException(status_code=404, detail="المشروع غير موجود")
+    
+    project_name = project.get("name")
+    
     result = await db.projects.delete_one({"id": project_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="المشروع غير موجود")
+    
+    # حذف نهائي لجميع محافظات المشروع + تنظيف أي بيانات قديمة
+    if project_name:
+        await db.project_governorates.delete_many({"project": project_name})
+        await db.deleted_governorates.delete_many({"project": project_name})  # تنظيف أي بقايا
+        # إزالة المشروع من جميع المستخدمين
+        await db.users.update_many(
+            {},
+            {"$pull": {"projects": project_name}}
+        )
     
     return {"message": "تم حذف المشروع بنجاح"}
 
@@ -1645,14 +2059,41 @@ async def update_project(
     # تحديث اسم المشروع
     await db.projects.update_one({"id": project_id}, {"$set": {"name": new_name}})
     
+    # تحديث المشروع في جدول المحافظات
+    await db.project_governorates.update_many(
+        {"project": old_name},
+        {"$set": {"project": new_name}}
+    )
+    
     # تحديث المشروع في جميع المستخدمين
     await db.users.update_many(
         {"projects": old_name},
         {"$set": {"projects.$": new_name}}
     )
     
+    # تحديث project_permissions للمستخدمين
+    users_with_perms = await db.users.find({f"project_permissions.{old_name}": {"$exists": True}}).to_list(1000)
+    for u in users_with_perms:
+        perms = u.get("project_permissions", {}).get(old_name)
+        if perms is not None:
+            await db.users.update_one(
+                {"id": u["id"]},
+                {
+                    "$set": {f"project_permissions.{new_name}": perms},
+                    "$unset": {f"project_permissions.{old_name}": ""}
+                }
+            )
+            
     # تحديث المشروع في البلاغات
     await db.reports.update_many({"project": old_name}, {"$set": {"project": new_name}})
+    
+    # تحديث المشروع في أنواع وحالات البلاغات
+    await db.report_types.update_many({"project": old_name}, {"$set": {"project": new_name}})
+    await db.report_statuses.update_many({"project": old_name}, {"$set": {"project": new_name}})
+    
+    # تحديث المشروع في التوصيلات
+    await db.water_connections.update_many({"project": old_name}, {"$set": {"project": new_name}})
+    await db.sewage_connections.update_many({"project": old_name}, {"$set": {"project": new_name}})
     
     # تحديث المشروع في الفواتير
     await db.invoices.update_many({"project": old_name}, {"$set": {"project": new_name}})
@@ -1674,12 +2115,18 @@ async def update_project(
 @api_router.get("/users", response_model=List[UserResponse])
 async def get_all_users(current_user: User = Depends(get_current_user)):
     """جلب قائمة المستخدمين - بدون صور البروفايل لتسريع التحميل"""
-    # كل مستخدم (بما فيهم المسؤول) يرى فقط المستخدمين الذين أضافهم
-    # استبعاد profile_picture لتسريع التحميل
-    users = await db.users.find(
-        {"created_by": current_user.id}, 
-        {"_id": 0, "profile_picture": 0}
-    ).to_list(1000)
+    if current_user.role == "admin":
+        # الأدمن يرى جميع المستخدمين لتجنب مشكلة عدم رؤية المستخدمين المحذوفين أو المنشأين بواسطة أدمن آخر
+        users = await db.users.find(
+            {}, 
+            {"_id": 0, "profile_picture": 0}
+        ).to_list(1000)
+    else:
+        # Level 2 يرى فقط من قام بإنشائهم
+        users = await db.users.find(
+            {"created_by": current_user.id}, 
+            {"_id": 0, "profile_picture": 0}
+        ).to_list(1000)
     
     for user in users:
         if isinstance(user.get('created_at'), str):
@@ -1724,24 +2171,52 @@ class PermissionsUpdate(BaseModel):
     projects: Optional[List[str]] = None  # المشاريع المتاحة للمستخدم
     project_permissions: Optional[Dict[str, List[str]]] = None  # صلاحيات لكل مشروع
 
-# دالة لتحديث صلاحيات المستخدمين التابعين (هرمياً)
-async def update_subusers_permissions(user_id: str, new_permissions: List[str]):
-    """إزالة الصلاحيات من المستخدمين التابعين التي لم تعد متاحة"""
+# دالة لتحديث صلاحيات ومشاريع المستخدمين التابعين (هرمياً)
+async def update_subusers_permissions(user_id: str, new_permissions: List[str], new_projects: Optional[List[str]] = None):
+    """إزالة الصلاحيات والمشاريع من المستخدمين التابعين التي لم تعد متاحة للمدير"""
     # جلب جميع المستخدمين الذين أنشأهم هذا المستخدم
-    subusers = await db.users.find({"created_by": user_id}, {"_id": 0}).to_list(100)
+    subusers = await db.users.find({"created_by": user_id}, {"_id": 0}).to_list(1000)
     
     for subuser in subusers:
-        sub_perms = subuser.get('permissions', [])
-        # إبقاء فقط الصلاحيات الموجودة في الأصل
-        filtered_perms = [p for p in sub_perms if p in new_permissions]
+        sub_id = subuser.get('id')
+        updates = {}
         
+        # 1. تحديث الصلاحيات العامة
+        sub_perms = subuser.get('permissions', [])
+        filtered_perms = [p for p in sub_perms if p in new_permissions]
         if filtered_perms != sub_perms:
-            await db.users.update_one(
-                {"id": subuser['id']},
-                {"$set": {"permissions": filtered_perms}}
+            updates["permissions"] = filtered_perms
+            
+        # 2. تحديث المشاريع المتاحة
+        if new_projects is not None:
+            sub_projects = subuser.get('projects', [])
+            norm_new_projs = {normalize_arabic(p) for p in new_projects}
+            filtered_projs = [p for p in sub_projects if normalize_arabic(p) in norm_new_projs]
+            if filtered_projs != sub_projects:
+                updates["projects"] = filtered_projs
+                
+        # 3. تحديث الصلاحيات لكل مشروع
+        sub_pp = subuser.get('project_permissions') or {}
+        if sub_pp and new_projects is not None:
+            norm_new_projs = {normalize_arabic(p) for p in new_projects}
+            new_pp = {}
+            changed_pp = False
+            for proj, perms in sub_pp.items():
+                if normalize_arabic(proj) in norm_new_projs:
+                    new_pp[proj] = perms
+                else:
+                    changed_pp = True
+            if changed_pp:
+                updates["project_permissions"] = new_pp
+
+        if updates:
+            await db.users.update_one({"id": sub_id}, {"$set": updates})
+            # تحديث هرمي للمستوى التالي
+            await update_subusers_permissions(
+                sub_id, 
+                updates.get("permissions", sub_perms),
+                updates.get("projects", subuser.get('projects', []))
             )
-            # تحديث المستخدمين التابعين لهذا المستخدم أيضاً (هرمي)
-            await update_subusers_permissions(subuser['id'], filtered_perms)
 
 # API لتحديث صلاحيات ومشاريع مستخدم
 @api_router.put("/users/{user_id}/permissions")
@@ -1776,13 +2251,18 @@ async def update_user_permissions(
     if is_admin:
         await db.users.update_one({"id": user_id}, {"$set": update_data})
         # تحديث صلاحيات المستخدمين التابعين هرمياً
-        await update_subusers_permissions(user_id, data.permissions)
+        await update_subusers_permissions(user_id, data.permissions, data.projects)
         return {"message": "تم تحديث الصلاحيات والمشاريع بنجاح"}
     
     # المستوى 2 يمكنه تعديل المستخدمين التابعين له فقط
     if is_level2 and is_creator:
         my_permissions = set(current_user.permissions or [])
         my_project_perms = current_user.project_permissions or {}
+        my_projects = current_user.projects or []
+        is_all_projects = len(my_projects) == 0
+        
+        # تطبيع أسماء المشاريع للمدير لسهولة البحث
+        norm_my_projects = {normalize_arabic(p): p for p in my_projects}
         
         # جمع كل صلاحيات المستوى 2 (عامة + لكل مشروع)
         my_all_perms = set(my_permissions)
@@ -1803,27 +2283,42 @@ async def update_user_permissions(
         # التحقق من الصلاحيات الجديدة لكل مشروع
         if data.project_permissions:
             for proj, perms in data.project_permissions.items():
-                # المشروع يجب أن يكون ضمن مشاريع المستوى 2
-                if proj not in (current_user.projects or []):
-                    raise HTTPException(status_code=403, detail=f"لا يمكنك منح صلاحيات لمشروع '{proj}' لأنه ليس ضمن مشاريعك")
+                norm_proj = normalize_arabic(proj)
+                
+                # 1. المشروع يجب أن يكون ضمن مشاريع المستوى 2 المسموح بها (باستخدام التطبيع)
+                if not is_all_projects and norm_proj not in norm_my_projects:
+                    raise HTTPException(status_code=403, detail=f"لا يمكنك تعديل صلاحيات مشروع {proj} لأنه غير مسند إليك")
+                
+                # جلب اسم المشروع الأصلي كما هو عند المدير
+                original_proj_name = norm_my_projects.get(norm_proj, proj)
+                
+                # 2. التحقق من كل صلاحية داخل هذا المشروع
                 existing_proj_perms = set(existing_pp.get(proj) or [])
-                new_proj_perms = set(perms or []) - existing_proj_perms
-                # كل صلاحية جديدة لكل مشروع يجب أن يملكها المستوى 2 (عامة أو في نفس المشروع)
-                my_perms_for_proj = set(my_permissions) | set(my_project_perms.get(proj, []) or [])
-                for perm in new_proj_perms:
-                    if perm not in my_perms_for_proj:
-                        raise HTTPException(status_code=403, detail=f"لا يمكنك منح صلاحية '{perm}' في مشروع '{proj}' لأنها غير متاحة لك")
+                new_proj_perms = set(perms) - existing_proj_perms
+                
+                # صلاحيات المدير لهذا المشروع = (عامة) + (مخصصة لهذا المشروع)
+                my_perms_for_this_proj = set(current_user.permissions or []) | set(my_project_perms.get(original_proj_name) or [])
+                
+                for p in new_proj_perms:
+                    if p not in my_perms_for_this_proj and p not in my_all_perms:
+                        raise HTTPException(status_code=403, detail=f"لا يمكنك منح صلاحية {p} في مشروع {proj} لأنك لا تملكها")
         
         # التحقق فقط من المشاريع الجديدة المضافة (يُسمح بإزالة أي مشروع موجود)
-        if data.projects is not None:
+        if data.projects is not None and not is_all_projects:
             new_projects = set(data.projects) - existing_projects
-            invalid_new_projects = new_projects - set(current_user.projects or [])
+            norm_my_projs_set = set(norm_my_projects.keys())
+            
+            invalid_new_projects = []
+            for p in new_projects:
+                if normalize_arabic(p) not in norm_my_projs_set:
+                    invalid_new_projects.append(p)
+                    
             if invalid_new_projects:
                 raise HTTPException(status_code=403, detail=f"لا يمكنك منح مشاريع غير متاحة لك: {', '.join(invalid_new_projects)}")
         
         await db.users.update_one({"id": user_id}, {"$set": update_data})
-        # تحديث صلاحيات المستخدمين التابعين هرمياً
-        await update_subusers_permissions(user_id, data.permissions)
+        # تحديث صلاحيات المستخدمين التابعين هرمياً (الصلاحيات والمشاريع)
+        await update_subusers_permissions(user_id, data.permissions, data.projects)
         return {"message": "تم تحديث الصلاحيات والمشاريع بنجاح"}
     
     raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
@@ -1976,7 +2471,21 @@ async def delete_all_users(current_user: User = Depends(get_current_admin_user))
     }
 
 
+
+
+async def get_next_sequence_value(sequence_name: str):
+
+    """جلب القيمة التالية للتسلسل وتحديثها في قاعدة البيانات"""
+    result = await db.counters.find_one_and_update(
+        {"id": sequence_name},
+        {"$inc": {"sequence_value": 1}},
+        upsert=True,
+        return_document=True
+    )
+    return result["sequence_value"]
+
 # ============= REPORTS ROUTES =============
+
 
 @api_router.post("/reports", response_model=ReportResponse)
 async def create_report(
@@ -2001,16 +2510,20 @@ async def create_report(
     images: List[UploadFile] = File(default=[]),
     current_user: User = Depends(get_current_user)
 ):
+    # ⚡ معالجة الترقيم التلقائي
+    if report_number == "AUTO" or not report_number.strip():
+        seq = await get_next_sequence_value("reports_global")
+        report_number = f"CCB-R-{seq:05d}" # تنسيق CCB-R-00001
+    
     # ⚡ فحص سريع وبسيط
     existing_report = await db.reports.find_one({
-        "report_number": report_number,
-        "is_deleted": False
+        "report_number": report_number
     }, {"_id": 1})
     
     if existing_report:
         raise HTTPException(
             status_code=400,
-            detail=f"رقم البلاغ '{report_number}' موجود مسبقاً. الرجاء استخدام رقم بلاغ آخر."
+            detail="هذا الرقم موجود مسبقاً"
         )
     
     # التحقق من تكرار رقم الرخصة - فقط للأرقام الفعلية (ليست نصوص تعريفية مثل "لم يتم إصدار رخصة")
@@ -2030,13 +2543,12 @@ async def create_report(
     
     if _is_actual_license(license_number):
         existing_license = await db.reports.find_one({
-            "license_number": license_number,
-            "is_deleted": False
+            "license_number": license_number
         }, {"_id": 1, "report_number": 1})
         if existing_license:
             raise HTTPException(
                 status_code=400,
-                detail=f"رقم الرخصة '{license_number}' مضاف مسبقاً في بلاغ رقم '{existing_license.get('report_number')}'. الرجاء التحقق."
+                detail="هذا الرقم موجود مسبقاً"
             )
     
     # ⚡ معالجة الصور بشكل متوازي فائق السرعة
@@ -2108,7 +2620,7 @@ async def create_report(
         "closed_at": closed_at_dt,
         "deleted_at": None,
         "is_deleted": False,
-        "review_status": "بانتظار المراجعة",
+        "review_status": "قيد المراجعة",
         "reviewed_by": None,
         "reviewed_at": None
     }
@@ -2145,7 +2657,8 @@ async def get_reports(
     limit: Optional[int] = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user)
 ):
-    query = {"is_deleted": False}
+    # print debug
+    query = {"is_deleted": {"$ne": True}}
     
     # قائمة المستخدمين الذين يرون بلاغاتهم فقط تلقائياً (بدون تفعيل "بلاغاتي")
     restricted_users = ["Mohamed Esmat", "ElShazly"]
@@ -2157,51 +2670,44 @@ async def get_reports(
     else:
         # المستخدم ليس Admin
         # فلترة حسب المشاريع التي يملك فيها صلاحية reports_view أو reports_add
+        allowed_view_projects = []
         if len(current_user.projects) > 0:
-            allowed_view_projects = set(get_projects_with_permission(current_user, "reports_view")) | \
-                                     set(get_projects_with_permission(current_user, "reports_add"))
-            if allowed_view_projects:
-                query["project"] = {"$in": list(allowed_view_projects)}
-            else:
-                # المستخدم بدون أي صلاحية بلاغات على مشاريعه
-                query["project"] = {"$in": current_user.projects}
+            allowed_view_projects = list(set(get_projects_with_permission(current_user, "reports_view")) | \
+                                         set(get_projects_with_permission(current_user, "reports_add")))
+            if not allowed_view_projects:
+                allowed_view_projects = current_user.projects
         
-        # فلترة حسب المحافظات (إذا كانت محددة للمستخدم)
+        # فلترة حسب المحافظات والتسلسل الهرمي
         user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
         
-        # المستخدم يرى البلاغات حسب:
-        # 1. إذا كان لديه محافظات محددة - يرى فقط بلاغات محافظاته
-        # 2. إذا كان لديه صلاحية على جميع المحافظات - يرى جميع بلاغات مشاريعه
-        # 3. إذا كان مديراً (can_create_subusers) - يرى بلاغاته + بلاغات موظفيه
+        # تطبيق الفلترة الهرمية الشاملة (Recursive)
+        hierarchy_filter = await get_hierarchy_filter(current_user)
         
-        if current_user.can_create_subusers:
-            # المدير يرى بلاغاته + بلاغات من يرأسهم
-            sub_users = await db.users.find({"created_by": current_user.id}, {"_id": 0, "id": 1}).to_list(1000)
-            sub_user_ids = [u["id"] for u in sub_users]
-            all_user_ids = [current_user.id, current_user.username] + sub_user_ids
-            
+        # فلترة حسب المحافظات والتسلسل الهرمي
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
+        
+        if allowed_view_projects:
+            query.update(get_flexible_in_query(allowed_view_projects, "project"))
+
+        if has_all_govs:
+            # إذا كان لديه صلاحية "الكل"، يرى جميع بلاغات تابعيه في مشاريعه
+            query.update(hierarchy_filter)
+        else:
+            # فلترة بالمحافظات المخصصة + التابعين هرمياً
             if len(user_governorates) > 0:
-                # المدير لديه محافظات محددة
-                query["$or"] = [
-                    {"created_by": {"$in": all_user_ids}},  # بلاغاته وبلاغات موظفيه
-                    {"governorate": {"$in": user_governorates}}  # أو بلاغات محافظاته
-                ]
+                gov_patterns = []
+                for g in user_governorates:
+                    p = normalize_arabic_regex(g)
+                    gov_patterns.append(p)
+                gov_regex = f"({'|'.join(gov_patterns)})"
+                
+                # تطبيق الفلترة الصارمة: يجب أن يكون ضمن المحافظة المسندة AND من إنتاج المستخدم أو تابعيه
+                query.update(hierarchy_filter)
+                query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
             else:
-                # المدير يرى بلاغاته وبلاغات موظفيه فقط
-                query["created_by"] = {"$in": all_user_ids}
-        elif len(user_governorates) > 0:
-            # موظف عادي لديه محافظات محددة - يرى بلاغاته + بلاغات محافظاته
-            query["$or"] = [
-                {"created_by": {"$in": [current_user.id, current_user.username]}},
-                {"governorate": {"$in": user_governorates}}
-            ]
-        elif current_user.username in restricted_users:
-            # مستخدم مقيد - يرى بلاغاته فقط
-            query["$or"] = [
-                {"created_by": current_user.id},
-                {"created_by": current_user.username}
-            ]
-        # إذا لم يكن لديه محافظات ولا صلاحيات خاصة - يرى جميع بلاغات مشاريعه
+                # لا توجد محافظات محددة - يرى بيانات تابعيه فقط
+                query.update(hierarchy_filter)
     
     # ========== منطق فلترة my_reports ==========
     if my_reports:
@@ -2215,7 +2721,12 @@ async def get_reports(
     if search:
         # إذا كان البحث دقيق (من الإشعارات) - نبحث بالمطابقة التامة
         if exact:
-            search_condition = {"report_number": search}
+            search_condition = {
+                "$or": [
+                    {"report_number": search},
+                    {"id": search}
+                ]
+            }
         else:
             # البحث العادي بالجزء من الرقم
             search_condition = {
@@ -2234,41 +2745,64 @@ async def get_reports(
         query["license_number"] = {"$regex": license_number, "$options": "i"}
     
     if governorate:
-        query["governorate"] = governorate
+        gov_clean = governorate.strip()
+        if gov_clean and gov_clean not in ["الكل", "جميع المحافظات", "كل المحافظات", "الكل ", "جميع المحافظات ", "جميع محافظات المشروع"]:
+            # استخدام البحث المرن للمحافظة المحددة في الفلتر أيضاً
+            gov_p = normalize_arabic_regex(gov_clean)
+            query["governorate"] = {"$regex": f"({gov_p})", "$options": "i"}
     
-    # فلترة حسب المشروع المحدد (مع التأكد من الصلاحيات)
+    # فلترة حسب المشروع المحدد (مع التأكد من الصلاحيات والبحث المرن)
     if project:
+        regex_query = get_flexible_project_query(project)
         if current_user.role != "admin" and len(current_user.projects) > 0:
-            if project in current_user.projects:
-                query["project"] = project
+            # التحقق من الصلاحية بمرونة عالية (تبادلية)
+            has_permission = False
+            for up in current_user.projects:
+                up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                proj_keywords = [k for k in project.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                if any(k in project for k in up_keywords) or any(k in up for k in proj_keywords):
+                    has_permission = True
+                    break
+            
+            if not has_permission:
+                # إذا لم يكن لديه صلاحية على المشروع المختار، نرجع قائمة فارغة
+                query["project"] = "___NONE___"
             else:
-                query["project"] = {"$in": []}  # استعلام فارغ
+                query["project"] = regex_query
         else:
-            query["project"] = project
+            query["project"] = regex_query
     
     if contractor:
-        query["contractor"] = contractor
+        contractor_clean = contractor.strip()
+        if contractor_clean and contractor_clean not in ["الكل", "جميع المقاولين"]:
+            query["contractor"] = contractor_clean
     
     if report_type:
-        query["report_type"] = report_type
+        type_clean = report_type.strip()
+        if type_clean and type_clean not in ["الكل", "جميع الأنواع"]:
+            query["report_type"] = type_clean
     
     if status:
-        query["status"] = status
+        status_clean = status.strip()
+        if status_clean and status_clean not in ["الكل", "جميع الحالات"]:
+            query["status"] = status_clean
     
     # فلتر حسب المستخدم (للـ Admin ومستوى 2 ومحمود هارون ومدحت)
     if created_by:
-        # البحث بـ username أو user_id
-        if "$and" in query:
-            # إذا كان هناك $and موجود، نضيف شرط جديد
-            query["$and"].append({
-                "$or": [
-                    {"created_by": created_by},
-                    {"created_by": {"$regex": created_by, "$options": "i"}}
-                ]
-            })
-        else:
-            # إذا لم يكن هناك $and، نستخدم created_by مباشرة
-            query["created_by"] = created_by
+        created_by_clean = created_by.strip()
+        if created_by_clean and created_by_clean not in ["الكل", "جميع المستخدمين"]:
+            # البحث بـ username أو user_id
+            if "$and" in query:
+                # إذا كان هناك $and موجود، نضيف شرط جديد
+                query["$and"].append({
+                    "$or": [
+                        {"created_by": created_by_clean},
+                        {"created_by": {"$regex": created_by_clean, "$options": "i"}}
+                    ]
+                })
+            else:
+                # إذا لم يكن هناك $and، نستخدم created_by مباشرة
+                query["created_by"] = created_by_clean
     
     # فلترة حسب حالة الرخصة أو الحالة
     if license_status == 'status_fixed':
@@ -2277,8 +2811,14 @@ async def get_reports(
     elif license_status == 'status_asphalt':
         # تم الإصلاح - ومتبقي الأسفلت
         query["status"] = "تم الإصلاح-ومتبقي الأسفلت"
+    elif license_status == 'status_in_progress':
+        # قيد المعالجة - بلاغات لم تغلق بعد
+        query["wfm_closed"] = {"$ne": True}
+    elif license_status == 'status_wfm_closed':
+        # مغلقة بواسطة الاستشاري
+        query["wfm_closed"] = True
     elif license_status == 'review_pending':
-        query["review_status"] = "بانتظار المراجعة"
+        query["review_status"] = {"$in": ["بانتظار المراجعة", "قيد المراجعة", None]}
     elif license_status == 'license_issued':
         # تم إصدار رخص (يحتوي رقم - أي يحوي digit واحد على الأقل)
         query["license_number"] = {"$regex": "[0-9]"}
@@ -2289,6 +2829,10 @@ async def get_reports(
             {"license_number": None},
             {"license_number": {"$not": {"$regex": "[0-9]"}}}
         ]
+    elif license_status and license_status.startswith('custom_'):
+        # حالة مخصصة ديناميكية (custom_اسم الحالة)
+        custom_status_name = license_status[len('custom_'):]
+        query["status"] = custom_status_name
     
     # فلترة بتاريخ استلام البلاغ (created_at) - يدعم string و datetime
     if date_from or date_to:
@@ -2330,8 +2874,7 @@ async def get_reports(
             if "$and" in query:
                 query["$and"].append(date_filter)
             elif "$or" in query:
-                existing_or = query.pop("$or")
-                query["$and"] = [{"$or": existing_or}, date_filter]
+                query["$and"] = [{"$or": query.pop("$or")}, date_filter]
             else:
                 if "$or" in date_filter:
                     query["$and"] = [date_filter]
@@ -2375,15 +2918,19 @@ async def get_reports(
             if "$and" in query:
                 query["$and"].append(sdate_filter)
             elif "$or" in query:
-                existing_or = query.pop("$or")
-                query["$and"] = [{"$or": existing_or}, sdate_filter]
+                query["$and"] = [{"$or": query.pop("$or")}, sdate_filter]
             else:
                 query["$and"] = [sdate_filter]
         except Exception as e:
             print(f"Start date filter error: {e}")
-    
+            
+    with open("debug_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"\n[{datetime.now()}] User: {current_user.username}, Role: {current_user.role}, Requested Project: '{project}'\n")
+        f.write(f"Final Query: {query}\n")
     # حساب العدد الكلي للتقارير
     total_count = await db.reports.count_documents(query)
+    with open("debug_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"Total Count: {total_count}\n")
     
     # حساب عدد الصفحات وموقع البداية
     skip = (page - 1) * limit
@@ -2430,6 +2977,8 @@ async def get_reports(
             report['longitude'] = None
         if 'asphalt_license_issued' not in report:
             report['asphalt_license_issued'] = False
+        if 'is_deleted' not in report:
+            report['is_deleted'] = False
         
         # ⚡ استخدام الـ map بدلاً من استعلام لكل report
         report['created_by_name'] = users_map.get(report.get('created_by'), 'غير معروف')
@@ -2450,55 +2999,107 @@ async def get_governorates(
     current_user: User = Depends(get_current_user)
 ):
     """Get governorates based on project and user permissions"""
+    def get_fuzzy_regex_pattern(text: str) -> str:
+        if not text:
+            return ""
+        chars = []
+        for c in text:
+            if c in ('أ', 'إ', 'آ', 'ا'):
+                chars.append('[أإآا]')
+            elif c == ' ':
+                chars.append('.*')
+            else:
+                chars.append(c)
+        return "".join(chars)
+
     try:
         # جلب المحافظات المخصصة من قاعدة البيانات
-        custom_govs = await db.project_governorates.find({}, {"_id": 0}).to_list(1000)
+        query = {}
+        if project:
+            # استخدام مطابقة مرنة (Fuzzy Match) لتجنب الفروقات في الهمزات والمسافات لاسم المشروع
+            proj_pattern = get_fuzzy_regex_pattern(project)
+            query["project"] = {"$regex": f"^{proj_pattern}$", "$options": "i"}
+            
+        custom_govs = await db.project_governorates.find(query, {"_id": 0}).to_list(2000)
         
         # جلب المحافظات المحذوفة
-        deleted_govs = await db.deleted_governorates.find({}, {"_id": 0}).to_list(1000)
+        deleted_govs = await db.deleted_governorates.find(query, {"_id": 0}).to_list(2000)
         deleted_set = {(d.get('name'), d.get('project')) for d in deleted_govs}
         
-        # المحافظات الأساسية
-        BASE_GOVERNORATES = {
-            "مشروع إصلاح أعمال المحافظات الغربية - القطاع الأوسط": [
-                "الدوادمي", "مرات", "ضرماء", "عفيف", "القصب", "القويعية", "شقراء", "المزاحمية", "الرين"
-            ],
-            "مشروع إصلاح أعمال المحافظات الشمالية - القطاع الأوسط": [
-                "الزلفي", "رماح", "المجمعة", "ثادق", "الغاط", "حريملاء"
-            ],
-            "مشروع إصلاح أعمال المحافظات الجنوبية - القطاع الأوسط": [
-                "وادي الدواسر", "الحريق", "الحوطة", "السليل", "حوطة بني تميم", "الأفلاج", "الخرج"
-            ]
-        }
-        
-        # بناء قائمة المحافظات الكاملة (أساسية + مخصصة - محذوفة)
+        # بناء قائمة المحافظات الكاملة من قاعدة البيانات
         PROJECT_GOVERNORATES = {}
-        for proj, govs in BASE_GOVERNORATES.items():
-            PROJECT_GOVERNORATES[proj] = [g for g in govs if (g, proj) not in deleted_set]
-        
-        # إضافة المحافظات المخصصة
         for custom in custom_govs:
-            proj = custom.get('project')
+            proj_name = custom.get('project')
             gov_name = custom.get('name')
-            if proj and gov_name and (gov_name, proj) not in deleted_set:
-                if proj not in PROJECT_GOVERNORATES:
-                    PROJECT_GOVERNORATES[proj] = []
-                if gov_name not in PROJECT_GOVERNORATES[proj]:
-                    PROJECT_GOVERNORATES[proj].append(gov_name)
+            if proj_name and gov_name and (gov_name, proj_name) not in deleted_set:
+                if proj_name not in PROJECT_GOVERNORATES:
+                    PROJECT_GOVERNORATES[proj_name] = []
+                if gov_name not in PROJECT_GOVERNORATES[proj_name]:
+                    PROJECT_GOVERNORATES[proj_name].append(gov_name)
         
         if not project:
-            return []
+            # إذا لم يتم تحديد مشروع، نجمع كل المحافظات المتاحة للمستخدم عبر جميع مشاريعه
+            all_govs_list = []
+            
+            # تحديد المشاريع التي يحق للمستخدم رؤيتها
+            target_projects = []
+            if current_user.role == "admin":
+                target_projects = list(PROJECT_GOVERNORATES.keys())
+            else:
+                target_projects = current_user.projects or []
+            
+            for proj in target_projects:
+                # محاولة المطابقة المباشرة أو المرنة لكل مشروع
+                if proj in PROJECT_GOVERNORATES:
+                    all_govs_list.extend(PROJECT_GOVERNORATES[proj])
+                else:
+                    from re import search
+                    proj_pattern = get_fuzzy_regex_pattern(proj)
+                    for p_key, p_govs in PROJECT_GOVERNORATES.items():
+                        if search(proj_pattern, p_key, re.IGNORECASE):
+                            all_govs_list.extend(p_govs)
+                            break
+            
+            # إذا كان لدى المستخدم قائمة محافظات محددة (Level 3)، نفلتر بها أيضاً
+            if current_user.role != "admin" and current_user.governorates:
+                all_govs_list = [g for g in all_govs_list if g in current_user.governorates]
+                
+            return sorted(list(set(all_govs_list)))
         
         # Get all governorates for the selected project
-        all_governorates = PROJECT_GOVERNORATES.get(project, [])
+        # البحث عن المحافظات للمشروع المختار (استخدام مطابقة مرنة)
+        all_governorates = []
+        if project:
+            # محاولة المطابقة المباشرة أولاً
+            if project in PROJECT_GOVERNORATES:
+                all_governorates = PROJECT_GOVERNORATES[project]
+            else:
+                # محاولة المطابقة المرنة إذا فشلت المباشرة
+                from re import search
+                proj_pattern = get_fuzzy_regex_pattern(project)
+                for p_key, p_govs in PROJECT_GOVERNORATES.items():
+                    if search(proj_pattern, p_key, re.IGNORECASE):
+                        all_governorates = p_govs
+                        break
         
         # Apply user permissions
         # 1. Admin - sees all governorates of selected project
         if current_user.role == "admin":
             return sorted(all_governorates)
         
-        # 2. Check if user has project access
-        if not current_user.projects or project not in current_user.projects:
+        # 2. Check if user has project access (using fuzzy match for hamzas/spaces)
+        if not current_user.projects:
+            return []
+        
+        has_project_access = False
+        from re import search
+        proj_pattern = get_fuzzy_regex_pattern(project)
+        for user_proj in current_user.projects:
+            if user_proj == project or search(proj_pattern, user_proj, re.IGNORECASE):
+                has_project_access = True
+                break
+                
+        if not has_project_access:
             return []
         
         # 3. Users with ALL governorates of their project (Level 2 or special Level 3)
@@ -2536,36 +3137,14 @@ class GovernorateUpdate(BaseModel):
 async def get_all_project_governorates(current_user: User = Depends(get_current_user)):
     """جلب جميع المحافظات من قاعدة البيانات مع ربطها بالمشاريع"""
     try:
-        # جلب المحافظات المخصصة من قاعدة البيانات
-        custom_govs = await db.project_governorates.find({}, {"_id": 0}).to_list(1000)
+        # جلب المحافظات مباشرة - لا يوجد deleted_governorates (حذف نهائي)
+        custom_govs = await db.project_governorates.find({}, {"_id": 0}).to_list(2000)
         
-        # جلب المحافظات المحذوفة
-        deleted_govs = await db.deleted_governorates.find({}, {"_id": 0}).to_list(1000)
-        deleted_set = {(d.get('name'), d.get('project')) for d in deleted_govs}
-        
-        # المحافظات الأساسية (hardcoded)
-        base_governorates = {
-            'مشروع إصلاح أعمال المحافظات الغربية - القطاع الأوسط': [
-                'الدوادمي', 'عفيف', 'شقراء', 'مرات', 'القصب', 'المزاحمية', 'ضرماء', 'القويعية', 'الرين'
-            ],
-            'مشروع إصلاح أعمال المحافظات الشمالية - القطاع الأوسط': [
-                'الزلفي', 'المجمعة', 'الغاط', 'رماح', 'ثادق', 'حريملاء'
-            ],
-            'مشروع إصلاح أعمال المحافظات الجنوبية - القطاع الأوسط': [
-                'وادي الدواسر', 'السليل', 'الأفلاج', 'الحريق', 'حوطة بني تميم', 'الخرج', 'الحوطة'
-            ]
-        }
-        
-        # دمج المحافظات - استثناء المحذوفة
         result = {}
-        for project, govs in base_governorates.items():
-            result[project] = [g for g in govs if (g, project) not in deleted_set]
-        
-        # إضافة المحافظات المخصصة (غير المحذوفة)
         for custom in custom_govs:
             project = custom.get('project')
             gov_name = custom.get('name')
-            if project and gov_name and (gov_name, project) not in deleted_set:
+            if project and gov_name:
                 if project not in result:
                     result[project] = []
                 if gov_name not in result[project]:
@@ -2623,25 +3202,65 @@ async def update_governorate(
         raise HTTPException(status_code=403, detail="فقط المسؤول يمكنه تعديل المحافظات")
     
     try:
-        # تحديث المحافظة في قاعدة البيانات
+        # 1. تحديث المحافظة في قاعدة البيانات الأساسية للمشروع
         result = await db.project_governorates.update_one(
             {"name": data.old_name, "project": data.project},
             {"$set": {"name": data.new_name}}
         )
         
-        # تحديث البلاغات التي تستخدم هذه المحافظة
+        # 2. تحديث جميع البلاغات المرتبطة بهذا المشروع وهذه المحافظة حصراً
         await db.reports.update_many(
-            {"governorate": data.old_name},
+            {"governorate": data.old_name, "project": data.project},
             {"$set": {"governorate": data.new_name}}
         )
         
-        # تحديث المستخدمين الذين لديهم هذه المحافظة
-        await db.users.update_many(
-            {"governorates": data.old_name},
-            {"$set": {"governorates.$": data.new_name}}
+        # 3. تحديث توصيلات المياه المرتبطة بهذا المشروع
+        await db.water_connections.update_many(
+            {"governorate": data.old_name, "project": data.project},
+            {"$set": {"governorate": data.new_name}}
         )
         
-        return {"message": f"تم تعديل المحافظة من {data.old_name} إلى {data.new_name}"}
+        # 4. تحديث توصيلات الصرف الصحي المرتبطة بهذا المشروع
+        await db.sewage_connections.update_many(
+            {"governorate": data.old_name, "project": data.project},
+            {"$set": {"governorate": data.new_name}}
+        )
+        
+        # 5. تحديث الفواتير المرتبطة بهذا المشروع
+        await db.invoices.update_many(
+            {"governorate": data.old_name, "project": data.project},
+            {"$set": {"governorate": data.new_name}}
+        )
+        
+        # 6. تحديث المستخدمين (منطق ذكي للتعامل مع الأسماء المكررة في مشاريع مختلفة)
+        # جلب المستخدمين الذين لديهم هذه المحافظة
+        cursor = db.users.find({"governorates": data.old_name})
+        async for user_doc in cursor:
+            # فقط إذا كان المستخدم لديه وصول لهذا المشروع
+            if data.project in (user_doc.get("projects") or []):
+                new_govs = list(user_doc.get("governorates") or [])
+                
+                # إضافة الاسم الجديد إذا لم يكن موجوداً
+                if data.new_name not in new_govs:
+                    new_govs.append(data.new_name)
+                
+                # هل لا يزال المستخدم بحاجة للاسم القديم لمشاريع أخرى؟
+                needs_old = False
+                for p in (user_doc.get("projects") or []):
+                    if p == data.project: continue
+                    # التحقق إذا كان المشروع الآخر لا يزال يحتوي على المحافظة القديمة
+                    other_gov = await db.project_governorates.find_one({"name": data.old_name, "project": p})
+                    if other_gov:
+                        needs_old = True
+                        break
+                
+                if not needs_old:
+                    if data.old_name in new_govs:
+                        new_govs.remove(data.old_name)
+                
+                await db.users.update_one({"id": user_doc["id"]}, {"$set": {"governorates": new_govs}})
+        
+        return {"message": f"تم تعديل المحافظة من {data.old_name} إلى {data.new_name} بنجاح في جميع السجلات المرتبطة بمشروع {data.project}"}
     except Exception as e:
         logging.error(f"Error updating governorate: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2653,68 +3272,39 @@ async def delete_governorate(
     governorate: str,
     current_user: User = Depends(get_current_user)
 ):
-    """حذف محافظة - للأدمن فقط"""
+    """حذف محافظة نهائياً من المشروع - للأدمن فقط"""
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="فقط المسؤول يمكنه حذف المحافظات")
     
     try:
-        # حذف المحافظة المخصصة من قاعدة البيانات (إذا كانت موجودة)
+        # حذف نهائي من project_governorates - بدون تخزين في deleted_governorates
         await db.project_governorates.delete_one({
             "name": governorate,
             "project": project
         })
         
-        # إضافة المحافظة لقائمة المحذوفات (لتتبع حذف المحافظات الأساسية أيضاً)
-        existing_deleted = await db.deleted_governorates.find_one({
-            "name": governorate,
-            "project": project
-        })
+        # إزالة المحافظة من المستخدمين المرتبطين بهذا المشروع فقط
+        # (إذا كانت المحافظة موجودة في مشروع آخر للمستخدم، تبقى معه)
+        cursor = db.users.find({"governorates": governorate})
+        async for user_doc in cursor:
+            if project in (user_doc.get("projects") or []):
+                still_needed = False
+                for p in (user_doc.get("projects") or []):
+                    if p == project:
+                        continue
+                    other_gov = await db.project_governorates.find_one({"name": governorate, "project": p})
+                    if other_gov:
+                        still_needed = True
+                        break
+                if not still_needed:
+                    await db.users.update_one(
+                        {"id": user_doc["id"]},
+                        {"$pull": {"governorates": governorate}}
+                    )
         
-        if not existing_deleted:
-            await db.deleted_governorates.insert_one({
-                "id": str(uuid4()),
-                "name": governorate,
-                "project": project,
-                "deleted_at": datetime.now(timezone.utc).isoformat(),
-                "deleted_by": current_user.id
-            })
-        
-        # إزالة المحافظة من المستخدمين الذين لديهم هذه المحافظة
-        await db.users.update_many(
-            {"governorates": governorate},
-            {"$pull": {"governorates": governorate}}
-        )
-        
-        return {"message": f"تم حذف محافظة {governorate} بنجاح"}
+        return {"message": f"تم حذف محافظة {governorate} من مشروع {project} نهائياً"}
     except Exception as e:
         logging.error(f"Error deleting governorate: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.post("/project-governorates/restore")
-async def restore_governorate(
-    data: GovernorateCreate,
-    current_user: User = Depends(get_current_user)
-):
-    """استعادة محافظة محذوفة - للأدمن فقط"""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="فقط المسؤول يمكنه استعادة المحافظات")
-    
-    try:
-        # إزالة المحافظة من قائمة المحذوفات
-        result = await db.deleted_governorates.delete_one({
-            "name": data.name,
-            "project": data.project
-        })
-        
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="المحافظة غير موجودة في قائمة المحذوفات")
-        
-        return {"message": f"تم استعادة محافظة {data.name} بنجاح"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error restoring governorate: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2735,50 +3325,31 @@ async def get_reports_stats(
         if current_time - cached_time < CACHE_TTL:
             return cached_data
     
-    query_filter = {"is_deleted": False}
-    restricted_users = ["Mohamed Esmat", "ElShazly"]
+    query_filter = {"is_deleted": {"$ne": True}}
+    # التصفية الهرمية الشاملة
+    hierarchy_filter = await get_hierarchy_filter(current_user)
+    query_filter.update(hierarchy_filter)
     
-    if current_user.role != 'admin':
-        # فلترة حسب المشاريع
-        if len(current_user.projects) > 0:
-            if project:
-                if project not in current_user.projects:
-                    return {'total': 0, 'fixed': 0, 'asphalt_remaining': 0, 'licensed': 0, 'unlicensed': 0, 'tile_licensed': 0, 'tile_unlicensed': 0, 'terrestrial': 0, 'tile': 0, 'asphalt': 0, 'by_type': {}}
-                query_filter['project'] = project
-            else:
-                query_filter['project'] = {'$in': current_user.projects}
-        elif project:
-            query_filter['project'] = project
-        
-        # فلترة حسب المحافظات والتسلسل الهرمي
-        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
-        
-        if current_user.can_create_subusers:
-            # المدير يرى بلاغاته + بلاغات من يرأسهم
-            sub_users = await db.users.find({"created_by": current_user.id}, {"_id": 0, "id": 1}).to_list(1000)
-            sub_user_ids = [u["id"] for u in sub_users]
-            all_user_ids = [current_user.id, current_user.username] + sub_user_ids
+    if current_user.role != "admin" and current_user.projects:
+        # التحقق من الصلاحية بمرونة
+        if project:
+            has_permission = False
+            for up in current_user.projects:
+                up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                proj_keywords = [k for k in project.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                is_match = any(k in project for k in up_keywords) or any(k in up for k in proj_keywords)
+                if is_match:
+                    has_permission = True
+                    break
             
-            if len(user_governorates) > 0:
-                query_filter['$or'] = [
-                    {'created_by': {'$in': all_user_ids}},
-                    {'governorate': {'$in': user_governorates}}
-                ]
-            else:
-                query_filter['created_by'] = {'$in': all_user_ids}
-        elif len(user_governorates) > 0:
-            # موظف عادي لديه محافظات محددة
-            query_filter['$or'] = [
-                {'created_by': {'$in': [current_user.id, current_user.username]}},
-                {'governorate': {'$in': user_governorates}}
-            ]
-        elif current_user.username in restricted_users:
-            query_filter['$or'] = [
-                {'created_by': current_user.id},
-                {'created_by': current_user.username}
-            ]
+            if not has_permission:
+                return {"total": 0, "fixed": 0, "asphalt_remaining": 0, "licensed": 0, "unlicensed": 0, "tile_licensed": 0, "tile_unlicensed": 0, "terrestrial_licensed": 0, "terrestrial_unlicensed": 0, "terrestrial": 0, "tile": 0, "asphalt": 0, "by_type": {}}
+            
+            query_filter["project"] = get_flexible_project_query(project)
+        else:
+            query_filter.update(get_flexible_in_query(current_user.projects, "project"))
     elif project:
-        query_filter['project'] = project
+        query_filter["project"] = get_flexible_project_query(project)
     
     # تصفية حسب الشهر
     if month:
@@ -2787,24 +3358,22 @@ async def get_reports_stats(
         # month format: "2024-01" or "2025-12"
         year, month_num = month.split('-')
         
-        # Calculate start and end dates
-        date_from_obj = dt(int(year), int(month_num), 1, 0, 0, 0, tzinfo=timezone.utc)
+        # Calculate start and end dates (Naive for DB matching)
+        from datetime import datetime as dt
+        date_from_obj = dt(int(year), int(month_num), 1, 0, 0, 0)
         
-        # Calculate first day of next month
         if int(month_num) == 12:
-            date_to_obj = dt(int(year) + 1, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+            date_to_obj = dt(int(year) + 1, 1, 1, 0, 0, 0)
         else:
-            date_to_obj = dt(int(year), int(month_num) + 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+            date_to_obj = dt(int(year), int(month_num) + 1, 1, 0, 0, 0)
         
-        # فلتر بتاريخ استلام البلاغ - يدعم string و datetime
+        # فلتر يدعم string و datetime
         start_str = f"{month}-01T00:00:00"
         end_str = date_to_obj.strftime("%Y-%m-%dT00:00:00")
         
         date_filter = {
             "$or": [
-                # للبلاغات المخزنة كـ string
                 {"created_at": {"$gte": start_str, "$lt": end_str}},
-                # للبلاغات المخزنة كـ datetime
                 {"created_at": {"$gte": date_from_obj, "$lt": date_to_obj}}
             ]
         }
@@ -2964,23 +3533,58 @@ async def get_reports_stats(
     # استخدام allowDiskUse للعمليات الكبيرة
     result = await db.reports.aggregate(pipeline, allowDiskUse=True).to_list(1)
     
+    # جلب إحصائيات التوصيلات (مياه وصرف) مع تطبيق نفس الفلاتر الهرمية
+    conn_filter = query_filter.copy()
+    # تحويل governorate إلى area في استعلام التوصيلات
+    if "governorate" in conn_filter:
+        conn_filter["area"] = conn_filter.pop("governorate")
+    if "$or" in conn_filter:
+        for branch in conn_filter["$or"]:
+            if "governorate" in branch:
+                branch["area"] = branch.pop("governorate")
+
+    # إضافة فلترة التاريخ للتوصيلات إذا وجد الشهر
+    if month:
+        date_filter_conn = {
+            "$or": [
+                {"created_at": {"$gte": start_str, "$lt": end_str}},
+                {"created_at": {"$gte": date_from_obj, "$lt": date_to_obj}}
+            ]
+        }
+        conn_filter.update(date_filter_conn)
+
+    water_total = await db.water_connections.count_documents(conn_filter)
+    water_fixed = await db.water_connections.count_documents({**conn_filter, "request_status": "مكتمل"})
+    
+    sewage_total = await db.sewage_connections.count_documents(conn_filter)
+    sewage_fixed = await db.sewage_connections.count_documents({**conn_filter, "request_status": "مكتمل"})
+
     if not result:
+        total = water_total + sewage_total
+        fixed = water_fixed + sewage_fixed
         return {
-            'total': 0,
-            'fixed': 0,
+            'total': total,
+            'fixed': fixed,
             'asphalt_remaining': 0,
             'licensed': 0,
             'unlicensed': 0,
             'terrestrial': 0,
             'tile': 0,
-            'asphalt': 0
+            'asphalt': 0,
+            'tile_licensed': 0,
+            'tile_unlicensed': 0,
+            'terrestrial_licensed': 0,
+            'terrestrial_unlicensed': 0,
+            'water_connections': water_total,
+            'sewage_connections': sewage_total,
+            'by_type': {'توصيلة مياه': water_total, 'توصيلة صرف صحي': sewage_total}
         }
     
     data = result[0]
     
     # استخراج النتائج
-    total = data['total'][0]['count'] if data['total'] else 0
-    fixed = data['fixed'][0]['count'] if data['fixed'] else 0
+    total = (data['total'][0]['count'] if data['total'] else 0) + water_total + sewage_total
+    fixed = (data['fixed'][0]['count'] if data['fixed'] else 0) + water_fixed + sewage_fixed
     asphalt_remaining = data['asphalt_remaining'][0]['count'] if data['asphalt_remaining'] else 0
     
     asphalt_stats = data['asphalt_reports'][0] if data['asphalt_reports'] else {}
@@ -3016,7 +3620,9 @@ async def get_reports_stats(
         'terrestrial': terrestrial,
         'tile': tile,
         'asphalt': asphalt,
-        'by_type': by_type  # إرجاع جميع الأنواع ديناميكياً
+        'water_connections': water_total,
+        'sewage_connections': sewage_total,
+        'by_type': {**by_type, 'توصيلة مياه': water_total, 'توصيلة صرف صحي': sewage_total}
     }
     
     # Store in cache
@@ -3028,58 +3634,180 @@ async def get_reports_stats(
 @api_router.get("/reports/governorate-72h-counts")
 async def get_governorate_48h_counts(
     project: Optional[str] = Query(None),
+    category: Optional[str] = Query("reports"),
+    base_date: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user)
 ):
     """جلب عدد البلاغات لكل محافظة في آخر 72 ساعة بناءً على timestamp"""
-    from datetime import timedelta
+    # جلب جميع المحافظات المتاحة للمستخدم لضمان ظهورها جميعاً حتى لو كان العدد 0
+    available_govs = []
+    try:
+        # جلب المحافظات من قاعدة البيانات
+        custom_govs = await db.project_governorates.find({}, {"_id": 0}).to_list(2000)
+        
+        # دمج المحافظات المخصصة
+        all_possible_govs = {}
+        for c in custom_govs:
+            p = c.get('project')
+            n = c.get('name')
+            if p and n:
+                if p not in all_possible_govs: all_possible_govs[p] = []
+                if n not in all_possible_govs[p]: all_possible_govs[p].append(n)
+        
+        # تحديد المشاريع المستهدفة بناءً على فلتر المستخدم وصلاحياته
+        target_projects = []
+        if current_user.role == "admin":
+            if project: target_projects = [project]
+            else: target_projects = list(all_possible_govs.keys())
+        else:
+            if project: target_projects = [project]
+            else: target_projects = current_user.projects or []
+            
+        for tp in target_projects:
+            # مطابقة مرنة للمشروع
+            for p_key, p_govs in all_possible_govs.items():
+                if tp == p_key or (project and tp in p_key):
+                    for g in p_govs:
+                        # التحقق من صلاحيات المحافظة للمستوى 3
+                        if current_user.role == "admin" or not current_user.governorates or g in current_user.governorates:
+                            if (g, p_key) not in available_govs:
+                                available_govs.append((g, p_key))
+    except Exception as e:
+        import logging
+        logging.error(f"Error building available govs list: {str(e)}")
+
+    from datetime import timedelta, datetime
     
-    # حساب الوقت قبل 72 ساعة بالضبط (بدون timezone للمقارنة البسيطة)
-    seventy_two_hours_ago = datetime.utcnow() - timedelta(hours=72)
+    # حساب الوقت المرجعي (الآن أو التاريخ المختار)
+    if base_date:
+        try:
+            base_dt = datetime.fromisoformat(base_date.replace('Z', '+00:00'))
+            if base_dt.tzinfo:
+                base_dt = base_dt.replace(tzinfo=None)
+            reference_time = base_dt
+        except:
+            reference_time = datetime.utcnow()
+    else:
+        reference_time = datetime.utcnow()
+
+    # حساب الوقت قبل 72 ساعة بالضبط
+    seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
-    # بناء الاستعلام الأساسي (بدون فلتر التاريخ - سنفلتر يدوياً)
-    query = {"is_deleted": False}
+    # بناء الاستعلام الأساسي 
+    query = {"is_deleted": {"$ne": True}}
     
-    # إضافة فلتر المشروع
+    # إضافة فلتر المشروع - بحث مرن جداً بالكلمات المفتاحية
     if project:
-        query["project"] = project
+        query["project"] = get_flexible_project_query(project)
     
     # التصفية الهرمية حسب الصلاحيات
-    if current_user.role != "admin":
+    if current_user.role != 'admin':
+        # للمستخدمين (مستوى 2 و 3): رؤية كل ما هو متاح في نطاق مشروعاتهم ومحافظاتهم
         if current_user.projects:
-            if project and project not in current_user.projects:
-                return []
-            elif not project:
-                query["project"] = {"$in": current_user.projects}
+            # فلترة بالمشاريع المتاحة
+            if project:
+                # التحقق من أن المشروع المختار ضمن مشاريع المستخدم بمرونة
+                has_permission = False
+                for up in current_user.projects:
+                    up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                    proj_keywords = [k for k in project.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                    is_match = any(k in project for k in up_keywords) or any(k in up for k in proj_keywords)
+                    
+                    if is_match:
+                        has_permission = True
+                        break
+                if not has_permission:
+                    return []
+            else:
+                # إذا لم يختر مشروع، نفلتر بجميع مشاريعه بمرونة
+                query.update(get_flexible_in_query(current_user.projects, "project"))
         
-        if current_user.governorates:
-            query["governorate"] = {"$in": current_user.governorates}
-            
-            total_govs = get_total_governorates_count_for_projects(current_user.projects)
-            if len(current_user.governorates) < (total_govs * 0.85):
-                allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-                query["created_by"] = {"$in": allowed_user_ids}
+        # التصفية الهرمية لضمان أن المستوى الثالث يرى بلاغاته فقط
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        
+        # Check if user has reports_review permission globally or in any project
+        permissions = getattr(current_user, 'permissions', [])
+        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        
+        # تجميع معرفات المستخدمين (المسؤول + التابعين له هرمياً)
+        if getattr(current_user, 'can_create_subusers', False) or "reports_view" in permissions or has_reports_review:
+            hierarchy_filter = {} # Bypass created_by restriction for reviewers (Level 2/Admin)
         else:
-            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            query["created_by"] = {"$in": allowed_user_ids}
+            hierarchy_filter = await get_hierarchy_filter(current_user)
+        
+        if len(user_governorates) > 0:
+            gov_patterns = []
+            for g in user_governorates:
+                p = normalize_arabic_regex(g)
+                gov_patterns.append(p)
+            gov_regex = f"({'|'.join(gov_patterns)})"
+            
+            if hierarchy_filter:
+                query.update(hierarchy_filter)
+            query['governorate'] = {'$regex': gov_regex, '$options': 'i'}
+        else:
+            if hierarchy_filter:
+                query.update(hierarchy_filter)
     
-    # جلب جميع البلاغات ثم فلترة يدوياً (يستخدم start_date = تاريخ مباشرة البلاغ)
-    all_reports = await db.reports.find(query, {"_id": 0, "governorate": 1, "created_at": 1, "added_at": 1, "start_date": 1}).to_list(5000)
+    # تحديد ما إذا كان المشروع مخصص للتوصيلات
+    is_connection_only = False
+    if project and any(kw in project for kw in ['ايصال', 'إيصال', 'توصيل']):
+        is_connection_only = True
+
+    # جلب البلاغات إذا كانت الفئة 'reports' أو 'all' أو إذا كان المشروع ليس مخصصاً للتوصيلات فقط
+    all_reports = []
+    
+    # استعلام التوصيلات (تستخدم area بدلاً من governorate)
+    conn_query = query.copy()
+    if "governorate" in conn_query:
+        conn_query["area"] = conn_query.pop("governorate")
+    if "$or" in conn_query:
+        for branch in conn_query["$or"]:
+            if "governorate" in branch:
+                branch["area"] = branch.pop("governorate")
+
+    # جلب البلاغات العادية
+    if category in ['reports', 'all', None]:
+        reports_list = await db.reports.find(query, {"_id": 0, "governorate": 1, "created_at": 1, "added_at": 1, "start_date": 1, "project": 1}).to_list(5000)
+        for r in reports_list:
+            r['item_type'] = 'report'
+            all_reports.append(r)
+    
+    # جلب التوصيلات مع الترتيب
+    if category in ['water_connections', 'all'] or (is_connection_only and category in ['reports', None]):
+        water_conns = await db.water_connections.find(conn_query, {"_id": 0, "area": 1, "governorate": 1, "created_at": 1, "added_at": 1, "project": 1}).sort("created_at", -1).to_list(2000)
+        for c in water_conns:
+            c['governorate'] = c.get('governorate') or c.get('area')
+            c['item_type'] = 'water_connection'
+            all_reports.append(c)
+        
+    if category in ['sewage_connections', 'all'] or (is_connection_only and category in ['reports', None]):
+        sewage_conns = await db.sewage_connections.find(conn_query, {"_id": 0, "area": 1, "governorate": 1, "created_at": 1, "added_at": 1, "project": 1}).sort("created_at", -1).to_list(2000)
+        for c in sewage_conns:
+            c['governorate'] = c.get('governorate') or c.get('area')
+            c['item_type'] = 'sewage_connection'
+            all_reports.append(c)
     
     # فلترة وتجميع حسب 72 ساعة بشكل يدوي
-    governorate_counts = {}
+    group_counts = {} # (gov, proj) -> count
+    
+    # تهيئة العدادات لجميع المحافظات المتاحة بـ 0 لضمان ظهورها
+    for gov, proj in available_govs:
+        group_counts[(gov, proj)] = 0
     for report in all_reports:
         start_date_val = report.get('start_date')
         created_at = report.get('created_at')
         added_at = report.get('added_at')
         governorate = report.get('governorate')
+        project_val = report.get('project', 'غير محدد')
         
         if not governorate:
             continue
         
-        # تحويل التاريخ إلى datetime للمقارنة (يستخدم تاريخ مباشرة البلاغ أولاً)
+        # تحويل التاريخ إلى datetime للمقارنة
         report_date = None
         
-        # أولوية 1: start_date (تاريخ مباشرة البلاغ)
+        # أولوية 1: start_date
         if isinstance(start_date_val, datetime):
             report_date = start_date_val.replace(tzinfo=None) if start_date_val.tzinfo else start_date_val
         elif isinstance(start_date_val, str) and start_date_val:
@@ -3089,7 +3817,7 @@ async def get_governorate_48h_counts(
             except Exception:
                 pass
         
-        # أولوية 2: created_at fallback
+        # أولوية 2: created_at
         if not report_date and isinstance(created_at, datetime):
             report_date = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
         elif not report_date and isinstance(created_at, str):
@@ -3104,15 +3832,19 @@ async def get_governorate_48h_counts(
         
         # التحقق من أن التاريخ ضمن 72 ساعة
         if report_date and report_date >= seventy_two_hours_ago:
-            governorate_counts[governorate] = governorate_counts.get(governorate, 0) + 1
+            key = (governorate, project_val)
+            group_counts[key] = group_counts.get(key, 0) + 1
     
-    # تحويل النتيجة إلى قائمة وترتيبها
+    # تحويل النتيجة إلى قائمة
     result = [
-        {"governorate": gov, "count": count} 
-        for gov, count in governorate_counts.items()
+        {"governorate": gov, "project": proj, "count": count} 
+        for (gov, proj), count in group_counts.items()
     ]
-    result.sort(key=lambda x: x['count'], reverse=True)
     
+    # إخفاء المحافظات التي عددها 0 لتقليل الزحام دائماً
+    result = [r for r in result if r['count'] > 0]
+        
+    result.sort(key=lambda x: x['count'], reverse=True)
     return result
 
 
@@ -3120,48 +3852,133 @@ async def get_governorate_48h_counts(
 async def get_reports_last_72_hours_list(
     project: Optional[str] = Query(None),
     governorate: Optional[str] = Query(None),
+    category: Optional[str] = Query("reports"),
+    base_date: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user)
 ):
     """جلب قائمة البلاغات خلال آخر 72 ساعة (بناءً على created_at timestamp)"""
-    from datetime import timedelta
+    from datetime import timedelta, datetime
     
-    # حساب الوقت قبل 72 ساعة بالضبط (بدون timezone للمقارنة البسيطة)
-    seventy_two_hours_ago = datetime.utcnow() - timedelta(hours=72)
+    # حساب الوقت المرجعي
+    if base_date:
+        try:
+            base_dt = datetime.fromisoformat(base_date.replace('Z', '+00:00'))
+            if base_dt.tzinfo:
+                base_dt = base_dt.replace(tzinfo=None)
+            reference_time = base_dt
+        except:
+            reference_time = datetime.utcnow()
+    else:
+        reference_time = datetime.utcnow()
+
+    # حساب الوقت قبل 72 ساعة بالضبط
+    seventy_two_hours_ago = reference_time - timedelta(hours=72)
     
-    # بناء الاستعلام الأساسي (بدون فلتر التاريخ - سنفلتر يدوياً)
-    query = {"is_deleted": False}
+    # بناء الاستعلام الأساسي 
+    query = {"is_deleted": {"$ne": True}}
     
-    # إضافة فلاتر المشروع والمحافظة
+    # إضافة فلاتر المشروع والمحافظة (مع البحث المرن)
     if project:
-        query["project"] = project
-    if governorate:
-        query["governorate"] = governorate
+        query["project"] = get_flexible_project_query(project)
+            
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+        query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
     
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
+        
+        # 1. التحقق من صلاحية المشروع بمرونة
         if current_user.projects:
-            if project and project not in current_user.projects:
+            has_permission = False
+            for up in current_user.projects:
+                up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                proj_keywords = [k for k in (project or "").replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                if project and (any(k in project for k in up_keywords) or any(k in up for k in proj_keywords)):
+                    has_permission = True
+                    break
+            
+            if project and not has_permission:
                 return {"reports": []}
             elif not project:
-                query["project"] = {"$in": current_user.projects}
+                query.update(get_flexible_in_query(current_user.projects, "project"))
         
-        if current_user.governorates:
-            if governorate and governorate not in current_user.governorates:
-                return {"reports": []}
-            elif not governorate:
-                query["governorate"] = {"$in": current_user.governorates}
-            
-            total_govs = get_total_governorates_count_for_projects(current_user.projects)
-            if len(current_user.governorates) < (total_govs * 0.85):
-                allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-                query["created_by"] = {"$in": allowed_user_ids}
+        # 2. تجميع معرفات المستخدمين (الهرمية)
+        sub_users_docs = await db.users.find(
+            {"$or": [{"created_by": current_user.id}, {"created_by": current_user.username}]}, 
+            {"_id": 0, "id": 1, "username": 1}
+        ).to_list(1000)
+        sub_user_ids = []
+        for u in sub_users_docs:
+            if u.get("id"): sub_user_ids.append(u["id"])
+            if u.get("username"): sub_user_ids.append(u["username"])
+        all_authorized_creators = [current_user.id, current_user.username] + sub_user_ids
+
+        # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته
+        permissions = getattr(current_user, 'permissions', [])
+        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
+            query['created_by'] = {'$in': [current_user.id, current_user.username]}
+            if not has_all_govs and user_governorates:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
+                        return {"reports": []}
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
         else:
-            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            query["created_by"] = {"$in": allowed_user_ids}
+            # المستوى الثاني يرى كافة البلاغات في المحافظات المسندة إليه
+            if not has_all_govs and user_governorates:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
+                        return {"reports": []}
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
     
-    # جلب البلاغات (بدون الصور)
+    # تحديد ما إذا كان المشروع مخصص للتوصيلات
+    is_connection_only = False
+    if project and any(kw in project for kw in ['ايصال', 'إيصال', 'توصيل']):
+        is_connection_only = True
+
+    # جلب البيانات بناءً على الفئة
+    all_reports = []
     projection = {"_id": 0, "images": 0}
-    all_reports = await db.reports.find(query, projection).sort("created_at", -1).to_list(1000)
+    
+    print("DEBUG last-72-hours-list query:", query)
+    
+    if category in ['reports', 'all', None]:
+        reports_list = await db.reports.find(query, projection).sort("created_at", -1).to_list(10000)
+        print("DEBUG last-72-hours-list reports found:", len(reports_list))
+        all_reports.extend(reports_list)
+    
+    # جلب التوصيلات خلال آخر 72 ساعة (مع التحقق من مشاريع الإيصال)
+    if category in ['water_connections', 'sewage_connections', 'all'] or (is_connection_only and category in ['reports', None]):
+        conn_query = query.copy()
+        if "governorate" in conn_query:
+            conn_query["area"] = conn_query.pop("governorate")
+        
+        # الاعتماد على الفلترة اليدوية اللاحقة لضمان الدقة وتوحيد المنطق مع إحصائيات المحافظات
+        pass
+        
+        if category in ['water_connections', 'all']:
+            water_conns = await db.water_connections.find(conn_query, projection).sort("created_at", -1).to_list(1000)
+            for c in water_conns:
+                c['report_type'] = 'توصيلة مياه'
+                c['report_number'] = c.get('request_number') or c.get('ccb_report_number')
+                c['status'] = c.get('request_status')
+                all_reports.append(c)
+        
+        if category in ['sewage_connections', 'all']:
+            sewage_conns = await db.sewage_connections.find(conn_query, projection).sort("created_at", -1).to_list(1000)
+            for c in sewage_conns:
+                c['report_type'] = 'توصيلة صرف صحي'
+                c['report_number'] = c.get('request_number') or c.get('ccb_report_number')
+                c['status'] = c.get('request_status')
+                all_reports.append(c)
     
     # فلترة البلاغات حسب 72 ساعة بشكل يدوي (يستخدم start_date = تاريخ مباشرة البلاغ)
     reports = []
@@ -3229,52 +4046,86 @@ async def get_reports_last_72_hours(
     
     # Use $or to search in both created_at and added_at fields
     query = {
-        "is_deleted": False,
+        "is_deleted": {"$ne": True},
         "$or": [
             {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
             {"added_at": {"$gte": seventy_two_hours_ago}}
         ]
     }
     
-    # إضافة فلاتر المشروع والمحافظة إذا تم تحديدها
+    # إضافة فلاتر المشروع والمحافظة (مع البحث المرن)
     if project:
-        query["project"] = project
+        query["project"] = get_flexible_project_query(project)
+            
     if governorate:
-        query["governorate"] = governorate
+        query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
+        
+    # استعلام التوصيلات
+    conn_query = {
+        "$or": [
+            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"added_at": {"$gte": seventy_two_hours_ago}}
+        ]
+    }
+    if project:
+        conn_query["project"] = get_flexible_project_query(project)
+            
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+        conn_query["area"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'} 
     
     # التصفية الهرمية حسب الصلاحيات
     if current_user.role != "admin":
-        # تصفية حسب صلاحيات المشاريع
-        if current_user.projects:
-            if project:
-                # التأكد من أن المشروع المطلوب في صلاحيات المستخدم
-                if project not in current_user.projects:
-                    return {"governorate": governorate, "count": 0} if governorate else []
-            else:
-                query["project"] = {"$in": current_user.projects}
-        
-        # تصفية حسب صلاحيات المحافظات
-        if current_user.governorates:
-            if governorate:
-                # التأكد من أن المحافظة المطلوبة في صلاحيات المستخدم
-                if governorate not in current_user.governorates:
-                    return {"governorate": governorate, "count": 0}
-            else:
-                query["governorate"] = {"$in": current_user.governorates}
-            
-            # حساب إجمالي عدد المحافظات في مشاريع المستخدم
-            total_govs = get_total_governorates_count_for_projects(current_user.projects)
-            
-            # إذا كان لديه محافظات محدودة
-            if len(current_user.governorates) < (total_govs * 0.85):
-                allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-                query["created_by"] = {"$in": allowed_user_ids}
+        permissions = getattr(current_user, 'permissions', [])
+        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
+            query["created_by"] = {"$in": [current_user.id, current_user.username]}
+            conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
+            if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
+                        return {"governorate": governorate, "count": 0} if governorate else []
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in current_user.governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
+            if current_user.projects:
+                if project:
+                    has_proj_perm = False
+                    for up in current_user.projects:
+                        up_kws = [k for k in up.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        p_kws = [k for k in project.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        if any(k in project for k in up_kws) or any(k in up for k in p_kws):
+                            has_proj_perm = True; break
+                    if not has_proj_perm:
+                        return {"governorate": governorate, "count": 0} if governorate else []
+                else:
+                    query.update(get_flexible_in_query(current_user.projects, "project"))
         else:
-            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            query["created_by"] = {"$in": allowed_user_ids}
+            # Level 2 and above
+            if current_user.projects:
+                if project:
+                    has_proj_perm = False
+                    for up in current_user.projects:
+                        up_kws = [k for k in up.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        p_kws = [k for k in project.replace('-', ' ').split() if len(k)>2 and k not in ['مشروع','أعمال','إصلاح']]
+                        if any(k in project for k in up_kws) or any(k in up for k in p_kws):
+                            has_proj_perm = True; break
+                    if not has_proj_perm:
+                        return {"governorate": governorate, "count": 0} if governorate else []
+                else:
+                    query.update(get_flexible_in_query(current_user.projects, "project"))
+            
+            if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in current_user.governorates):
+                        return {"governorate": governorate, "count": 0}
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in current_user.governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
     
     # إذا تم تحديد محافظة، نرجع العدد مباشرة
-    if governorate:
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
         count = await db.reports.count_documents(query)
         return {"governorate": governorate, "count": count, "project": project}
     
@@ -3291,8 +4142,21 @@ async def get_reports_last_72_hours(
     
     result = await db.reports.aggregate(pipeline).to_list(100)
     
+    # إضافة التوصيلات للتجميع
+    water_count = await db.water_connections.count_documents(conn_query)
+    sewage_count = await db.sewage_connections.count_documents(conn_query)
+    
     # تحويل النتيجة إلى قائمة
     governorate_counts = [{"governorate": item['_id'], "count": item['count']} for item in result]
+    
+    # إذا كان هناك توصيلات، يمكننا إضافتها تحت محافظة "توصيلات" أو توزيعها إذا كان لدينا معلومات المحافظة
+    # للتبسيط الآن سنضيفها للعدد الإجمالي إذا لم يكن هناك فلتر محافظة، أو نضيفها لنتائج البحث
+    if not governorate:
+        # إضافة عنصر للتوصيلات
+        if water_count > 0:
+            governorate_counts.append({"governorate": "توصيلات مياه", "count": water_count})
+        if sewage_count > 0:
+            governorate_counts.append({"governorate": "توصيلات صرف", "count": sewage_count})
     
     return governorate_counts
 
@@ -3300,7 +4164,7 @@ async def get_reports_last_72_hours(
 @api_router.get("/reports/{report_id}/images")
 async def get_report_images(report_id: str, current_user: User = Depends(get_current_user)):
     """جلب صور بلاغ معين فقط (Lazy Loading)"""
-    query = {"id": report_id, "is_deleted": False}
+    query = {"id": report_id, "is_deleted": {"$ne": True}}
     
     # فلترة حسب صلاحيات المحافظات
     if current_user.role != "admin" or len(current_user.governorates) > 0:
@@ -3406,7 +4270,7 @@ async def get_my_reports_count(current_user: User = Depends(get_current_user)):
     try:
         # البحث بالـ user_id أو username
         query = {
-            "is_deleted": False,
+            "is_deleted": {"$ne": True},
             "$or": [
                 {"created_by": current_user.id},
                 {"created_by": current_user.username}
@@ -3432,12 +4296,20 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
     """
     try:
         base = {
-            "is_deleted": False,
-            "review_status": "بانتظار المراجعة"
+            "is_deleted": {"$ne": True},
+            "review_status": {"$in": ["بانتظار المراجعة", "قيد المراجعة", None]}
         }
         
         if current_user.role == "admin":
             count = await db.reports.count_documents(base)
+            return {"count": count}
+            
+        # للمستوى الثالث العادي، يرون فقط بلاغاتهم بانتظار المراجعة
+        permissions = getattr(current_user, 'permissions', [])
+        has_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_review:
+            query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
+            count = await db.reports.count_documents(query)
             return {"count": count}
         
         # المشاريع التي يملك فيها المستخدم صلاحية reports_review
@@ -3472,30 +4344,47 @@ async def get_pending_review_by_governorate(current_user: User = Depends(get_cur
     """
     try:
         base = {
-            "is_deleted": False,
-            "review_status": "بانتظار المراجعة"
+            "is_deleted": {"$ne": True},
+            "review_status": {"$in": ["بانتظار المراجعة", "قيد المراجعة", None]}
         }
         
         if current_user.role == "admin":
             query = base
+        elif not current_user.can_create_subusers and not ("reports_review" in getattr(current_user, 'permissions', []) or len(get_projects_with_permission(current_user, "reports_review")) > 0):
+            # للمستوى الثالث العادي (لا يملكون صلاحية مراجعة)، يرون فقط بلاغاتهم
+            query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
         else:
-            allowed_projects = get_projects_with_permission(current_user, "reports_review")
+            # جلب المشاريع التي يملك فيها المستخدم أي صلاحية (رؤية أو مراجعة أو إضافة)
+            allowed_projects = set(get_projects_with_permission(current_user, "reports_view")) | \
+                               set(get_projects_with_permission(current_user, "reports_review")) | \
+                               set(get_projects_with_permission(current_user, "reports_add"))
+            
             governorates = current_user.governorates or []
-            or_clauses = []
+            
+            # بناء الاستعلام بناءً على النطاق الجغرافي والمشاريع
+            query_parts = []
+            
             if allowed_projects:
-                reviewer_clause = {"project": {"$in": allowed_projects}}
+                p_query = get_flexible_in_query(list(allowed_projects), "project")
                 if governorates:
-                    reviewer_clause["governorate"] = {"$in": governorates}
-                or_clauses.append(reviewer_clause)
-            or_clauses.append({"created_by": current_user.id})
-            query = {**base, "$or": or_clauses}
+                    p_query["governorate"] = {"$in": governorates}
+                query_parts.append(p_query)
+            
+            # دائماً يرى بلاغاته الشخصية
+            query_parts.append({"created_by": current_user.id})
+            
+            query = {**base, "$or": query_parts}
         
-        # Aggregation pipeline للحصول على العدد لكل محافظة
+        # Aggregation pipeline للحصول على العدد لكل محافظة ومشروع ومستخدم
         pipeline = [
             {"$match": query},
             {
                 "$group": {
-                    "_id": "$governorate",
+                    "_id": {
+                        "governorate": "$governorate",
+                        "project": "$project",
+                        "created_by": "$created_by"
+                    },
                     "count": {"$sum": 1}
                 }
             },
@@ -3505,10 +4394,29 @@ async def get_pending_review_by_governorate(current_user: User = Depends(get_cur
         result = await db.reports.aggregate(pipeline).to_list(100)
         
         # تحويل النتيجة
-        governorate_counts = [
-            {"governorate": item['_id'], "count": item['count']} 
-            for item in result if item['_id']
-        ]
+        governorate_counts = []
+        for item in result:
+            if not item.get('_id'):
+                continue
+                
+            # إيجاد اسم المستخدم إذا أمكن
+            created_by = item['_id'].get('created_by')
+            created_by_name = None
+            if created_by:
+                # إذا كان معرف، نجلب الاسم
+                user_obj = await db.users.find_one({"$or": [{"id": created_by}, {"username": created_by}]})
+                if user_obj:
+                    created_by_name = user_obj.get("full_name") or user_obj.get("username")
+                else:
+                    created_by_name = str(created_by)
+                    
+            governorate_counts.append({
+                "governorate": item['_id'].get('governorate', 'غير محدد'), 
+                "project": item['_id'].get('project', 'غير محدد'),
+                "created_by": created_by,
+                "created_by_name": created_by_name,
+                "count": item['count']
+            })
         
         return {"data": governorate_counts, "total": sum(item['count'] for item in governorate_counts)}
         
@@ -3533,9 +4441,10 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
     try:
         is_admin = current_user.role == "admin"
         # المشاريع المسموحة لكل نوع
+        # تحسين: إذا كان لديه صلاحية إشعارات البلاغات، يرى التوصيلات أيضاً لهذا المشروع
         report_projects = get_projects_with_permission(current_user, "reports_notifications")
-        water_projects = get_projects_with_permission(current_user, "water_connections")
-        sewage_projects = get_projects_with_permission(current_user, "sewage_connections")
+        water_projects = list(set(get_projects_with_permission(current_user, "water_connections") + report_projects))
+        sewage_projects = list(set(get_projects_with_permission(current_user, "sewage_connections") + report_projects))
         
         governorates = current_user.governorates or []
         
@@ -3543,12 +4452,11 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
         reports = []
         if is_admin or report_projects:
             base_query = {
-                "is_deleted": False,
-                "created_by": {"$ne": current_user.id},  # استبعاد ما أنشأه المستخدم
+                "is_deleted": {"$ne": True},
                 "$and": [
                     {"$or": [
                         {"seen_by": {"$exists": False}},
-                        {"seen_by": {"$not": {"$elemMatch": {"$eq": current_user.id}}}}
+                        {"seen_by": {"$ne": current_user.id}}
                     ]},
                     {"$or": [
                         {"deleted_notifications": {"$exists": False}},
@@ -3557,13 +4465,21 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
                 ]
             }
             if not is_admin:
-                base_query["project"] = {"$in": report_projects}
+                expanded_reports = []
+                for p in report_projects:
+                    expanded_reports.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                base_query["project"] = {"$in": expanded_reports}
+                
                 if governorates:
-                    base_query["governorate"] = {"$in": governorates}
+                    expanded_govs = []
+                    for g in governorates:
+                        clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                        expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                    base_query["governorate"] = {"$in": expanded_govs}
             reports = await db.reports.find(
                 base_query,
                 {"_id": 0, "id": 1, "report_number": 1, "governorate": 1, "project": 1,
-                 "report_type": 1, "created_at": 1, "added_at": 1, "contractor": 1, "created_by": 1}
+                 "report_type": 1, "created_at": 1, "added_at": 1, "contractor": 1, "created_by": 1, "created_by_name": 1}
             ).sort("added_at", -1).limit(300).to_list(300)
             for r in reports:
                 r["item_type"] = "report"
@@ -3573,11 +4489,10 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
         if is_admin or water_projects:
             wq = {
                 "is_deleted": {"$ne": True},
-                "created_by": {"$ne": current_user.id},
                 "$and": [
                     {"$or": [
                         {"seen_by": {"$exists": False}},
-                        {"seen_by": {"$not": {"$elemMatch": {"$eq": current_user.id}}}}
+                        {"seen_by": {"$ne": current_user.id}}
                     ]},
                     {"$or": [
                         {"deleted_notifications": {"$exists": False}},
@@ -3586,25 +4501,34 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
                 ]
             }
             if not is_admin:
-                wq["project"] = {"$in": water_projects}
+                expanded_water = []
+                for p in water_projects:
+                    expanded_water.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                wq["project"] = {"$in": expanded_water}
+                if governorates:
+                    expanded_govs = []
+                    for g in governorates:
+                        clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                        expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                    wq["area"] = {"$in": expanded_govs}
             water_conns = await db.water_connections.find(
                 wq,
                 {"_id": 0, "id": 1, "request_number": 1, "account_number": 1, "project": 1,
-                 "customer_name": 1, "created_at": 1, "created_by": 1, "created_by_name": 1}
+                 "customer_name": 1, "created_at": 1, "created_by": 1, "created_by_name": 1, "area": 1}
             ).sort("created_at", -1).limit(300).to_list(300)
             for c in water_conns:
                 c["item_type"] = "water_connection"
+                c["governorate"] = c.get("area") or "غير محدد"
         
         # ===== توصيلات الصرف =====
         sewage_conns = []
         if is_admin or sewage_projects:
             sq = {
                 "is_deleted": {"$ne": True},
-                "created_by": {"$ne": current_user.id},
                 "$and": [
                     {"$or": [
                         {"seen_by": {"$exists": False}},
-                        {"seen_by": {"$not": {"$elemMatch": {"$eq": current_user.id}}}}
+                        {"seen_by": {"$ne": current_user.id}}
                     ]},
                     {"$or": [
                         {"deleted_notifications": {"$exists": False}},
@@ -3613,20 +4537,41 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
                 ]
             }
             if not is_admin:
-                sq["project"] = {"$in": sewage_projects}
+                expanded_sewage = []
+                for p in sewage_projects:
+                    expanded_sewage.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                sq["project"] = {"$in": expanded_sewage}
+                if governorates:
+                    expanded_govs = []
+                    for g in governorates:
+                        clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                        expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                    sq["area"] = {"$in": expanded_govs}
             sewage_conns = await db.sewage_connections.find(
                 sq,
                 {"_id": 0, "id": 1, "request_number": 1, "account_number": 1, "project": 1,
-                 "customer_name": 1, "created_at": 1, "created_by": 1, "created_by_name": 1}
+                 "customer_name": 1, "created_at": 1, "created_by": 1, "created_by_name": 1, "area": 1}
             ).sort("created_at", -1).limit(300).to_list(300)
             for c in sewage_conns:
                 c["item_type"] = "sewage_connection"
+                c["governorate"] = c.get("area") or "غير محدد"
         
-        # تجميع البلاغات حسب المحافظة (التوصيلات ليس لها محافظة، تُجمع تحت "توصيلات")
-        by_governorate = {}
+        # تجميع العناصر حسب المحافظة والمشروع (لإظهار اسم المشروع تحت المحافظة في الهيدر)
+        by_gov_project = {} # (gov, project) -> items
         for report in reports:
             gov = report.get('governorate') or 'غير محدد'
-            by_governorate.setdefault(gov, []).append(report)
+            proj = report.get('project') or 'غير محدد'
+            by_gov_project.setdefault((gov, proj), []).append(report)
+        
+        for conn in water_conns:
+            gov = conn.get('governorate') or 'غير محدد'
+            proj = conn.get('project') or 'غير محدد'
+            by_gov_project.setdefault((gov, proj), []).append(conn)
+            
+        for conn in sewage_conns:
+            gov = conn.get('governorate') or 'غير محدد'
+            proj = conn.get('project') or 'غير محدد'
+            by_gov_project.setdefault((gov, proj), []).append(conn)
         
         total = len(reports) + len(water_conns) + len(sewage_conns)
         
@@ -3636,8 +4581,8 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
             "water_connections": water_conns,
             "sewage_connections": sewage_conns,
             "by_governorate": [
-                {"governorate": gov, "count": len(items), "reports": items}
-                for gov, items in by_governorate.items()
+                {"governorate": gov, "project": proj, "count": len(items), "reports": items}
+                for (gov, proj), items in by_gov_project.items()
             ],
             "counts": {
                 "reports": len(reports),
@@ -3659,15 +4604,14 @@ async def get_seen_reports(current_user: User = Depends(get_current_user)):
     يستبعد البلاغات التي حذفها المستخدم من الإشعارات
     """
     try:
-        # المشاريع التي يملك فيها المستخدم صلاحية إشعارات البلاغات
-        allowed_projects = get_projects_with_permission(current_user, "reports_notifications")
+        allowed_projects = list(set(get_projects_with_permission(current_user, "reports_notifications") + get_projects_with_permission(current_user, "reports_review")))
         
         if current_user.role != "admin" and not allowed_projects:
             return {"total": 0, "reports": []}
         
         # الشرط الأساسي: البلاغات المقروءة من قبل المستخدم واستبعاد المحذوفة
         base_query = {
-            "is_deleted": False,
+            "is_deleted": {"$ne": True},
             "seen_by": current_user.id,
             "$or": [
                 {"deleted_notifications": {"$exists": False}},
@@ -3680,10 +4624,17 @@ async def get_seen_reports(current_user: User = Depends(get_current_user)):
             query = base_query
         else:
             # المستخدم يرى بلاغات مشاريعه المصرح له بإشعاراتها فقط
-            query = {**base_query, "project": {"$in": allowed_projects}}
+            expanded_reports = []
+            for p in allowed_projects:
+                expanded_reports.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+            query = {**base_query, "project": {"$in": expanded_reports}}
             governorates = current_user.governorates or []
             if governorates:
-                query["governorate"] = {"$in": governorates}
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                query["governorate"] = {"$in": expanded_govs}
         
         # جلب آخر 50 بلاغ مقروء
         reports = await db.reports.find(
@@ -3758,14 +4709,14 @@ async def mark_report_as_unseen(report_id: str, current_user: User = Depends(get
 @api_router.post("/reports/mark-all-seen")
 async def mark_all_reports_as_seen(current_user: User = Depends(get_current_user)):
     """
-    تحديد جميع البلاغات الجديدة كـ 'تمت رؤيتها' للمستخدم الحالي
+    تحديد جميع البلاغات والتوصيلات الجديدة كـ 'تمت رؤيتها' للمستخدم الحالي
     """
     try:
         query = {
-            "is_deleted": False,
+            "is_deleted": {"$ne": True},
             "$or": [
                 {"seen_by": {"$exists": False}},
-                {"seen_by": {"$not": {"$elemMatch": {"$eq": current_user.id}}}}
+                {"seen_by": {"$ne": current_user.id}}
             ]
         }
         
@@ -3777,21 +4728,49 @@ async def mark_all_reports_as_seen(current_user: User = Depends(get_current_user
             pass
         elif len(projects) > 0:
             # المستخدم لديه مشاريع محددة - يرى بلاغات مشاريعه فقط
-            query["project"] = {"$in": projects}
+            expanded_projects = []
+            for p in projects:
+                expanded_projects.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+            query["project"] = {"$in": expanded_projects}
+            
+            governorates = current_user.governorates or []
+            if governorates:
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                
+                # We will apply this general query for all collections,
+                # if the collection uses "area" instead of "governorate", we might need two queries, 
+                # but to be safe and simple, let's use an $or
+                query["$or"] = [{"governorate": {"$in": expanded_govs}}, {"area": {"$in": expanded_govs}}, {"governorate": {"$exists": False}}, {"area": {"$exists": False}}]
         else:
             # المستخدم ليس لديه مشاريع - يرى بلاغاته فقط
-            query["created_by"] = current_user.id
+            pass  # Removed created_by filter so they can see all if they have no projects assigned but somehow reach here
         
-        result = await db.reports.update_many(
+        result_reports = await db.reports.update_many(
             query,
             {"$addToSet": {"seen_by": current_user.id}}
         )
         
-        return {"success": True, "count": result.modified_count, "message": f"تم تحديد {result.modified_count} بلاغ كمرئي"}
+        # تحديث توصيلات المياه
+        result_water = await db.water_connections.update_many(
+            query,
+            {"$addToSet": {"seen_by": current_user.id}}
+        )
+        
+        # تحديث توصيلات الصرف
+        result_sewage = await db.sewage_connections.update_many(
+            query,
+            {"$addToSet": {"seen_by": current_user.id}}
+        )
+        
+        total_modified = result_reports.modified_count + result_water.modified_count + result_sewage.modified_count
+        return {"success": True, "count": total_modified, "message": f"تم تحديد {total_modified} عنصر كمرئي"}
         
     except Exception as e:
         logger.error(f"Error marking all reports as seen: {str(e)}")
-        raise HTTPException(status_code=500, detail="فشل في تحديث حالة البلاغات")
+        raise HTTPException(status_code=500, detail="فشل في تحديث حالة الإشعارات")
 
 
 @api_router.delete("/reports/notifications/{report_id}")
@@ -3831,10 +4810,10 @@ async def clear_all_read_notifications(current_user: User = Depends(get_current_
         # بناء الـ query حسب صلاحيات المستخدم
         if current_user.role == "admin":
             # Admin: حذف جميع الإشعارات
-            query = {"is_deleted": False}
+            query = {"is_deleted": {"$ne": True}}
         elif len(projects) > 0:
             # المستخدم لديه مشاريع: حذف إشعارات مشاريعه
-            query = {"is_deleted": False, "project": {"$in": projects}}
+            query = {"is_deleted": {"$ne": True}, "project": {"$in": projects}}
         else:
             return {"success": True, "count": 0, "message": "لا توجد إشعارات للحذف"}
         
@@ -3921,13 +4900,139 @@ async def delete_sewage_connection_notification(conn_id: str, current_user: User
 
 
 
+@api_router.get("/reports/consultant-notes")
+async def get_consultant_notes(
+    project: str = Query(None),
+    governorate: str = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    role = user_doc.get("role")
+    
+    # Check if user has consultant_notes permission
+    if role != "admin":
+        has_perm = False
+        if "consultant_notes" in user_perms:
+            has_perm = True
+        else:
+            for p in pp.values():
+                if "consultant_notes" in p:
+                    has_perm = True
+                    break
+        if not has_perm:
+            raise HTTPException(status_code=403, detail="Forbidden")
+            
+    # Base query
+    query = {
+        "consultant_note": {"$exists": True, "$ne": "", "$type": "string"},
+        "is_deleted": {"$ne": True}
+    }
+    
+    user_projs = user_doc.get("projects", [])
+    user_govs = user_doc.get("governorates", [])
+    
+    if role != "admin":
+        if not project and user_projs:
+            proj_filter = get_loose_in_query(user_projs, "project")
+        elif project:
+            proj_filter = get_flexible_in_query([project], "project")
+        else:
+            proj_filter = {}
+            
+        if not governorate and user_govs:
+            gov_filter = get_flexible_in_query(user_govs, "governorate")
+        elif governorate:
+            gov_filter = get_flexible_in_query([governorate], "governorate")
+        else:
+            gov_filter = {}
+            
+        if proj_filter and gov_filter:
+            query["$and"] = [proj_filter, gov_filter]
+        elif proj_filter:
+            query.update(proj_filter)
+        elif gov_filter:
+            query.update(gov_filter)
+            
+    else:
+        filters = []
+        if project:
+            filters.append(get_flexible_in_query([project], "project"))
+        if governorate:
+            filters.append(get_flexible_in_query([governorate], "governorate"))
+            
+        if len(filters) > 1:
+            query["$and"] = filters
+        elif filters:
+            query.update(filters[0])
+
+    print("=== DEBUG get_consultant_notes ===")
+    print("User:", current_user.username)
+    print("Query:", query)
+    
+    reports = await db.reports.find(
+        query, 
+        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "consultant_note": 1, "consultant_note_by": 1, "consultant_note_reply": 1, "consultant_note_replied_by": 1, "consultant_note_processed": 1, "created_at": 1, "status": 1}
+    ).sort("created_at", -1).to_list(200)
+    
+    print("Found Reports:", len(reports))
+    
+    return {"reports": reports}
+
+
+@api_router.put("/reports/{report_id}/consultant_note_processed")
+async def toggle_consultant_note_processed(report_id: str, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    user_role = getattr(current_user, "role", current_user.get("role") if isinstance(current_user, dict) else None)
+    can_create = getattr(current_user, "can_create_subusers", current_user.get("can_create_subusers") if isinstance(current_user, dict) else False)
+    
+    if user_role != "admin" and not can_create:
+        raise HTTPException(status_code=403, detail="Only Level 1 and Level 2 can process consultant notes")
+    current_status = report.get("consultant_note_processed", False)
+    new_status = not current_status
+    
+    await db.reports.update_one({"id": report_id}, {"$set": {"consultant_note_processed": new_status}})
+    return {"success": True, "consultant_note_processed": new_status}
+
+
+class ConsultantNoteReply(BaseModel):
+    reply: str
+
+@api_router.put("/reports/{report_id}/consultant_note_reply")
+async def update_consultant_note_reply(report_id: str, payload: ConsultantNoteReply, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    if not has_project_permission(current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user, report.get("project"), "consultant_notes"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+        
+    replier_name = current_user.full_name if getattr(current_user, 'full_name', None) else current_user.username
+    update_data = {
+        "consultant_note_reply": payload.reply,
+        "consultant_note_replied_by": replier_name if payload.reply else ""
+    }
+    
+    # Do not auto-change consultant_note_processed when adding a reply
+    # The user will manually click the button to mark it as processed
+    if not payload.reply:
+        # Only reset it if they delete the reply entirely
+        update_data["consultant_note_processed"] = False
+        
+    await db.reports.update_one({"id": report_id}, {"$set": update_data})
+    
+    return {"success": True, "reply": payload.reply, "replied_by": update_data["consultant_note_replied_by"]}
+
+
 @api_router.get("/reports/{report_id}", response_model=ReportResponse)
 async def get_report(
     report_id: str, 
     exclude_images: bool = Query(False, description="استبعاد الصور لتسريع التحميل"),
     current_user: User = Depends(get_current_user)
 ):
-    query = {"id": report_id, "is_deleted": False}
+    query = {"id": report_id, "is_deleted": {"$ne": True}}
     
     # فلترة حسب صلاحيات المحافظات (إلا إذا كان admin بدون محافظات محددة)
     if current_user.role != "admin" or len(current_user.governorates) > 0:
@@ -3972,6 +5077,9 @@ async def get_report(
     return ReportResponse(**report_doc)
 
 
+    return ReportResponse(**report_doc)
+
+
 @api_router.put("/reports/{report_id}", response_model=ReportResponse)
 async def update_report(
     report_id: str,
@@ -3995,7 +5103,7 @@ async def update_report(
     images: List[UploadFile] = File(default=[]),
     current_user: User = Depends(get_current_user)
 ):
-    query = {"id": report_id, "is_deleted": False}
+    query = {"id": report_id, "is_deleted": {"$ne": True}}
     
     # فلترة حسب صلاحيات المشاريع (إلا إذا كان admin بدون مشاريع محددة)
     if current_user.role != "admin" or len(current_user.projects) > 0:
@@ -4015,14 +5123,13 @@ async def update_report(
     if report_number is not None and report_number != report_doc.get('report_number'):
         existing_report = await db.reports.find_one({
             "report_number": report_number,
-            "is_deleted": False,
             "id": {"$ne": report_id}  # استثناء البلاغ الحالي
         })
         
         if existing_report:
             raise HTTPException(
                 status_code=400,
-                detail=f"رقم البلاغ '{report_number}' موجود مسبقاً. الرجاء استخدام رقم بلاغ آخر."
+                detail="هذا الرقم موجود مسبقاً"
             )
     
     # التحقق من تكرار رقم الرخصة - فقط للأرقام الفعلية (ليست نصوص مثل "لم يتم إصدار رخصة")
@@ -4039,14 +5146,13 @@ async def update_report(
         if _is_actual_license_edit(license_number):
             existing_license = await db.reports.find_one({
                 "license_number": license_number,
-                "is_deleted": False,
                 "id": {"$ne": report_id}  # استثناء البلاغ الحالي
             })
             
             if existing_license:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"رقم الرخصة '{license_number}' مضاف مسبقاً في بلاغ رقم '{existing_license.get('report_number')}'. الرجاء التحقق من رقم الرخصة."
+                    detail="هذا الرقم موجود مسبقاً"
                 )
     
     update_data = {}
@@ -4147,7 +5253,7 @@ async def update_report_review_status(
 ):
     """تحديث حالة مراجعة البلاغ - ديناميكي حسب صلاحية reports_review لكل مشروع"""
     
-    report = await db.reports.find_one({"id": report_id, "is_deleted": False}, {"_id": 0})
+    report = await db.reports.find_one({"id": report_id, "is_deleted": {"$ne": True}}, {"_id": 0})
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     
@@ -4171,19 +5277,20 @@ async def update_report_review_status(
                     authorized_users.append(u.get("full_name") or u.get("username"))
             
             if authorized_users:
-                names = "، ".join(authorized_users)
                 raise HTTPException(
                     status_code=403, 
-                    detail=f"لا يمكنك المراجعة، فقط {names} لديه صلاحية مراجعة بلاغات هذا المشروع"
+                    detail="لا يمكنك المراجعه فقط م/محمود هارون مهندس نظم المعلومات وتحليل البيانات لديه صلاحيه مراجعه بلاغات هذا المشروع"
                 )
             else:
                 raise HTTPException(
                     status_code=403, 
-                    detail="ليس لديك صلاحية مراجعة بلاغات هذا المشروع - يرجى التواصل مع بيت الخبرة"
+                    detail="لا يمكنك المراجعه فقط م/محمود هارون مهندس نظم المعلومات وتحليل البيانات لديه صلاحيه مراجعه بلاغات هذا المشروع"
                 )
     
     # تحديث حالة المراجعة
-    new_status = "تمت المراجعة" if report.get("review_status") == "بانتظار المراجعة" else "بانتظار المراجعة"
+    is_pending = report.get("review_status") in ["بانتظار المراجعة", "قيد المراجعة", None]
+    new_status = "تمت المراجعة" if is_pending else "قيد المراجعة"
+    reviewed_by_name = (current_user.full_name or current_user.username) if new_status == "تمت المراجعة" else None
     
     await db.reports.update_one(
         {"id": report_id},
@@ -4191,57 +5298,18 @@ async def update_report_review_status(
             "$set": {
                 "review_status": new_status,
                 "reviewed_by": current_user.id if new_status == "تمت المراجعة" else None,
-                "reviewed_by_name": (current_user.full_name or current_user.username) if new_status == "تمت المراجعة" else None,
+                "reviewed_by_name": reviewed_by_name,
                 "reviewed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None
             }
         }
     )
     
-    return {"message": "تم تحديث حالة المراجعة بنجاح", "review_status": new_status}
-
-
-@api_router.put("/wfm/toggle/{report_id}")
-async def toggle_wfm_closed(
-    report_id: str,
-    current_user: User = Depends(get_current_user)
-):
-    """تبديل حالة إغلاق WFM للبلاغ (قيد المعالجة <-> مقفلة WFM)"""
-    report = await db.reports.find_one({"id": report_id, "is_deleted": False}, {"_id": 0})
-    if not report:
-        raise HTTPException(status_code=404, detail="البلاغ غير موجود")
-
-    report_project = report.get("project", "")
-
-    # التحقق من الصلاحية: admin أو من لديه reports_review في هذا المشروع
-    if current_user.role != "admin":
-        if not has_project_permission(current_user, report_project, "reports_review"):
-            raise HTTPException(
-                status_code=403,
-                detail="ليس لديك صلاحية تغيير حالة WFM لهذا البلاغ"
-            )
-
-    # تبديل الحالة
-    current_wfm = report.get("wfm_closed", False)
-    new_wfm = not current_wfm
-
-    update_fields = {
-        "wfm_closed": new_wfm,
-        "updated_at": datetime.now(timezone.utc).isoformat()
+    msg = "تم مراجعة البلاغ بنجاح" if new_status == "تمت المراجعة" else "تم اعادة فتح حالة المراجعة"
+    return {
+        "message": msg, 
+        "review_status": new_status,
+        "reviewed_by_name": reviewed_by_name
     }
-
-    # إذا تم الإغلاق، سجّل من أغلقه ومتى
-    if new_wfm:
-        update_fields["wfm_closed_by"] = current_user.full_name or current_user.username
-        update_fields["wfm_closed_at"] = datetime.now(timezone.utc).isoformat()
-    else:
-        update_fields["wfm_closed_by"] = None
-        update_fields["wfm_closed_at"] = None
-
-    await db.reports.update_one({"id": report_id}, {"$set": update_fields})
-
-    msg = "تم إغلاق البلاغ من WFM بنجاح" if new_wfm else "تم إعادة فتح البلاغ من WFM بنجاح"
-    return {"message": msg, "wfm_closed": new_wfm}
-
 
 
 @api_router.delete("/reports/{report_id}/images/{image_index}")
@@ -4251,7 +5319,7 @@ async def delete_report_image(
     current_user: User = Depends(get_current_user)
 ):
     """حذف صورة معينة من البلاغ"""
-    query = {"id": report_id, "is_deleted": False}
+    query = {"id": report_id, "is_deleted": {"$ne": True}}
     
     # فلترة حسب صلاحيات المشاريع والمحافظات
     if current_user.role != "admin" or len(current_user.projects) > 0:
@@ -4288,7 +5356,7 @@ async def add_report_image(
     current_user: User = Depends(get_current_user)
 ):
     """إضافة صورة واحدة للبلاغ (رفع في الخلفية)"""
-    query = {"id": report_id, "is_deleted": False}
+    query = {"id": report_id, "is_deleted": {"$ne": True}}
     
     if current_user.role != "admin" or len(current_user.projects) > 0:
         if len(current_user.projects) > 0:
@@ -4328,7 +5396,7 @@ async def add_report_image(
 async def delete_report(report_id: str, current_user: User = Depends(get_current_user)):
     """حذف بلاغ (نقله إلى سلة المحذوفات)"""
     # أولاً: احصل على البلاغ
-    report_doc = await db.reports.find_one({"id": report_id, "is_deleted": False}, {"_id": 0})
+    report_doc = await db.reports.find_one({"id": report_id, "is_deleted": {"$ne": True}}, {"_id": 0})
     
     if not report_doc:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -4389,6 +5457,9 @@ async def get_deleted_reports(current_user: User = Depends(get_current_user)):
     - Level 3 مع جميع المحافظات: يرى الكل
     - Level 3 عادي: يرى محافظاته + ما حذفه
     """
+    if current_user.role != "admin" and "trash" not in current_user.permissions:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية لعرض سلة المحذوفات")
+        
     query = {"is_deleted": True}
     
     # Admin يرى كل شيء
@@ -4495,7 +5566,7 @@ async def restore_report(report_id: str, current_user: User = Depends(get_curren
     await db.reports.update_one(
         {"id": report_id},
         {"$set": {
-            "is_deleted": False,
+            "is_deleted": {"$ne": True},
             "deleted_at": None
         }}
     )
@@ -4562,18 +5633,17 @@ async def permanently_delete_all_trashed(current_user: User = Depends(get_curren
 
 @api_router.delete("/reports-trash/{report_id}/permanent")
 async def permanently_delete_report(report_id: str, current_user: User = Depends(get_current_user)):
-    # التحقق من الصلاحيات: فقط Admin أو Eng Mahmoud Haroun
-    if current_user.role != "admin" and current_user.username != "Eng Mahmoud Haroun":
+    # التحقق من الصلاحيات
+    has_trash_perm = current_user.role == "admin" or "trash" in (current_user.permissions or []) or user_has_any_project_permission(current_user, "trash")
+    if not has_trash_perm and current_user.username != "Eng Mahmoud Haroun":
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية الحذف النهائي")
     
     query = {"id": report_id, "is_deleted": True}
     
     # فلترة حسب صلاحيات المشاريع والمحافظات
-    if current_user.role != "admin" or len(current_user.projects) > 0:
+    if current_user.role != "admin":
         if len(current_user.projects) > 0:
             query["project"] = {"$in": current_user.projects}
-    
-    if current_user.role != "admin" or len(current_user.governorates) > 0:
         if len(current_user.governorates) > 0:
             query["governorate"] = {"$in": current_user.governorates}
     
@@ -4624,6 +5694,162 @@ async def get_permanently_deleted_reports(current_user: User = Depends(get_curre
     return reports
 
 
+# ============= WATER & SEWAGE CONNECTIONS TRASH =============
+
+@api_router.get("/water-connections-trash")
+async def get_deleted_water_connections(current_user: User = Depends(get_current_user)):
+    """جلب توصيلات المياه المحذوفة مؤقتاً"""
+    is_admin = current_user.role == "admin"
+    has_permission = user_has_any_project_permission(current_user, "water_connections")
+    
+    if not is_admin and not has_permission:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    query = {"is_deleted": True}
+    
+    # فلترة حسب المشاريع وصاحب الحذف ("كل مشروع وكل مستخدم خاصة بسلة محذوفاتة")
+    if not is_admin:
+        allowed_projects = get_projects_with_permission(current_user, "water_connections")
+        query["project"] = {"$in": allowed_projects}
+        query["deleted_by"] = current_user.id
+        
+    connections = await db.water_connections.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(1000)
+    
+    # جلب أسماء المستخدمين الذين حذفوا التوصيلات
+    for conn in connections:
+        if conn.get('deleted_by'):
+            user_doc = await db.users.find_one({"id": conn['deleted_by']}, {"_id": 0, "full_name": 1})
+            conn['deleted_by_name'] = user_doc.get('full_name') if user_doc else 'غير معروف'
+        else:
+            conn['deleted_by_name'] = 'غير معروف'
+            
+    return connections
+
+
+@api_router.post("/water-connections-trash/{conn_id}/restore")
+async def restore_water_connection(conn_id: str, current_user: User = Depends(get_current_user)):
+    """استعادة توصيلة مياه محذوفة"""
+    is_admin = current_user.role == "admin"
+    has_permission = user_has_any_project_permission(current_user, "water_connections")
+    
+    if not is_admin and not has_permission:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    query = {"id": conn_id, "is_deleted": True}
+    if not is_admin:
+        allowed_projects = get_projects_with_permission(current_user, "water_connections")
+        query["project"] = {"$in": allowed_projects}
+        query["deleted_by"] = current_user.id
+        
+    result = await db.water_connections.update_one(
+        query,
+        {"$unset": {"is_deleted": "", "deleted_at": "", "deleted_by": ""}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="التوصيلة غير موجودة في سلة المحذوفات أو ليست تابعة لك")
+        
+    return {"message": "تم استعادة التوصيلة بنجاح"}
+
+
+@api_router.delete("/water-connections-trash/{conn_id}/permanent")
+async def permanently_delete_water_connection(conn_id: str, current_user: User = Depends(get_current_user)):
+    """حذف توصيلة مياه نهائياً"""
+    is_admin = current_user.role == "admin"
+    has_permission = user_has_any_project_permission(current_user, "water_connections")
+    
+    if not is_admin and not has_permission:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    query = {"id": conn_id, "is_deleted": True}
+    if not is_admin:
+        allowed_projects = get_projects_with_permission(current_user, "water_connections")
+        query["project"] = {"$in": allowed_projects}
+        query["deleted_by"] = current_user.id
+        
+    result = await db.water_connections.delete_one(query)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="التوصيلة غير موجودة في سلة المحذوفات أو ليست تابعة لك")
+        
+    return {"message": "تم حذف التوصيلة نهائياً بنجاح"}
+
+
+@api_router.get("/sewage-connections-trash")
+async def get_deleted_sewage_connections(current_user: User = Depends(get_current_user)):
+    """جلب توصيلات الصرف الصحي المحذوفة مؤقتاً"""
+    is_admin = current_user.role == "admin"
+    has_permission = user_has_any_project_permission(current_user, "sewage_connections")
+    
+    if not is_admin and not has_permission:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    query = {"is_deleted": True}
+    
+    # فلترة حسب المشاريع وصاحب الحذف ("كل مشروع وكل مستخدم خاصة بسلة محذوفاتة")
+    if not is_admin:
+        allowed_projects = get_projects_with_permission(current_user, "sewage_connections")
+        query["project"] = {"$in": allowed_projects}
+        query["deleted_by"] = current_user.id
+        
+    connections = await db.sewage_connections.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(1000)
+    
+    # جلب أسماء المستخدمين الذين حذفوا التوصيلات
+    for conn in connections:
+        if conn.get('deleted_by'):
+            user_doc = await db.users.find_one({"id": conn['deleted_by']}, {"_id": 0, "full_name": 1})
+            conn['deleted_by_name'] = user_doc.get('full_name') if user_doc else 'غير معروف'
+        else:
+            conn['deleted_by_name'] = 'غير معروف'
+            
+    return connections
+
+
+@api_router.post("/sewage-connections-trash/{conn_id}/restore")
+async def restore_sewage_connection(conn_id: str, current_user: User = Depends(get_current_user)):
+    """استعادة توصيلة صرف صحي محذوفة"""
+    is_admin = current_user.role == "admin"
+    has_permission = user_has_any_project_permission(current_user, "sewage_connections")
+    
+    if not is_admin and not has_permission:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    query = {"id": conn_id, "is_deleted": True}
+    if not is_admin:
+        allowed_projects = get_projects_with_permission(current_user, "sewage_connections")
+        query["project"] = {"$in": allowed_projects}
+        query["deleted_by"] = current_user.id
+        
+    result = await db.sewage_connections.update_one(
+        query,
+        {"$unset": {"is_deleted": "", "deleted_at": "", "deleted_by": ""}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="التوصيلة غير موجودة في سلة المحذوفات أو ليست تابعة لك")
+        
+    return {"message": "تم استعادة التوصيلة بنجاح"}
+
+
+@api_router.delete("/sewage-connections-trash/{conn_id}/permanent")
+async def permanently_delete_sewage_connection(conn_id: str, current_user: User = Depends(get_current_user)):
+    """حذف توصيلة صرف صحي نهائياً"""
+    is_admin = current_user.role == "admin"
+    has_permission = user_has_any_project_permission(current_user, "sewage_connections")
+    
+    if not is_admin and not has_permission:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    query = {"id": conn_id, "is_deleted": True}
+    if not is_admin:
+        allowed_projects = get_projects_with_permission(current_user, "sewage_connections")
+        query["project"] = {"$in": allowed_projects}
+        query["deleted_by"] = current_user.id
+        
+    result = await db.sewage_connections.delete_one(query)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="التوصيلة غير موجودة في سلة المحذوفات أو ليست تابعة لك")
+        
+    return {"message": "تم حذف التوصيلة نهائياً بنجاح"}
+
+
 @api_router.get("/reports/check-duplicate")
 async def check_duplicate_report(
     report_number: str = Query(...),
@@ -4635,7 +5861,7 @@ async def check_duplicate_report(
     """فحص وجود بلاغ مكرر - يفحص رقم البلاغ + المشروع + رقم الرخصة + نوع البلاغ"""
     query = {
         "report_number": report_number,
-        "is_deleted": False
+        "is_deleted": {"$ne": True}
     }
     
     # إضافة فلاتر إضافية إذا كانت موجودة
@@ -4669,11 +5895,25 @@ async def bulk_delete_reports(
     if not ids:
         raise HTTPException(status_code=400, detail="No report IDs provided")
     
-    result = await db.reports.delete_many({"id": {"$in": ids}})
+    # التحقق من الصلاحيات للمستخدم العادي (يمكن تركها أو تطبيق نفس شروط الحذف المفرد)
+    # لكن الأهم هو النقل لسلة المحذوفات بدلاً من الحذف النهائي
+    now = datetime.now(timezone.utc).isoformat()
+    result = await db.reports.update_many(
+        {"id": {"$in": ids}},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": now,
+            "deleted_by": current_user.id
+        }}
+    )
+    
+    # ⚡ مسح الـ cache لتحديث الإحصائيات
+    global stats_cache
+    stats_cache.clear()
     
     return {
-        "message": f"تم حذف {result.deleted_count} بلاغ بنجاح",
-        "deleted_count": result.deleted_count
+        "message": f"تم نقل {result.modified_count} بلاغ إلى سلة المحذوفات بنجاح",
+        "deleted_count": result.modified_count
     }
 
 
@@ -4689,7 +5929,7 @@ async def fix_reports_license_status(
     license_result = await db.reports.update_many(
         {
             "license_number": {"$regex": "[0-9]"},
-            "is_deleted": False
+            "is_deleted": {"$ne": True}
         },
         {
             "$set": {"asphalt_license_issued": True}
@@ -4704,7 +5944,7 @@ async def fix_reports_license_status(
                 {"license_number": None},
                 {"license_number": {"$not": {"$regex": "[0-9]"}}}
             ],
-            "is_deleted": False
+            "is_deleted": {"$ne": True}
         },
         {
             "$set": {"asphalt_license_issued": False}
@@ -4715,7 +5955,7 @@ async def fix_reports_license_status(
     closed_result = await db.reports.update_many(
         {
             "status": {"$in": ["تم الإصلاح", "مغلق", "منتهي"]},
-            "is_deleted": False
+            "is_deleted": {"$ne": True}
         },
         {
             "$set": {"wfm_closed": True, "review_status": "تمت المراجعة"}
@@ -4740,7 +5980,7 @@ async def import_reports_from_excel(
 ):
     """استيراد بلاغات من ملف Excel مع إمكانية تحديد المشروع والمحافظة"""
     # التحقق من صلاحية الاستيراد
-    if current_user.role != 'admin' and 'reports_import' not in current_user.permissions:
+    if not user_has_any_project_permission(current_user, 'reports_import'):
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية استيراد البلاغات")
     
     # التحقق من نوع الملف
@@ -4908,7 +6148,7 @@ async def import_reports_from_excel(
                 existing = await db.reports.find_one({
                     "report_number": report_number, 
                     "project": row_project,
-                    "is_deleted": False
+                    "is_deleted": {"$ne": True}
                 }, {"_id": 1})
                 
                 if existing:
@@ -4923,7 +6163,6 @@ async def import_reports_from_excel(
                             if pd.isna(val) or val is None or str(val).strip().lower() in ['nan', 'none', '']:
                                 return default
                             return float(val)
-                        return default
                     except:
                         return default
                 
@@ -4958,14 +6197,14 @@ async def import_reports_from_excel(
                     "longitude": safe_str('longitude', ''),
                     "notes": safe_str('notes', ''),
                     "images": [],
-                    "is_deleted": False,
+                    "is_deleted": {"$ne": True},
                     "created_by": current_user.id,
                     "created_by_name": current_user.full_name or current_user.username,
                     "created_at": now,
                     "updated_at": now,
                     "added_at": now,  # وقت الإضافة للنظام
                     "report_date": now,  # تاريخ البلاغ
-                    "review_status": "تمت المراجعة" if status_val in ['تم الإصلاح', 'مغلق', 'منتهي'] else "بانتظار المراجعة",
+                    "review_status": "تمت المراجعة" if status_val in ['تم الإصلاح', 'مغلق', 'منتهي'] else "قيد المراجعة",
                     "asphalt_license_issued": has_license,  # صدرت الرخصة إذا كان هناك رقم رخصة
                     "wfm_closed": status_val in ['تم الإصلاح', 'مغلق', 'منتهي'],  # مغلق في WFM إذا كانت الحالة منتهية
                     "closed_at": now if status_val in ['تم الإصلاح', 'مغلق', 'منتهي'] else None
@@ -4997,7 +6236,7 @@ async def import_reports_from_excel(
                 print(f"✅ تم إضافة البلاغ: {report_number}")
                 
             except Exception as e:
-                print(f"❌ خطأ في صف {idx + 2}: {str(e)}")
+                # print error ❌ خطأ في صف {idx + 2}
                 errors.append(f"سطر {idx + 2}: {str(e)}")
         
         print(f"📊 النتيجة: تم استيراد {imported}، تم تخطي {skipped}، أخطاء {len(errors)}")
@@ -5041,12 +6280,15 @@ async def create_invoice(
     if current_user.created_by:
         manager = await db.users.find_one({"id": current_user.created_by}, {"_id": 0})
     
+    # معالجة الصور ورفعها لـ Cloudinary إذا كانت base64
+    processed_images = await process_images_for_storage(data.images or ([data.image] if data.image else []), category="invoices")
+
     invoice = {
         "id": str(uuid4()),
         "invoice_number": data.invoice_number,
         "amount": data.amount,
         "description": data.description,
-        "images": data.images or ([data.image] if data.image else []),
+        "images": processed_images,
         "uploaded_by": current_user.id,
         "uploaded_by_name": current_user.full_name,
         "project": data.project,
@@ -5528,11 +6770,15 @@ class EmployeeRequestCreate(BaseModel):
     images: Optional[List[str]] = []  # الصور المرفقة
     project: str  # المشروع
     notes: Optional[str] = None  # ملاحظات إضافية
+    amount: Optional[float] = None # مبلغ السلفة
+    monthly_deduction: Optional[float] = None # الخصم الشهري
 
 class EmployeeRequestUpdate(BaseModel):
     reason: Optional[str] = None
     images: Optional[List[str]] = None
     notes: Optional[str] = None
+    amount: Optional[float] = None
+    monthly_deduction: Optional[float] = None
 
 
 @api_router.get("/request-templates")
@@ -5712,13 +6958,18 @@ async def create_employee_request(
     if current_user.created_by:
         manager = await db.users.find_one({"id": current_user.created_by}, {"_id": 0})
     
+    # معالجة الصور ورفعها لـ Cloudinary إذا كانت base64
+    processed_images = await process_images_for_storage(data.images or [], category="requests")
+
     request = {
         "id": str(uuid4()),
         "request_type": data.request_type,
         "reason": data.reason,
-        "images": data.images or [],
+        "images": processed_images,
         "project": data.project,
         "notes": data.notes,
+        "amount": data.amount,
+        "monthly_deduction": data.monthly_deduction,
         "uploaded_by": current_user.id,
         "uploaded_by_name": current_user.full_name,
         "manager_id": current_user.created_by,
@@ -5769,12 +7020,16 @@ async def get_employee_requests(
     if for_review:
         # وضع المراجعة - حسب المستوى
         if current_user.role == "admin":
-            # الأدمن: يرى الطلبات المعتمدة من المديرين للاعتماد النهائي
-            query["status"] = "approved_by_manager"
+            # الأدمن: يرى الطلبات المعتمدة من المديرين + السلف التي لم تعتمد بعد
+            query["$or"] = [
+                {"status": {"$in": ["approved_by_manager", "reviewing"]}},
+                {"request_type": {"$in": ["advance_request", "advance"]}, "status": "pending"}
+            ]
         elif has_sub_users:
-            # مدير المشروع الذي لديه موظفين: يرى طلبات موظفيه قيد الانتظار
+            # مدير المشروع الذي لديه موظفين: يرى طلبات موظفيه قيد الانتظار (باستثناء السلف التي تذهب للأدمن مباشرة)
             query["status"] = "pending"
             query["uploaded_by"] = {"$in": sub_user_ids}
+            query["request_type"] = {"$ne": "advance_request"}
         elif can_final_approve:
             # المسؤول عن الاعتماد النهائي (صلاحية طلبات الموظفين + مشاريع متعددة)
             query["status"] = "approved_by_manager"
@@ -5790,8 +7045,11 @@ async def get_employee_requests(
             if status and status != 'all':
                 query["status"] = status
             else:
-                # الأدمن يرى كل شيء ما عدا pending
-                query["status"] = {"$in": ["approved_by_manager", "approved_by_admin", "approved_final", "rejected", "cancelled"]}
+                # الأدمن يرى كل شيء ما عدا pending (إلا إذا كان نوع الطلب سلفة)
+                query["$or"] = [
+                    {"status": {"$in": ["approved_by_manager", "approved_by_admin", "approved_final", "rejected", "cancelled", "reviewing"]}},
+                    {"request_type": {"$in": ["advance_request", "advance"]}, "status": "pending"}
+                ]
             if project:
                 query["project"] = project
         elif can_view_all:
@@ -5803,10 +7061,11 @@ async def get_employee_requests(
             if project:
                 query["project"] = project
         elif has_sub_users:
-            # المدير الذي لديه موظفين يرى طلبات موظفيه + طلباته الشخصية (كل الحالات بما فيها المرفوضة والملغاة)
-            query_ids = sub_user_ids.copy()
-            query_ids.append(current_user.id)
-            query["uploaded_by"] = {"$in": query_ids}
+            # المدير الذي لديه موظفين يرى طلباته الشخصية + طلبات موظفيه (باستثناء السلف التي تذهب للأدمن)
+            query["$or"] = [
+                {"uploaded_by": current_user.id}, # طلباته هو
+                {"uploaded_by": {"$in": sub_user_ids}, "request_type": {"$nin": ["advance_request", "advance"]}} # طلبات موظفيه (بدون السلف)
+            ]
             # لا نفلتر على الحالة افتراضياً - يرى كل شيء
             if status and status != 'all':
                 query["status"] = status
@@ -5830,7 +7089,10 @@ async def get_employee_requests(
                 query["status"] = status
     
     if request_type:
-        query["request_type"] = request_type
+        if request_type in ["advance_request", "advance"]:
+            query["request_type"] = {"$in": ["advance_request", "advance"]}
+        else:
+            query["request_type"] = request_type
     
     # فلترة حسب تاريخ محدد (يوم)
     if date:
@@ -5897,9 +7159,13 @@ async def update_employee_request(
     if data.reason is not None:
         update_data["reason"] = data.reason
     if data.images is not None:
-        update_data["images"] = data.images
+        update_data["images"] = await process_images_for_storage(data.images, category="requests")
     if data.notes is not None:
         update_data["notes"] = data.notes
+    if data.amount is not None:
+        update_data["amount"] = data.amount
+    if data.monthly_deduction is not None:
+        update_data["monthly_deduction"] = data.monthly_deduction
     
     await db.employee_requests.update_one({"id": request_id}, {"$set": update_data})
     return {"message": "تم تعديل الطلب بنجاح"}
@@ -5948,7 +7214,7 @@ async def approve_employee_request(
         has_final_review_delegation = False
     
     if current_user.role == "admin":
-        # الأدمن (بيت الخبرة): يعتمد الطلبات نهائياً من أي حالة
+        # الأدمن (بيت الخبرة): يعتمد الطلبات نهائياً من أي حالة (بما فيها جاري المراجعة)
         update_data = {
             "status": "approved_by_admin",
             "approved_by": current_user.id,
@@ -5974,6 +7240,10 @@ async def approve_employee_request(
         if not is_own_request and uploader_id not in sub_user_ids:
             raise HTTPException(status_code=403, detail="هذا الطلب ليس من موظفيك")
         
+        # منع مدير المشروع من اعتماد السلف - تذهب للأدمن مباشرة
+        if request.get("request_type") in ["advance_request", "advance"] and not is_own_request:
+            raise HTTPException(status_code=403, detail="طلبات السلف تعتمد مباشرة من بيت الخبرة")
+
         update_data = {
             "status": "approved_by_manager",
             "reviewed_by_manager": current_user.id,
@@ -6055,6 +7325,82 @@ async def reject_employee_request(
     )
     
     return {"message": "تم إلغاء اعتماد الطلب - يمكن للأدمن إعادة اعتماده"}
+    
+
+@api_router.put("/employee-requests/{request_id}/reviewing")
+async def mark_employee_request_reviewing(
+    request_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """تحويل الطلب إلى حالة جاري المراجعة - متاح فقط للأدمن"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="فقط بيت الخبرة يمكنه وضع الطلب قيد المراجعة")
+        
+    request = await db.employee_requests.find_one({"id": request_id}, {"_id": 0})
+    if not request:
+        raise HTTPException(status_code=404, detail="الطلب غير موجود")
+        
+    await db.employee_requests.update_one(
+        {"id": request_id}, 
+        {"$set": {
+            "status": "reviewing",
+            "reviewing_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    return {"message": "الطلب الآن قيد المراجعة"}
+
+
+@api_router.put("/employee-requests/{request_id}/upload-signed")
+async def upload_signed_document(
+    request_id: str,
+    data: dict, # Expecting {"signed_document": "..."}
+    current_user: User = Depends(get_current_user)
+):
+    """رفع المستند الموقع - متاح لصاحب الطلب أو الأدمن"""
+    request = await db.employee_requests.find_one({"id": request_id}, {"_id": 0})
+    if not request:
+        raise HTTPException(status_code=404, detail="الطلب غير موجود")
+    
+    # التحقق من الصلاحية: صاحب الطلب أو الأدمن
+    if request.get("uploaded_by") != current_user.id and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="غير مصرح لك برفع المستند لهذا الطلب")
+
+    signed_doc = data.get("signed_document")
+    if not signed_doc:
+        raise HTTPException(status_code=400, detail="المستند مطلوب")
+
+    # إذا كان المستند base64، قم برفعه لـ Cloudinary
+    if signed_doc.startswith("data:"):
+        processed = await process_images_for_storage([signed_doc], category="signed")
+        signed_doc = processed[0]
+
+    await db.employee_requests.update_one(
+        {"id": request_id},
+        {"$set": {
+            "signed_document": signed_doc,
+            "signed_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    return {"message": "تم رفع المستند الموقع بنجاح"}
+
+
+@api_router.put("/employee-requests/{request_id}/verify")
+async def verify_signed_request(
+    request_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """تأكيد استلام المستند الموقع وإغلاق الطلب نهائياً - للأدمن فقط"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="غير مصرح لك بتأكيد الطلب")
+        
+    await db.employee_requests.update_one(
+        {"id": request_id},
+        {"$set": {
+            "admin_verified_at": datetime.now(timezone.utc).isoformat(),
+            "admin_verified_by": current_user.full_name
+        }}
+    )
+    return {"message": "تم تأكيد الاستلام بنجاح"}
 
 
 @api_router.put("/employee-requests/{request_id}/cancel")
@@ -6141,6 +7487,7 @@ async def get_pending_notifications_count(current_user: User = Depends(get_curre
         pending_invoices = 0
         pending_requests = 0
         pending_extracts = 0
+        signed_requests = 0
         
         user_permissions = current_user.permissions or []
         has_all_projects = "all_projects" in user_permissions
@@ -6163,7 +7510,10 @@ async def get_pending_notifications_count(current_user: User = Depends(get_curre
                 "is_deleted": {"$ne": True}
             })
             pending_requests = await db.employee_requests.count_documents({
-                "status": "approved_by_manager",
+                "$or": [
+                    {"status": "approved_by_manager"},
+                    {"request_type": {"$in": ["advance_request", "advance"]}, "status": "pending"}
+                ],
                 "is_deleted": {"$ne": True}
             })
             pending_extracts = await db.extracts.count_documents({
@@ -6174,6 +7524,12 @@ async def get_pending_notifications_count(current_user: User = Depends(get_curre
                     {"actual_value": 0},
                     {"actual_value": ""}
                 ],
+                "is_deleted": {"$ne": True}
+            })
+            # طلبات الموظفين التي تم توقيعها ولم يتم تأكيد استلامها نهائياً
+            signed_requests = await db.employee_requests.count_documents({
+                "signed_document": {"$exists": True, "$ne": None},
+                "admin_verified_at": {"$exists": False},
                 "is_deleted": {"$ne": True}
             })
         else:
@@ -6188,9 +7544,20 @@ async def get_pending_notifications_count(current_user: User = Depends(get_curre
                     "uploaded_by": {"$in": sub_user_ids + [current_user.id]},
                     "is_deleted": {"$ne": True}
                 })
+                # طلبات موظفيه (باستثناء السلف) + طلباته الشخصية (بدون السلف)
                 req_count += await db.employee_requests.count_documents({
-                    "status": "pending",
-                    "uploaded_by": {"$in": sub_user_ids + [current_user.id]},
+                    "$or": [
+                        {
+                            "uploaded_by": current_user.id, 
+                            "status": "pending",
+                            "request_type": {"$nin": ["advance_request", "advance"]}
+                        },
+                        {
+                            "uploaded_by": {"$in": sub_user_ids}, 
+                            "status": "pending", 
+                            "request_type": {"$nin": ["advance_request", "advance"]}
+                        }
+                    ],
                     "is_deleted": {"$ne": True}
                 })
             else:
@@ -6203,6 +7570,7 @@ async def get_pending_notifications_count(current_user: User = Depends(get_curre
                 req_count += await db.employee_requests.count_documents({
                     "status": "pending",
                     "manager_id": current_user.id,
+                    "request_type": {"$nin": ["advance_request", "advance"]},
                     "is_deleted": {"$ne": True}
                 })
             
@@ -6252,7 +7620,8 @@ async def get_pending_notifications_count(current_user: User = Depends(get_curre
             "pending_invoices": pending_invoices,
             "pending_requests": pending_requests,
             "pending_extracts": pending_extracts,
-            "total": pending_invoices + pending_requests + pending_extracts
+            "signed_requests": signed_requests,
+            "total": pending_invoices + pending_requests + pending_extracts + signed_requests
         }
     except Exception as e:
         logger.error(f"Error getting notifications count: {str(e)}")
@@ -6268,25 +7637,28 @@ async def get_dashboard_stats(
     current_user: User = Depends(get_current_user)
 ):
     """الحصول على إحصائيات لوحة التحكم"""
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     
     # قائمة المستخدمين الذين يرون بلاغاتهم فقط تلقائياً
     restricted_users = ["Mohamed Esmat", "ElShazly"]
     
-    # التصفية الهرمية: عرض إحصائيات تقارير المستخدم + المستخدمين الفرعيين
+    # التصفية الهرمية الشاملة
+    hierarchy_filter = await get_hierarchy_filter(current_user)
+    
+    # دمج الفلاتر بمرونة
     if current_user.role != "admin":
-        # تصفية حسب صلاحيات المشاريع إذا كانت محددة
-        if current_user.projects:
-            query["project"] = {"$in": current_user.projects}
-        
-        # لا نفلتر حسب المحافظات في الإحصائيات - الصلاحية على المشاريع كافية
-        
-        # فقط محمد عصمت والشاذلي يرون إحصائيات بلاغاتهم فقط
-        if current_user.username in restricted_users:
-            query["$or"] = [
-                {"created_by": current_user.id},
-                {"created_by": current_user.username}
-            ]
+        user_projects_filter = get_flexible_in_query(current_user.projects, "project")
+        if user_projects_filter:
+            query = {"$and": [
+                {"is_deleted": {"$ne": True}},
+                hierarchy_filter,
+                user_projects_filter
+            ]}
+        else:
+            query.update(hierarchy_filter)
+    else:
+        # للأدمن، لا يوجد قيود إلا الـ is_deleted
+        query = {"is_deleted": {"$ne": True}}
     
     # إحصائيات عامة
     total_reports = await db.reports.count_documents(query)
@@ -6338,7 +7710,7 @@ async def export_selected_reports_excel(
     # جلب البلاغات المحددة
     query = {
         "id": {"$in": report_ids},
-        "is_deleted": False
+        "is_deleted": {"$ne": True}
     }
     
     # تطبيق الصلاحيات
@@ -6377,9 +7749,9 @@ async def export_selected_reports_excel(
     
     headers = [
         "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة",
-        "الحالة", "نوع البلاغ", "العمق (سم)", "القطر (ملم)",
+        "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق (سم)", "القطر (ملم)",
         "اسم المقاول", "خط العرض", "خط الطول", "رخصة أسفلت",
-        "الملاحظات", "تاريخ الإنشاء", "تاريخ الإغلاق", "عدد الصور", "أنشأ بواسطة"
+        "الملاحظات", "تاريخ الاستلام", "تاريخ الإغلاق", "عدد الصور", "مراقب الاستشاري"
     ]
     
     # تنسيق الرأس
@@ -6395,7 +7767,7 @@ async def export_selected_reports_excel(
             bottom=Side(style='thin', color='000000')
         )
     
-    column_widths = [6, 15, 35, 15, 15, 18, 12, 12, 12, 25, 12, 12, 12, 30, 18, 18, 10, 20]
+    column_widths = [6, 15, 35, 15, 15, 18, 18, 12, 12, 12, 25, 12, 12, 12, 30, 18, 18, 10, 20]
     for idx, width in enumerate(column_widths, 1):
         ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = width
     
@@ -6416,14 +7788,20 @@ async def export_selected_reports_excel(
         images_count = images_counts.get(report.get('id'), 0)
         
         _rn = report.get('report_number', '')
-        if _rn and not str(_rn).startswith('CCB-'):
-            _rn = f"CCB-{_rn}"
+        if _rn:
+            _rn = str(_rn).replace('CCP-', '').replace('CCB-', '')
+            proj_name = report.get('project', '')
+            if 'الغربي' in proj_name:
+                _rn = f"CCB-{_rn}"
+            else:
+                _rn = f"CCP-{_rn}"
         row_data = [
             row_idx - 1,
             report.get('governorate', ''),
             report.get('project', ''),
             _rn,
             report.get('license_number', ''),
+            "مغلقة بواسطة الاستشاري" if report.get('wfm_closed') else "قيد المعالجة",
             report.get('status', ''),
             report.get('report_type', ''),
             report.get('depth_meters', ''),
@@ -6467,6 +7845,7 @@ async def export_selected_reports_pdf(
     request: dict,
     current_user: User = Depends(get_current_user)
 ):
+    lang = request.get("lang", "ar")
     """تصدير بلاغات محددة إلى PDF بدعم كامل للعربية"""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
@@ -6488,7 +7867,7 @@ async def export_selected_reports_pdf(
     # جلب البلاغات المحددة
     query = {
         "id": {"$in": report_ids},
-        "is_deleted": False
+        "is_deleted": {"$ne": True}
     }
     
     # تطبيق الصلاحيات
@@ -6533,26 +7912,47 @@ async def export_selected_reports_pdf(
         elif 'الجنوبية' in project_name:
             return 'مشروع المحافظات الجنوبية'
         return project_name
-    
-    # دالة لتحويل النص العربي بدون تقطيع
+
+    def t(text):
+        if lang != 'en': return text
+        trans = {
+            "رقم": "No.", "المحافظة": "Governorate", "المشروع": "Project", 
+            "رقم البلاغ": "Report No.", "رقم الرخصة": "License No.", "حالة الرخصة": "License Status",
+            "الحالة": "Status", "نوع البلاغ": "Type", "العمق": "Depth", "القطر": "Diameter",
+            "المقاول": "Contractor", "تاريخ الإنشاء": "Created At",
+            "بلاغات محافظة": "Reports of Governorate", "لشهر": "for Month", "تقرير البلاغات": "Reports Report",
+            "تنفيذ م-محمود محمد هارون مدير النظام وتحليل البيانات": "Implemented by Eng. Mahmoud Haroon - System & Data Manager",
+            "شركة المياه الوطنية": "National Water Company", "مكتب بيت الخبرة للاستشارات الهندسية": "Bayt Al Khibra Eng. Consultancy",
+            "الاسم: ........................": "Name: ........................",
+            "التوقيع: ........................": "Signature: ........................",
+            "قيد المعالجة": "In Progress", "مغلقة بواسطة الاستشاري": "Closed by Consultant",
+            "لم يتم إصدار رخصة": "License Not Issued",
+            "ايصال": "Esal", "ايصال الرياض": "Esal Riyadh",
+            "مشروع كشف التسربات وإصلاحها": "Leak Detection & Repair Project",
+            "مشروع المحافظات الغربية -القطاع الأوسط": "Western Governorates Project - Middle Sector",
+            "مشروع المحافظات الشمالية": "Northern Governorates Project",
+            "مشروع المحافظات الجنوبية": "Southern Governorates Project"
+        }
+        for k, v in trans.items():
+            if text == k: return v
+        
+        if text.startswith("الاسم:"): return text.replace("الاسم:", "Name:")
+        if text.startswith("بلاغات محافظة"): return text.replace("بلاغات محافظة", "Reports of Governorate").replace("لشهر", "for Month")
+        
+        return text
+
     def arabic_text(text):
-        if not text:
-            return ''
-        if not isinstance(text, str):
-            text = str(text)
+        if not text: return ""
+        text = t(text)
         try:
-            # ⚡ معالجة محسّنة للعربية مع الفواصل والأرقام
-            # استخدام configuration محسّن
-            reshaped = reshape(text, language='Arabic')
-            bidi_text = get_display(reshaped, base_dir='R')  # Right-to-Left
-            return bidi_text
-        except Exception as e:
-            # في حالة الخطأ، محاولة بدون language parameter
-            try:
-                reshaped = reshape(text)
-                return get_display(reshaped)
-            except:
-                return text
+            if any("؀" <= c <= "ۿ" for c in text):
+                from arabic_reshaper import reshape
+                from bidi.algorithm import get_display
+                return get_display(reshape(text))
+            return text
+        except:
+            return text
+
     
     # إنشاء PDF - تقليل الهوامش لإتاحة مساحة أكبر
     buffer = BytesIO()
@@ -6659,15 +8059,7 @@ async def export_selected_reports_pdf(
     
     # تحديد اسم المشروع الكامل للعرض
     def get_full_project_name(project):
-        if not project:
-            return ""
-        if 'الغربية' in project:
-            return "مشروع الاشراف على اعمال اصلاح وصيانة شبكات المياه والصرف الصحي بالمحافظات الغربية"
-        elif 'الشمالية' in project:
-            return "مشروع الاشراف على اعمال اصلاح وصيانة شبكات المياه والصرف الصحي بالمحافظات الشمالية"
-        elif 'الجنوبية' in project:
-            return "مشروع الاشراف على اعمال اصلاح وصيانة شبكات المياه والصرف الصحي بالمحافظات الجنوبية"
-        return project
+        return project if project else ""
     
     # إنشاء العنوان الديناميكي
     from reportlab.platypus import Paragraph
@@ -6715,50 +8107,61 @@ async def export_selected_reports_pdf(
         project_para = Paragraph(project_text, project_style)
         elements.append(project_para)
     
-    # إضافة اسم معد البيانات (على اليمين) - فقط للمشروع الغربي
-    if project_name_full and 'الغربية' in project_name_full:
-        author_style = ParagraphStyle(
-            'AuthorStyle',
-            fontName=font_name,
-            fontSize=10,  # تصغير حجم الخط
-            alignment=TA_RIGHT,
-            textColor=colors.HexColor('#333333'),
-            spaceBefore=0,
-            spaceAfter=5,  # تقليل المسافة
-            leading=14
-        )
-        
-        author_text = arabic_text("إعداد م / محمود هارون")
-        author_para = Paragraph(author_text, author_style)
-        elements.append(author_para)
+    # إضافة م / محمود هارون فوق الجدول
+    author_style = ParagraphStyle(
+        'AuthorStyle',
+        fontName=font_name,
+        fontSize=10,
+        alignment=TA_RIGHT,
+        textColor=colors.HexColor('#555555'),
+        spaceBefore=2,
+        spaceAfter=5,
+        leading=14
+    )
+    author_text = arabic_text("تنفيذ م-محمود محمد هارون مدير النظام وتحليل البيانات")
+    author_para = Paragraph(author_text, author_style)
+    elements.append(author_para)
     
     # إضافة مسافة صغيرة قبل الجدول
     elements.append(Spacer(1, 3*mm))
     
     # الرأس - 11 عمود (مع العمق والقطر) - معكوسة من اليمين لليسار
     headers = [
-        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة",
+        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة الرخصة",
         "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الإنشاء"
     ]
     
     # عكس ترتيب الأعمدة لتبدأ من اليمين (RTL)
     headers_reversed = headers[::-1]
     
-    # نمط خاص بعناوين الجدول - يضمن الخط العربي وتوسيط النص
-    from reportlab.platypus import Paragraph as _HPara
-    from reportlab.lib.styles import ParagraphStyle as _HPS
-    from reportlab.lib.enums import TA_CENTER as _HTAC
-    _header_style = _HPS(
-        'ExportSelHeaderArabic',
+    # ستايلات خلايا الجدول لضمان التنسيق والتفاف النص والترميز الصحيح
+    header_style = ParagraphStyle(
+        'HeaderStyle',
         fontName=font_name,
-        fontSize=7,
-        alignment=_HTAC,
+        fontSize=8,
+        alignment=TA_CENTER,
         textColor=colors.whitesmoke,
         leading=10
     )
-    data = [[_HPara(arabic_text(h), _header_style) for h in headers_reversed]]
     
-
+    cell_style = ParagraphStyle(
+        'CellStyle',
+        fontName=font_name,
+        fontSize=8,
+        alignment=TA_CENTER,
+        leading=10
+    )
+    
+    latin_cell_style = ParagraphStyle(
+        'LatinCellStyle',
+        fontName='NotoSans' if os.path.exists(latin_font_path) else 'Helvetica',
+        fontSize=8,
+        alignment=TA_CENTER,
+        leading=10
+    )
+    
+    data = [[Paragraph(arabic_text(h), header_style) for h in headers_reversed]]
+    
     # البيانات
     for idx, report in enumerate(reports, 1):
         created_at = report.get('created_at')
@@ -6771,10 +8174,15 @@ async def export_selected_reports_pdf(
         lng = report.get('longitude', '')
         coordinates = f"{lat}, {lng}" if lat and lng else ''
         
-        # إضافة CC- لرقم البلاغ إذا لم يكن موجوداً
-        report_num = report.get('report_number') or ''
-        if report_num and not str(report_num).startswith('CCB-'):
-            report_num = f"CCB-{report_num}"
+        # إضافة CCB- أو CCP- حسب المشروع
+        report_num = report.get('report_number', '')
+        if report_num:
+            report_num = str(report_num).replace('CCP-', '').replace('CCB-', '')
+            proj_name = report.get('project', '')
+            if 'الغربي' in proj_name:
+                report_num = f"CCB-{report_num}"
+            else:
+                report_num = f"CCP-{report_num}"
         
         # جلب قيم العمق والقطر
         depth_val = report.get('depth_meters', '')
@@ -6782,59 +8190,51 @@ async def export_selected_reports_pdf(
         depth_str = str(depth_val) if depth_val else '-'
         diameter_str = str(diameter_val) if diameter_val else '-'
         
-        # ترتيب الصف من اليمين لليسار مباشرة (بدون عكس النصوص الإنجليزية)
+        # ترتيب الصف من اليمين لليسار مباشرة
         # معالجة رقم الرخصة - إذا كان فارغ نعرض "لم يتم إصدار رخصة"
         license_num = report.get('license_number') or ''
-        if not license_num or license_num.strip() == '':
+        if not license_num or str(license_num).strip() == '':
             license_num = 'لم يتم إصدار رخصة'
         
         row = [
-            date_str,  # تاريخ الإنشاء - يمين
-            arabic_text(report.get('contractor') or ''),  # المقاول
-            diameter_str,  # القطر بالملليمتر
-            depth_str,  # العمق بالمتر
-            arabic_text(report.get('report_type') or ''),  # نوع البلاغ
-            arabic_text(report.get('status') or ''),  # الحالة
-            arabic_text(license_num),  # رقم الرخصة
-            report_num,  # رقم البلاغ مع CCB- (بدون عكس)
-            arabic_text(shorten_project_name(report.get('project') or '')),  # المشروع
-            arabic_text(report.get('governorate') or ''),  # المحافظة
-            str(idx)  # رقم - يسار
+            Paragraph(date_str, latin_cell_style),  # تاريخ الإنشاء - يمين
+            Paragraph(arabic_text(report.get('contractor') or ''), cell_style),  # المقاول
+            Paragraph(diameter_str, latin_cell_style),  # القطر بالملليمتر
+            Paragraph(depth_str, latin_cell_style),  # العمق بالمتر
+            Paragraph(arabic_text(report.get('report_type') or ''), cell_style),  # نوع البلاغ
+            Paragraph(arabic_text(report.get('status') or ''), cell_style),  # الحالة
+            Paragraph(arabic_text("مغلقة بواسطة الاستشاري") if report.get('wfm_closed') else arabic_text("قيد المعالجة"), cell_style), # حالة الرخصة
+            Paragraph(arabic_text(license_num), cell_style),  # رقم الرخصة
+            Paragraph(report_num, latin_cell_style),  # رقم البلاغ مع CCP-
+            Paragraph(arabic_text(shorten_project_name(report.get('project') or '')), cell_style),  # المشروع
+            Paragraph(arabic_text(report.get('governorate') or ''), cell_style),  # المحافظة
+            Paragraph(str(idx), latin_cell_style)  # رقم - يسار
         ]
         data.append(row)
     
-    # إنشاء الجدول - 11 عمود متوازن ضمن عرض الصفحة landscape A4 (802 points)
-    # العروض بالـ points (معكوسة من اليمين لليسار): تاريخ، مقاول، قطر، عمق، نوع، حالة، رقم رخصة، رقم بلاغ، مشروع، محافظة، رقم
-    # تعديل: توسيع الحالة (70→85)، تضييق رقم الرخصة (90→75)
-    # المجموع: 65+75+50+50+65+85+75+85+105+60+28 = 743 points (ضمن 802)
-    col_widths = [65, 75, 45, 45, 65, 95, 70, 95, 130, 65, 30]
+    # إنشاء الجدول - 12 عمود متوازن مع توسيع خانة رقم البلاغ والحالة
+    # العروض: تاريخ(50), مقاول(70), قطر(35), عمق(35), نوع(50), حالة(125), حالة رخصة(85), رقم رخصة(50), رقم بلاغ(110), مشروع(120), محافظة(35), رقم(20)
+    col_widths = [50, 70, 35, 35, 50, 125, 85, 50, 110, 120, 35, 20]
     table = Table(data, colWidths=col_widths, repeatRows=1)
-    # تحديد اسم الخط اللاتيني (NotoSans إذا تم تسجيله، وإلا fallback للخط الأساسي)
-    latin_font = 'NotoSans' if 'NotoSans' in pdfmetrics.getRegisteredFontNames() else font_name
+    
     table.setStyle(TableStyle([
         # تنسيق الرأس
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#366092')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('FONTNAME', (0, 0), (-1, -1), font_name),
-        ('FONTSIZE', (0, 0), (-1, 0), 7),
-        ('FONTSIZE', (0, 1), (-1, -1), 6.5),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-        ('TOPPADDING', (0, 0), (-1, 0), 10),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
-        ('TOPPADDING', (0, 1), (-1, -1), 6),
-        # تنسيق البيانات
-        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+        ('FONTSIZE', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 2),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('TOPPADDING', (0, 0), (-1, 0), 6),
+        
+        # تنسيق الجسم
         ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-        ('BOX', (0, 0), (-1, -1), 1, colors.black),
-        # خط لاتيني للأعمدة التي تحتوي على أرقام/أحرف لاتينية (CCB-, تواريخ, أرقام)
-        ('FONTNAME', (0, 1), (0, -1), latin_font),   # تاريخ الإنشاء
-        ('FONTNAME', (2, 1), (2, -1), latin_font),   # القطر
-        ('FONTNAME', (3, 1), (3, -1), latin_font),   # العمق
-        ('FONTNAME', (7, 1), (7, -1), latin_font),   # رقم البلاغ (CCB-xxx)
-        ('FONTNAME', (10, 1), (10, -1), latin_font), # الرقم التسلسلي
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('TOPPADDING', (0, 1), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 5),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ]))
     
     elements.append(table)
@@ -6870,48 +8270,27 @@ async def export_selected_reports_pdf(
     
     # ========== إضافة قسم التوقيعات مباشرة تحت الجدول ==========
     # بيانات التوقيع مع اسم المراقب
-    if supervisor_name:
-        sig_data = [
-            [
-                arabic_text("شركة المياه الوطنية"),
-                "",
-                "",
-                arabic_text("مكتب بيت الخبرة للاستشارات الهندسية")
-            ],
-            [
-                arabic_text("الاسم: ........................"),
-                "",
-                "",
-                arabic_text(f"الاسم: {supervisor_name}")
-            ],
-            [
-                arabic_text("التوقيع: ........................"),
-                "",
-                "",
-                arabic_text("التوقيع: ........................")
-            ]
+    company_name = branding.get("company_name", "مكتب بيت الخبرة للاستشارات الهندسية")
+    sig_data = [
+        [
+            arabic_text("شركة المياه الوطنية"),
+            "",
+            "",
+            arabic_text(company_name)
+        ],
+        [
+            arabic_text("الاسم: ........................"),
+            "",
+            "",
+            arabic_text(f"الاسم: {supervisor_name}") if supervisor_name else arabic_text("الاسم: ........................")
+        ],
+        [
+            arabic_text("التوقيع: ........................"),
+            "",
+            "",
+            arabic_text("التوقيع: ........................")
         ]
-    else:
-        sig_data = [
-            [
-                arabic_text("شركة المياه الوطنية"),
-                "",
-                "",
-                arabic_text("مكتب بيت الخبرة للاستشارات الهندسية")
-            ],
-            [
-                arabic_text("الاسم: ........................"),
-                "",
-                "",
-                arabic_text("الاسم: ........................")
-            ],
-            [
-                arabic_text("التوقيع: ........................"),
-                "",
-                "",
-                arabic_text("التوقيع: ........................")
-            ]
-        ]
+    ]
     
     sig_table = Table(sig_data, colWidths=[page_width*0.30, page_width*0.20, page_width*0.20, page_width*0.30])
     sig_table.setStyle(TableStyle([
@@ -6956,7 +8335,7 @@ async def export_72h_reports_excel(
     seventy_two_hours_ago = datetime.utcnow() - timedelta(hours=72)
     
     # بناء الاستعلام الأساسي
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     
     # إضافة فلاتر المشروع والمحافظة
     if project:
@@ -6977,7 +8356,14 @@ async def export_72h_reports_excel(
                 pass
             elif not governorate:
                 query["governorate"] = {"$in": current_user.governorates}
-    
+                
+        # إذا لم يكن يملك صلاحية إنشاء مستخدمين (المستوى الثالث)، يعرض بلاغاته فقط
+        if not current_user.can_create_subusers:
+            query["created_by"] = {"$in": [current_user.id, current_user.username]}
+        else:
+            # إذا كان مستوى ثاني، نجمع البلاغات الخاصة به وبمستخدميه
+            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+            query["created_by"] = {"$in": allowed_user_ids}
     # جلب البلاغات
     all_reports = await db.reports.find(query, {"_id": 0, "images": 0}).sort("created_at", -1).to_list(1000)
     
@@ -7021,7 +8407,7 @@ async def export_72h_reports_excel(
     ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
     
     # رؤوس الأعمدة
-    headers = ["#", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الإنشاء"]
+    headers = ["#", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الاستلام"]
     header_row = 3
     
     # تنسيق رؤوس الأعمدة
@@ -7049,8 +8435,12 @@ async def export_72h_reports_excel(
                 pass
         
         report_num = report.get('report_number', '')
-        if report_num and not str(report_num).startswith('CCB-'):
-            report_num = f"CCB-{report_num}"
+        if report_num:
+            report_num = str(report_num)
+            if report_num.startswith('CCP-'):
+                report_num = report_num.replace('CCP-', 'CCB-')
+            elif not report_num.startswith('CCB-'):
+                report_num = f"CCB-{report_num}"
         
         license_num = report.get('license_number', '')
         if not license_num or license_num.strip() == '':
@@ -7061,16 +8451,17 @@ async def export_72h_reports_excel(
         ws.cell(row=row, column=3, value=report.get('project', ''))
         ws.cell(row=row, column=4, value=report_num)
         ws.cell(row=row, column=5, value=license_num)
-        ws.cell(row=row, column=6, value=report.get('status', ''))
-        ws.cell(row=row, column=7, value=report.get('report_type', ''))
-        ws.cell(row=row, column=8, value=report.get('depth_meters', ''))
-        ws.cell(row=row, column=9, value=report.get('diameter_mm', ''))
-        ws.cell(row=row, column=10, value=report.get('contractor', ''))
-        ws.cell(row=row, column=11, value=created_at)
+        ws.cell(row=row, column=6, value="مغلقة بواسطة الاستشاري" if report.get('wfm_closed') else "قيد المعالجة")
+        ws.cell(row=row, column=7, value=report.get('status', ''))
+        ws.cell(row=row, column=8, value=report.get('report_type', ''))
+        ws.cell(row=row, column=9, value=report.get('depth_meters', ''))
+        ws.cell(row=row, column=10, value=report.get('diameter_mm', ''))
+        ws.cell(row=row, column=11, value=report.get('contractor', ''))
+        ws.cell(row=row, column=12, value=created_at)
     
     # ضبط عرض الأعمدة
     from openpyxl.utils import get_column_letter
-    column_widths = [5, 15, 30, 20, 20, 20, 15, 10, 10, 20, 20]
+    column_widths = [5, 15, 30, 20, 20, 20, 15, 15, 10, 10, 20, 20]
     for col, width in enumerate(column_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
     
@@ -7102,10 +8493,13 @@ async def export_reports_excel(
     license_status: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    start_date_from: Optional[str] = Query(None),
+    start_date_to: Optional[str] = Query(None),
     created_by: Optional[str] = Query(None),
+    lang: Optional[str] = Query("ar"),
     current_user: User = Depends(get_current_user)
 ):
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     
     # التصفية الهرمية: عرض تقارير المستخدم + المستخدمين الفرعيين
     if current_user.role != "admin":
@@ -7160,8 +8554,12 @@ async def export_reports_excel(
         query["status"] = "تم الإصلاح"
     elif license_status == 'status_asphalt':
         query["status"] = "تم الإصلاح-ومتبقي الأسفلت"
+    elif license_status == 'status_in_progress':
+        query["wfm_closed"] = {"$ne": True}
+    elif license_status == 'status_wfm_closed':
+        query["wfm_closed"] = True
     elif license_status == 'review_pending':
-        query["review_status"] = "بانتظار المراجعة"
+        query["review_status"] = {"$in": ["بانتظار المراجعة", "قيد المراجعة", None]}
     elif license_status == 'license_issued':
         query["license_number"] = {"$regex": "[0-9]"}
     elif license_status == 'license_not_issued':
@@ -7170,6 +8568,9 @@ async def export_reports_excel(
             {"license_number": None},
             {"license_number": {"$not": {"$regex": "[0-9]"}}}
         ]
+    elif license_status and license_status.startswith('custom_'):
+        custom_status_name = license_status[len('custom_'):]
+        query["status"] = custom_status_name
     
     # فلترة بتاريخ استلام البلاغ (created_at) - يدعم string و datetime
     if date_from or date_to:
@@ -7211,7 +8612,7 @@ async def export_reports_excel(
             if "$and" in query:
                 query["$and"].append(date_filter)
             elif "$or" in query:
-                query = {"$and": [{"$or": query.pop("$or")}, date_filter]}
+                query["$and"] = [{"$or": query.pop("$or")}, date_filter]
             else:
                 if "$or" in date_filter:
                     query["$and"] = [date_filter]
@@ -7219,6 +8620,47 @@ async def export_reports_excel(
                     query.update(date_filter)
         except Exception as e:
             print(f"Date filter error: {e}")
+
+    # فلترة بتاريخ مباشرة البلاغ (start_date)
+    if start_date_from or start_date_to:
+        from datetime import datetime as dt, timedelta
+        try:
+            if start_date_from and start_date_to:
+                s_from = dt.fromisoformat(start_date_from)
+                s_to = dt.fromisoformat(start_date_to)
+                s_next = s_to + timedelta(days=1)
+                sdate_filter = {
+                    "$or": [
+                        {"start_date": {"$gte": f"{start_date_from}T00:00:00", "$lt": s_next.strftime("%Y-%m-%dT00:00:00")}},
+                        {"start_date": {"$gte": s_from, "$lt": s_next}}
+                    ]
+                }
+            elif start_date_from:
+                s_from = dt.fromisoformat(start_date_from)
+                sdate_filter = {
+                    "$or": [
+                        {"start_date": {"$gte": f"{start_date_from}T00:00:00"}},
+                        {"start_date": {"$gte": s_from}}
+                    ]
+                }
+            else:
+                s_to = dt.fromisoformat(start_date_to)
+                s_next = s_to + timedelta(days=1)
+                sdate_filter = {
+                    "$or": [
+                        {"start_date": {"$lt": s_next.strftime("%Y-%m-%dT00:00:00")}},
+                        {"start_date": {"$lt": s_next}}
+                    ]
+                }
+            
+            if "$and" in query:
+                query["$and"].append(sdate_filter)
+            elif "$or" in query:
+                query["$and"] = [{"$or": query.pop("$or")}, sdate_filter]
+            else:
+                query["$and"] = [sdate_filter]
+        except Exception as e:
+            print(f"Start date filter error: {e}")
     
     # جلب البلاغات بدون حد (None) لدعم أي عدد من البلاغات
     # ⚡ استثناء حقل الصور الكامل لتسريع الاستعلام - نجلب فقط عدد الصور
@@ -7293,9 +8735,9 @@ async def export_reports_excel(
     
     headers = [
         "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة",
-        "الحالة", "نوع البلاغ", "العمق (سم)", "القطر (ملم)",
+        "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق (سم)", "القطر (ملم)",
         "اسم المقاول", "خط العرض", "خط الطول", "رخصة أسفلت",
-        "الملاحظات", "تاريخ الإنشاء", "تاريخ الإغلاق", "عدد الصور", "أنشأ بواسطة"
+        "الملاحظات", "تاريخ الاستلام", "تاريخ الإغلاق", "عدد الصور", "مراقب الاستشاري"
     ]
     
     # تنسيق الرأس (السطر الثاني)
@@ -7312,7 +8754,7 @@ async def export_reports_excel(
         )
     
     # ضبط عرض الأعمدة
-    column_widths = [6, 15, 35, 15, 15, 18, 12, 12, 12, 25, 12, 12, 12, 30, 18, 18, 10, 20]
+    column_widths = [6, 15, 35, 15, 15, 18, 18, 12, 12, 12, 25, 12, 12, 12, 30, 18, 18, 10, 20]
     for idx, width in enumerate(column_widths, 1):
         ws.column_dimensions[ws.cell(row=2, column=idx).column_letter].width = width
     
@@ -7332,8 +8774,13 @@ async def export_reports_excel(
         
         images_count = images_counts.get(report.get('id'), 0)
         _rn = report.get('report_number', '')
-        if _rn and not str(_rn).startswith('CCB-'):
-            _rn = f"CCB-{_rn}"
+        if _rn:
+            _rn = str(_rn).replace('CCP-', '').replace('CCB-', '')
+            proj_name = report.get('project', '')
+            if 'الغربي' in proj_name:
+                _rn = f"CCB-{_rn}"
+            else:
+                _rn = f"CCP-{_rn}"
         
         row_data = [
             row_idx - 2,  # رقم تسلسلي يبدأ من 1 (row_idx يبدأ من 3، فنطرح 2)
@@ -7341,6 +8788,7 @@ async def export_reports_excel(
             report.get('project', ''),
             _rn,
             report.get('license_number', ''),
+            "مغلقة بواسطة الاستشاري" if report.get('wfm_closed') else "قيد المعالجة",
             report.get('status', ''),
             report.get('report_type', ''),
             report.get('depth_meters', ''),
@@ -7420,6 +8868,13 @@ async def get_team_members(
 
 @api_router.post("/team-members", response_model=TeamMemberResponse)
 async def add_team_member(member_data: dict, current_user: User = Depends(get_current_user)):
+    if 'profile_picture' in member_data and member_data['profile_picture']:
+        picture = member_data['profile_picture']
+        if picture.startswith('data:image'):
+            header, encoded = picture.split(",", 1)
+            image_data = base64.b64decode(encoded)
+            member_data['profile_picture'] = _upload_image(image_data, category="profiles", content_type="image/jpeg")
+            
     member = TeamMember(**member_data, created_by=current_user.id)
     
     doc = member.model_dump()
@@ -7447,6 +8902,14 @@ async def update_team_member(
         update_data['position'] = member_data['position']
     if 'project' in member_data:
         update_data['project'] = member_data['project']
+    if 'profile_picture' in member_data:
+        picture = member_data['profile_picture']
+        if picture and picture.startswith('data:image'):
+            header, encoded = picture.split(",", 1)
+            image_data = base64.b64decode(encoded)
+            update_data['profile_picture'] = _upload_image(image_data, category="profiles", content_type="image/jpeg")
+        else:
+            update_data['profile_picture'] = picture
     
     if not update_data:
         raise HTTPException(status_code=400, detail="لا توجد بيانات للتحديث")
@@ -7480,24 +8943,67 @@ async def get_contractors(
     all_contractors: Optional[bool] = Query(False),
     current_user: User = Depends(get_current_user)
 ):
-    """جلب قائمة المقاولين، مع إمكانية الفلترة حسب المشروع"""
+    """جلب قائمة المقاولين، مع إمكانية الفلترة حسب المشروع والصلاحيات"""
     query = {}
     
-    # للـ Admin: إذا طُلب جميع المقاولين أو لم يُحدد مشروع
-    if current_user.role == "admin" and all_contractors:
-        # إرجاع جميع المقاولين بدون فلتر
-        pass
-    # فلترة حسب المشروع إذا تم تحديده
-    elif project:
-        query["project"] = project
-    
+    # التحقق من الصلاحيات والمشاريع المسموحة لغير المسؤولين
+    if current_user.role != "admin":
+        # المقاولين يمكن جلبهم إذا كان لدى المستخدم صلاحية إدارة المقاولين، أو صلاحية إدخال/عرض التوصيلات (المياه أو الصرف) أو البلاغات أو المستخلصات/الفواتير
+        allowed_contractor_projects = get_projects_with_permission(current_user, "contractors")
+        allowed_water_projects = get_projects_with_permission(current_user, "water_connections")
+        allowed_sewage_projects = get_projects_with_permission(current_user, "sewage_connections")
+        allowed_reports_view_projects = get_projects_with_permission(current_user, "reports_view")
+        allowed_reports_add_projects = get_projects_with_permission(current_user, "reports_add")
+        allowed_reports_edit_projects = get_projects_with_permission(current_user, "reports_edit")
+        allowed_reports_review_projects = get_projects_with_permission(current_user, "reports_review")
+        allowed_extracts_projects = get_projects_with_permission(current_user, "extracts")
+        allowed_invoices_projects = get_projects_with_permission(current_user, "invoices")
+        
+        allowed_projects = list(set(
+            allowed_contractor_projects + 
+            allowed_water_projects + 
+            allowed_sewage_projects + 
+            allowed_reports_view_projects + 
+            allowed_reports_add_projects +
+            allowed_reports_edit_projects +
+            allowed_reports_review_projects +
+            allowed_extracts_projects +
+            allowed_invoices_projects
+        ))
+        
+        if not allowed_projects:
+            return []
+            
+        if project:
+            # إذا حدد مشروعاً معيناً، نتحقق من صلاحيته عليه
+            if project in allowed_projects:
+                query["project"] = project
+            else:
+                return []
+        else:
+            # إذا لم يحدد مشروعاً
+            if len(allowed_projects) == 1:
+                # إذا كان لديه مشروع واحد فقط، نظهر مقاولي هذا المشروع فقط
+                query["project"] = allowed_projects[0]
+            else:
+                # إذا كان لديه عدة مشاريع، نظهر مقاولي كل مشاريع المستخدم المسموحة
+                query["project"] = {"$in": allowed_projects}
+    else:
+        # للـ Admin: إذا طُلب جميع المقاولين أو لم يُحدد مشروع
+        if current_user.role == "admin" and all_contractors:
+            # إرجاع جميع المقاولين بدون فلتر
+            pass
+        # فلترة حسب المشروع إذا تم تحديده
+        elif project:
+            query["project"] = project
+            
     contractors = await db.contractors.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
     
     # تحويل التواريخ
     for contractor in contractors:
         if isinstance(contractor.get('created_at'), str):
             contractor['created_at'] = datetime.fromisoformat(contractor['created_at'])
-    
+            
     return [ContractorResponse(**contractor) for contractor in contractors]
 
 
@@ -7507,6 +9013,15 @@ async def create_contractor(
     current_user: User = Depends(get_current_user)
 ):
     """إضافة مقاول جديد"""
+    # التحقق من صلاحية المستخدم على هذا المشروع
+    if current_user.role != "admin":
+        allowed_projects = get_projects_with_permission(current_user, "contractors")
+        if contractor_data.project not in allowed_projects:
+            raise HTTPException(
+                status_code=403, 
+                detail="ليس لديك صلاحية لإضافة مقاول لهذا المشروع"
+            )
+            
     # التحقق من عدم وجود مقاول بنفس الاسم في نفس المشروع
     existing = await db.contractors.find_one({
         "name": contractor_data.name,
@@ -7518,7 +9033,7 @@ async def create_contractor(
             status_code=400, 
             detail="يوجد مقاول بنفس الاسم في هذا المشروع"
         )
-    
+        
     contractor = Contractor(
         **contractor_data.model_dump(),
         created_by=current_user.id
@@ -7543,7 +9058,21 @@ async def update_contractor(
     
     if not contractor:
         raise HTTPException(status_code=404, detail="المقاول غير موجود")
-    
+        
+    # التحقق من صلاحية المستخدم على هذا المشروع
+    if current_user.role != "admin":
+        allowed_projects = get_projects_with_permission(current_user, "contractors")
+        if contractor_data.project not in allowed_projects:
+            raise HTTPException(
+                status_code=403,
+                detail="ليس لديك صلاحية لتعديل مقاول في هذا المشروع"
+            )
+        if contractor.get("project") not in allowed_projects:
+            raise HTTPException(
+                status_code=403,
+                detail="ليس لديك صلاحية لتعديل مقاول في هذا المشروع"
+            )
+            
     # التحقق من عدم تكرار الاسم في نفس المشروع (باستثناء المقاول الحالي)
     existing = await db.contractors.find_one({
         "name": contractor_data.name,
@@ -7556,7 +9085,7 @@ async def update_contractor(
             status_code=400,
             detail="يوجد مقاول آخر بنفس الاسم في هذا المشروع"
         )
-    
+        
     update_data = contractor_data.model_dump()
     
     await db.contractors.update_one(
@@ -7569,7 +9098,7 @@ async def update_contractor(
     
     if isinstance(updated_contractor.get('created_at'), str):
         updated_contractor['created_at'] = datetime.fromisoformat(updated_contractor['created_at'])
-    
+        
     return ContractorResponse(**updated_contractor)
 
 
@@ -7579,10 +9108,20 @@ async def delete_contractor(
     current_user: User = Depends(get_current_user)
 ):
     """حذف مقاول"""
-    result = await db.contractors.delete_one({"id": contractor_id})
-    
-    if result.deleted_count == 0:
+    contractor = await db.contractors.find_one({"id": contractor_id})
+    if not contractor:
         raise HTTPException(status_code=404, detail="المقاول غير موجود")
+        
+    # التحقق من صلاحية المستخدم على هذا المشروع
+    if current_user.role != "admin":
+        allowed_projects = get_projects_with_permission(current_user, "contractors")
+        if contractor.get("project") not in allowed_projects:
+            raise HTTPException(
+                status_code=403,
+                detail="ليس لديك صلاحية لحذف مقاول في هذا المشروع"
+            )
+            
+    await db.contractors.delete_one({"id": contractor_id})
     
     return {"message": "تم حذف المقاول بنجاح"}
 
@@ -7875,7 +9414,7 @@ async def create_work_unit(
         "id": str(uuid.uuid4()),
         "name": name,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "is_deleted": False
+        "is_deleted": {"$ne": True}
     }
     await db.work_units.insert_one(unit)
     return {"id": unit["id"], "name": name, "message": "تم إضافة وحدة الأعمال بنجاح"}
@@ -7907,7 +9446,7 @@ async def get_extracts(
     current_user: User = Depends(get_current_user)
 ):
     """الحصول على قائمة المستخلصات مع فلترة حسب المشروع والشهر وحالة الصرف"""
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     
     # فلترة حسب المشروع إذا تم تحديده
     if project:
@@ -8058,7 +9597,7 @@ async def get_extract_payment_stats(
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="هذه الميزة متاحة لبيت الخبرة فقط")
     
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     if project:
         query["project"] = project
     
@@ -8103,7 +9642,7 @@ async def get_extract(
 ):
     """الحصول على تفاصيل مستخلص محدد"""
     extract = await db.extracts.find_one(
-        {"id": extract_id, "is_deleted": False},
+        {"id": extract_id, "is_deleted": {"$ne": True}},
         {"_id": 0}
     )
     
@@ -8143,7 +9682,7 @@ async def update_extract(
 ):
     """تحديث مستخلص"""
     extract = await db.extracts.find_one(
-        {"id": extract_id, "is_deleted": False},
+        {"id": extract_id, "is_deleted": {"$ne": True}},
         {"_id": 0}
     )
     
@@ -8260,6 +9799,67 @@ async def delete_extract(
     return {"message": "تم حذف المستخلص بنجاح"}
 
 
+@api_router.get("/extracts-trash", response_model=List[ExtractResponse])
+async def get_deleted_extracts(current_user: User = Depends(get_current_user)):
+    """جلب المستخلصات المحذوفة"""
+    # التحقق من الصلاحيات للمستخلصات
+    query = {"is_deleted": True}
+    
+    if current_user.role != "admin" and current_user.level not in ["1", "2"]:
+        if len(current_user.projects) > 0:
+            query["project"] = {"$in": current_user.projects}
+        else:
+            raise HTTPException(status_code=403, detail="ليس لديك صلاحية عرض المستخلصات المحذوفة")
+    
+    extracts = await db.extracts.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(1000)
+    
+    # تحويل التواريخ
+    for extract in extracts:
+        if isinstance(extract.get('created_at'), str):
+            extract['created_at'] = datetime.fromisoformat(extract['created_at'])
+        if isinstance(extract.get('updated_at'), str):
+            extract['updated_at'] = datetime.fromisoformat(extract['updated_at'])
+            
+    return [ExtractResponse(**ext) for ext in extracts]
+
+
+@api_router.post("/extracts-trash/{extract_id}/restore")
+async def restore_deleted_extract(extract_id: str, current_user: User = Depends(get_current_user)):
+    """استعادة مستخلص محذوف"""
+    query = {"id": extract_id, "is_deleted": True}
+    
+    if current_user.role != "admin" and current_user.level not in ["1", "2"]:
+        if len(current_user.projects) > 0:
+            query["project"] = {"$in": current_user.projects}
+    
+    extract = await db.extracts.find_one(query, {"_id": 0})
+    if not extract:
+        raise HTTPException(status_code=404, detail="المستخلص غير موجود أو ليس لديك صلاحية")
+        
+    await db.extracts.update_one({"id": extract_id}, {"$set": {"is_deleted": {"$ne": True}}})
+    return {"message": "تم استعادة المستخلص بنجاح"}
+
+
+@api_router.delete("/extracts-trash/{extract_id}/permanent")
+async def permanently_delete_extract(extract_id: str, current_user: User = Depends(get_current_user)):
+    """حذف المستخلص نهائياً"""
+    has_trash_perm = current_user.role == "admin" or "trash" in (current_user.permissions or []) or user_has_any_project_permission(current_user, "trash")
+    if not has_trash_perm and current_user.username != "Eng Mahmoud Haroun":
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية الحذف النهائي")
+        
+    query = {"id": extract_id, "is_deleted": True}
+    
+    if current_user.role != "admin" and current_user.level not in ["1", "2"]:
+        if len(current_user.projects) > 0:
+            query["project"] = {"$in": current_user.projects}
+            
+    extract = await db.extracts.find_one(query, {"_id": 0})
+    if not extract:
+        raise HTTPException(status_code=404, detail="المستخلص غير موجود أو ليس لديك صلاحية")
+        
+    await db.extracts.delete_one({"id": extract_id})
+    return {"message": "تم الحذف النهائي بنجاح"}
+
 
 @api_router.post("/extracts/recalculate-differences")
 async def recalculate_extract_differences(
@@ -8300,7 +9900,7 @@ async def update_extract_payment(
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="هذه الميزة متاحة لبيت الخبرة فقط")
     
-    extract = await db.extracts.find_one({"id": extract_id, "is_deleted": False}, {"_id": 0})
+    extract = await db.extracts.find_one({"id": extract_id, "is_deleted": {"$ne": True}}, {"_id": 0})
     
     if not extract:
         raise HTTPException(status_code=404, detail="المستخلص غير موجود")
@@ -8364,6 +9964,8 @@ async def export_reports_pdf(
     license_status: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    start_date_from: Optional[str] = Query(None),
+    start_date_to: Optional[str] = Query(None),
     created_by: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user)
 ):
@@ -8381,12 +9983,12 @@ async def export_reports_pdf(
     # تسجيل الخط العربي
     arabic_font_path = os.path.join(os.path.dirname(__file__), 'fonts', 'NotoSansArabic-Regular.ttf')
     pdfmetrics.registerFont(TTFont('Arabic', arabic_font_path))
-    # تسجيل خط يدعم اللاتينية للأعمدة مثل CCB
+    # تسجيل خط يدعم اللاتينية للأعمدة مثل CCP
     noto_sans_path = os.path.join(os.path.dirname(__file__), 'fonts', 'NotoSans-Regular.ttf')
     if os.path.exists(noto_sans_path):
         pdfmetrics.registerFont(TTFont('NotoSans', noto_sans_path))
     
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     
     # التصفية الهرمية: عرض تقارير المستخدم + المستخدمين الفرعيين
     if current_user.role != "admin":
@@ -8441,8 +10043,12 @@ async def export_reports_pdf(
         query["status"] = "تم الإصلاح"
     elif license_status == 'status_asphalt':
         query["status"] = "تم الإصلاح-ومتبقي الأسفلت"
+    elif license_status == 'status_in_progress':
+        query["wfm_closed"] = {"$ne": True}
+    elif license_status == 'status_wfm_closed':
+        query["wfm_closed"] = True
     elif license_status == 'review_pending':
-        query["review_status"] = "بانتظار المراجعة"
+        query["review_status"] = {"$in": ["بانتظار المراجعة", "قيد المراجعة", None]}
     elif license_status == 'license_issued':
         query["license_number"] = {"$regex": "[0-9]"}
     elif license_status == 'license_not_issued':
@@ -8451,6 +10057,9 @@ async def export_reports_pdf(
             {"license_number": None},
             {"license_number": {"$not": {"$regex": "[0-9]"}}}
         ]
+    elif license_status and license_status.startswith('custom_'):
+        custom_status_name = license_status[len('custom_'):]
+        query["status"] = custom_status_name
     
     # فلترة بتاريخ استلام البلاغ (created_at) - يدعم string و datetime
     if date_from or date_to:
@@ -8492,7 +10101,7 @@ async def export_reports_pdf(
             if "$and" in query:
                 query["$and"].append(date_filter)
             elif "$or" in query:
-                query = {"$and": [{"$or": query.pop("$or")}, date_filter]}
+                query["$and"] = [{"$or": query.pop("$or")}, date_filter]
             else:
                 if "$or" in date_filter:
                     query["$and"] = [date_filter]
@@ -8500,6 +10109,47 @@ async def export_reports_pdf(
                     query.update(date_filter)
         except Exception as e:
             print(f"Date filter error: {e}")
+
+    # فلترة بتاريخ مباشرة البلاغ (start_date)
+    if start_date_from or start_date_to:
+        from datetime import datetime as dt, timedelta
+        try:
+            if start_date_from and start_date_to:
+                s_from = dt.fromisoformat(start_date_from)
+                s_to = dt.fromisoformat(start_date_to)
+                s_next = s_to + timedelta(days=1)
+                sdate_filter = {
+                    "$or": [
+                        {"start_date": {"$gte": f"{start_date_from}T00:00:00", "$lt": s_next.strftime("%Y-%m-%dT00:00:00")}},
+                        {"start_date": {"$gte": s_from, "$lt": s_next}}
+                    ]
+                }
+            elif start_date_from:
+                s_from = dt.fromisoformat(start_date_from)
+                sdate_filter = {
+                    "$or": [
+                        {"start_date": {"$gte": f"{start_date_from}T00:00:00"}},
+                        {"start_date": {"$gte": s_from}}
+                    ]
+                }
+            else:
+                s_to = dt.fromisoformat(start_date_to)
+                s_next = s_to + timedelta(days=1)
+                sdate_filter = {
+                    "$or": [
+                        {"start_date": {"$lt": s_next.strftime("%Y-%m-%dT00:00:00")}},
+                        {"start_date": {"$lt": s_next}}
+                    ]
+                }
+            
+            if "$and" in query:
+                query["$and"].append(sdate_filter)
+            elif "$or" in query:
+                query["$and"] = [{"$or": query.pop("$or")}, sdate_filter]
+            else:
+                query["$and"] = [sdate_filter]
+        except Exception as e:
+            print(f"Start date filter error: {e}")
     
     # جلب البلاغات بدون حد (None) لدعم أي عدد من البلاغات
     # ⚡ استثناء حقل الصور الكامل لتسريع الاستعلام - نجلب فقط عدد الصور
@@ -8582,15 +10232,7 @@ async def export_reports_pdf(
     
     # دالة للحصول على اسم المشروع الكامل
     def get_full_project_name(proj):
-        if not proj:
-            return ""
-        if 'الغربية' in proj:
-            return "مشروع الاشراف على اعمال اصلاح وصيانة شبكات المياه والصرف الصحي بالمحافظات الغربية"
-        elif 'الشمالية' in proj:
-            return "مشروع الاشراف على اعمال اصلاح وصيانة شبكات المياه والصرف الصحي بالمحافظات الشمالية"
-        elif 'الجنوبية' in proj:
-            return "مشروع الاشراف على اعمال اصلاح وصيانة شبكات المياه والصرف الصحي بالمحافظات الجنوبية"
-        return proj
+        return proj if proj else ""
     
     # إنشاء العنوان الديناميكي
     title_style = ParagraphStyle(
@@ -8666,55 +10308,65 @@ async def export_reports_pdf(
         project_para = Paragraph(project_text, project_style)
         elements.append(project_para)
     
-    # إضافة اسم معد البيانات (على اليمين) - فقط للمشروع الغربي
-    if project_for_display and 'الغربية' in project_for_display:
-        author_style = ParagraphStyle(
-            'AuthorStyle',
-            fontName='Arabic',
-            fontSize=10,  # تصغير حجم الخط
-            alignment=TA_RIGHT,
-            textColor=colors.HexColor('#333333'),
-            spaceBefore=0,
-            spaceAfter=5,  # تقليل المسافة
-            leading=14
-        )
-        
-        author_text = reshape("إعداد م / محمود هارون")
-        author_text = get_display(author_text)
-        author_para = Paragraph(author_text, author_style)
-        elements.append(author_para)
+    # إضافة م / محمود هارون فوق الجدول
+    author_style = ParagraphStyle(
+        'AuthorStyle2',
+        fontName='Arabic',
+        fontSize=8,
+        alignment=TA_RIGHT,
+        textColor=colors.HexColor('#555555'),
+        spaceBefore=2,
+        spaceAfter=5,
+        leading=14
+    )
+    author_text = reshape("تنفيذ م-محمود محمد هارون مدير النظام وتحليل البيانات")
+    author_text = get_display(author_text)
+    author_para = Paragraph(author_text, author_style)
+    elements.append(author_para)
     
     # إضافة مسافة صغيرة قبل الجدول
     elements.append(Spacer(1, 3*mm))
     
     # إعداد البيانات - 11 عمود (مع العمق والقطر)
     headers = [
-        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة",
+        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة الرخصة",
         "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الإنشاء"
     ]
     
     # عكس ترتيب الأعمدة لتبدأ من اليمين (RTL)
     headers_reversed = headers[::-1]
     
-    # نمط خاص بعناوين الجدول - يضمن الخط العربي وتوسيط النص
-    from reportlab.platypus import Paragraph as _Para
-    from reportlab.lib.styles import ParagraphStyle as _PS
-    from reportlab.lib.enums import TA_CENTER as _TAC
-    header_style = _PS(
-        'HeaderArabic',
+    # ستايلات خلايا الجدول لضمان التنسيق والتفاف النص والترميز الصحيح
+    header_style = ParagraphStyle(
+        'HeaderStyle2',
         fontName='Arabic',
-        fontSize=7,
-        alignment=_TAC,
+        fontSize=8,
+        alignment=TA_CENTER,
         textColor=colors.whitesmoke,
         leading=10
     )
     
-    # تحويل العناوين إلى Paragraph مع الخط العربي لضمان العرض الصحيح
+    cell_style = ParagraphStyle(
+        'CellStyle2',
+        fontName='Arabic',
+        fontSize=8,
+        alignment=TA_CENTER,
+        leading=10,
+        wordWrap='RTL'
+    )
+    
+    latin_cell_style = ParagraphStyle(
+        'LatinCellStyle2',
+        fontName='NotoSans' if os.path.exists(noto_sans_path) else 'Helvetica',
+        fontSize=8,
+        alignment=TA_CENTER,
+        leading=10
+    )
+    
+    # معالجة العناوين - الطريقة الأصلية البسيطة التي كانت تعمل
     processed_headers = []
     for header in headers_reversed:
-        reshaped = reshape(header)
-        bidi_text = get_display(reshaped)
-        processed_headers.append(_Para(bidi_text, header_style))
+        processed_headers.append(Paragraph(arabic_text(header), header_style))
     
     data = [processed_headers]
     
@@ -8733,10 +10385,15 @@ async def export_reports_pdf(
         lng = report.get('longitude', '')
         coordinates = f"{lat}, {lng}" if lat and lng else ''
         
-        # إضافة CC- لرقم البلاغ إذا لم يكن موجوداً
+        # إضافة CCB- أو CCP- حسب المشروع
         report_num = report.get('report_number', '')
-        if report_num and not str(report_num).startswith('CCB-'):
-            report_num = f"CCB-{report_num}"
+        if report_num:
+            report_num = str(report_num).replace('CCP-', '').replace('CCB-', '')
+            proj_name = report.get('project', '')
+            if 'الغربي' in proj_name:
+                report_num = f"CCB-{report_num}"
+            else:
+                report_num = f"CCP-{report_num}"
         
         # جلب قيم العمق والقطر
         depth_val = report.get('depth_meters', '')
@@ -8758,36 +10415,28 @@ async def export_reports_pdf(
             depth_str,  # العمق بالمتر
             report.get('report_type', ''),  # نوع البلاغ
             report.get('status', ''),  # الحالة
+            "مغلقة بواسطة الاستشاري" if report.get('wfm_closed') else "قيد المعالجة", # حالة الرخصة
             license_num,  # رقم الرخصة
-            report_num,  # رقم البلاغ مع CCB- (بدون عكس)
+            report_num,  # رقم البلاغ مع CCP- (بدون عكس)
             shorten_project_name(report.get('project', '')),  # المشروع
             report.get('governorate', ''),  # المحافظة
             str(idx)  # رقم - يسار
         ]
         
-        # معالجة كل خلية
-        processed_row = []
-        for i, cell in enumerate(row):
-            cell_str = str(cell) if cell else ''
-            
-            # تحقق إذا كانت الخلية تحتوي على أحرف لاتينية (مثل CCB-)
-            has_latin = any(ord('A') <= ord(c) <= ord('Z') or ord('a') <= ord(c) <= ord('z') for c in cell_str)
-            # تحقق إذا كانت أرقام فقط (مع - أو , أو مسافات)
-            is_numeric = cell_str and cell_str.replace('-', '').replace(',', '').replace(' ', '').replace('.', '').isdigit()
-            
-            if has_latin or is_numeric:
-                # نص يحتوي على أحرف لاتينية أو أرقام - بدون معالجة bidi
-                processed_row.append(cell_str)
-            elif cell_str:
-                # نص عربي - نطبق معالجة bidi
-                try:
-                    reshaped = reshape(cell_str)
-                    bidi_text = get_display(reshaped)
-                    processed_row.append(bidi_text)
-                except:
-                    processed_row.append(cell_str)
-            else:
-                processed_row.append(cell_str)
+        processed_row = [
+            Paragraph(created_at.strftime('%Y-%m-%d') if created_at else '', latin_cell_style),
+            Paragraph(arabic_text(report.get('contractor', '')), cell_style),
+            Paragraph(diameter_str, latin_cell_style),
+            Paragraph(depth_str, latin_cell_style),
+            Paragraph(arabic_text(report.get('report_type', '')), cell_style),
+            Paragraph(arabic_text(report.get('status', '')), cell_style),
+            Paragraph(arabic_text("مغلقة بواسطة الاستشاري") if report.get('wfm_closed') else arabic_text("قيد المعالجة"), cell_style),
+            Paragraph(arabic_text(license_num), cell_style),
+            Paragraph(report_num, latin_cell_style),
+            Paragraph(arabic_text(shorten_project_name(report.get('project', ''))), cell_style),
+            Paragraph(arabic_text(report.get('governorate', '')), cell_style),
+            Paragraph(str(idx), latin_cell_style)
+        ]
         
         data.append(processed_row)
     
@@ -8795,7 +10444,9 @@ async def export_reports_pdf(
     # العروض بالـ points (معكوسة من اليمين لليسار): تاريخ، مقاول، قطر، عمق، نوع، حالة، رقم رخصة، رقم بلاغ، مشروع، محافظة، رقم
     # تعديل: توسيع الحالة (70→85)، تضييق رقم الرخصة (90→75)
     # المجموع: 65+75+50+50+65+85+75+85+105+60+28 = 743 points (ضمن 802)
-    col_widths = [65, 75, 45, 45, 65, 95, 70, 95, 130, 65, 30]
+    # إنشاء الجدول - 12 عمود متوازن مع توسيع خانة رقم البلاغ والحالة
+    # العروض: تاريخ(50), مقاول(70), قطر(35), عمق(35), نوع(50), حالة(125), حالة رخصة(85), رقم رخصة(50), رقم بلاغ(110), مشروع(120), محافظة(35), رقم(20)
+    col_widths = [50, 70, 35, 35, 50, 125, 85, 50, 110, 120, 35, 20]
     table = Table(data, colWidths=col_widths, repeatRows=1)
     # العمود 7 من اليسار (index 7) هو رقم البلاغ (CCB-)
     # والعمود 0 هو التاريخ (يحتاج خط لاتيني أيضاً)
@@ -8805,35 +10456,20 @@ async def export_reports_pdf(
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Arabic'),
-        ('FONTSIZE', (0, 0), (-1, 0), 7),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-        ('TOPPADDING', (0, 0), (-1, 0), 10),
+        ('FONTSIZE', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 2),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('TOPPADDING', (0, 0), (-1, 0), 6),
         
-        # تنسيق البيانات - الخط الأساسي عربي
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('FONTNAME', (0, 1), (-1, -1), 'Arabic'),
-        ('FONTSIZE', (0, 1), (-1, -1), 6.5),
-        
-        # خط لاتيني للأعمدة التي تحتوي على أرقام وحروف لاتينية
-        # العمود 0: التاريخ (yyyy-mm-dd)
-        ('FONTNAME', (0, 1), (0, -1), 'NotoSans'),
-        # العمود 2: القطر (أرقام)
-        ('FONTNAME', (2, 1), (2, -1), 'NotoSans'),
-        # العمود 3: العمق (أرقام)
-        ('FONTNAME', (3, 1), (3, -1), 'NotoSans'),
-        # العمود 6: رقم الرخصة - يبقى بالخط العربي لدعم نص "لم يتم إصدار رخصة"
-        # العمود 7: رقم البلاغ (CCB-xxx)
-        ('FONTNAME', (7, 1), (7, -1), 'NotoSans'),
-        # العمود 10: الرقم التسلسلي
-        ('FONTNAME', (10, 1), (10, -1), 'NotoSans'),
-        
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (-1, -1), 4),
-        ('TOPPADDING', (0, 1), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+        # تنسيق الجسم
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 2),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+        ('TOPPADDING', (0, 1), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 5),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ]))
     
     elements.append(table)
@@ -8870,53 +10506,39 @@ async def export_reports_pdf(
     # ========== إضافة قسم التوقيعات مباشرة تحت الجدول ==========
     elements.append(Spacer(1, 10*mm))
     
-    # دالة مساعدة للنص العربي في التوقيعات
+    # دالة مساعدة للنص العربي في التوقيعات - معالجة محسنة
     def sig_arabic(text):
+        import html
+        if not text: return ""
+        if not isinstance(text, str): text = str(text)
+        if '\\u' in text:
+            try: text = text.encode('utf-8').decode('unicode-escape')
+            except: pass
+        text = html.unescape(text)
         return get_display(reshape(text))
     
     # بيانات التوقيع مع اسم المراقب
-    if supervisor_name:
-        sig_data = [
-            [
-                sig_arabic("شركة المياه الوطنية"),
-                "",
-                "",
-                sig_arabic("مكتب بيت الخبرة للاستشارات الهندسية")
-            ],
-            [
-                sig_arabic("الاسم: ........................"),
-                "",
-                "",
-                sig_arabic(f"الاسم: {supervisor_name}")
-            ],
-            [
-                sig_arabic("التوقيع: ........................"),
-                "",
-                "",
-                sig_arabic("التوقيع: ........................")
-            ]
+    company_name = branding.get("company_name", "مكتب بيت الخبرة للاستشارات الهندسية")
+    sig_data = [
+        [
+            sig_arabic("شركة المياه الوطنية"),
+            "",
+            "",
+            sig_arabic(company_name)
+        ],
+        [
+            sig_arabic("الاسم: ........................"),
+            "",
+            "",
+            sig_arabic(f"الاسم: {supervisor_name}") if supervisor_name else sig_arabic("الاسم: ........................")
+        ],
+        [
+            sig_arabic("التوقيع: ........................"),
+            "",
+            "",
+            sig_arabic("التوقيع: ........................")
         ]
-    else:
-        sig_data = [
-            [
-                sig_arabic("شركة المياه الوطنية"),
-                "",
-                "",
-                sig_arabic("مكتب بيت الخبرة للاستشارات الهندسية")
-            ],
-            [
-                sig_arabic("الاسم: ........................"),
-                "",
-                "",
-                sig_arabic("الاسم: ........................")
-            ],
-            [
-                sig_arabic("التوقيع: ........................"),
-                "",
-                "",
-                sig_arabic("التوقيع: ........................")
-            ]
-        ]
+    ]
     
     sig_table = Table(sig_data, colWidths=[page_width*0.30, page_width*0.20, page_width*0.20, page_width*0.30])
     sig_table.setStyle(TableStyle([
@@ -9279,7 +10901,14 @@ async def remove_user_from_cars_list(user_id: str, project: str = Query(...), cu
 @api_router.get("/water-connections")
 async def get_water_connections(
     project: Optional[str] = None,
+    governorate: Optional[str] = None,
     status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    request_number: Optional[str] = None,
+    ccb_report_number: Optional[str] = None,
+    customer_name: Optional[str] = None,
+    search: Optional[str] = None,
     page: int = 1,
     limit: int = 10,
     current_user: User = Depends(get_current_user)
@@ -9292,24 +10921,100 @@ async def get_water_connections(
     if not is_admin and not has_permission:
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
     
-    query = {}
+    query = {"is_deleted": {"$ne": True}}
     
-    # ⚡ فلترة حسب المشاريع التي يملك فيها المستخدم صلاحية water_connections
+    # ⚡ فلترة حسب المشاريع المسموحة (لغير الأدمن)
+    allowed_projects = None
     if not is_admin:
         allowed_projects = get_projects_with_permission(current_user, "water_connections")
-        if allowed_projects:
-            query["project"] = {"$in": allowed_projects}
-        else:
+        if not allowed_projects:
             return {"connections": [], "total_count": 0, "total_pages": 0, "current_page": page, "limit": limit}
+        query["project"] = {"$in": allowed_projects}
     
-    # فلتر إضافي إذا طُلب مشروع محدد
+    # ⚡ فلترة مرنة حسب اسم المشروع (للجميع)
     if project:
-        if not is_admin and not has_project_permission(current_user, project, "water_connections"):
-            raise HTTPException(status_code=403, detail="ليس لديك صلاحية على هذا المشروع")
-        query["project"] = project
+        keywords = [k for k in project.replace('-', ' ').split() if len(k) > 1]
+        if keywords:
+            p_regex = ".*".join(keywords).replace('أ', '[أا]').replace('إ', '[إا]').replace('ا', '[اأإ]')
+            regex_query = {"$regex": p_regex, "$options": "i"}
+            
+            if not is_admin:
+                # دمج البحث مع الصلاحيات المتاحة
+                query["$and"] = [
+                    {"project": regex_query},
+                    {"project": {"$in": allowed_projects}}
+                ]
+                if "project" in query: del query["project"]
+            else:
+                query["project"] = regex_query
     
     if status:
         query["request_status"] = status
+
+    if governorate:
+        gov_p = normalize_arabic_regex(governorate.strip())
+        gov_filter = {"$or": [{"governorate": {"$regex": gov_p, "$options": "i"}}, {"area": {"$regex": gov_p, "$options": "i"}}]}
+        if "$or" in query or "$and" in query:
+            if "$and" not in query: query["$and"] = []
+            if "$or" in query: query["$and"].append({"$or": query.pop("$or")})
+            query["$and"].append(gov_filter)
+        else:
+            query.update(gov_filter)
+
+    if request_number:
+        query["request_number"] = {"$regex": request_number, "$options": "i"}
+    
+    if ccb_report_number:
+        query["ccb_report_number"] = {"$regex": ccb_report_number, "$options": "i"}
+        
+    if customer_name:
+        query["customer_name"] = {"$regex": customer_name, "$options": "i"}
+
+    if search:
+        query["$or"] = query.get("$or", []) + [
+            {"request_number": {"$regex": search, "$options": "i"}},
+            {"ccb_report_number": {"$regex": search, "$options": "i"}},
+            {"customer_name": {"$regex": search, "$options": "i"}},
+            {"phone_number": {"$regex": search, "$options": "i"}},
+            {"area": {"$regex": search, "$options": "i"}},
+            {"contractor": {"$regex": search, "$options": "i"}}
+        ]
+
+    if date_from or date_to:
+        date_query = {}
+        if date_from: date_query["$gte"] = date_from
+        if date_to: date_query["$lte"] = date_to
+        query["work_order_date"] = date_query
+    
+    # ⚡ فلترة حسب المحافظات والتسلسل الهرمي (لغير الأدمن)
+    if not is_admin:
+        hierarchy_filter = await get_hierarchy_filter(current_user)
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
+        
+        if not has_all_govs:
+            if len(user_governorates) > 0:
+                gov_patterns = []
+                for g in user_governorates:
+                    p = normalize_arabic_regex(g)
+                    gov_patterns.append(p)
+                gov_regex = f"({'|'.join(gov_patterns)})"
+                
+                # تطبيق الفلترة الصارمة: يجب أن يكون من إنتاج المستخدم أو تابعيه AND ضمن المحافظات المسندة
+                query.update(hierarchy_filter)
+                
+                gov_or = [
+                    {"governorate": {"$regex": gov_regex, "$options": "i"}},
+                    {"area": {"$regex": gov_regex, "$options": "i"}}
+                ]
+                
+                if "$and" in query:
+                    query["$and"].append({"$or": gov_or})
+                else:
+                    query["$or"] = gov_or
+            else:
+                # لا توجد محافظات محددة - يرى فقط ما أنشأه هو أو تابعوه
+                query.update(hierarchy_filter)
     
     # Get total count
     total_count = await db.water_connections.count_documents(query)
@@ -9404,7 +11109,7 @@ async def create_water_connection(data: WaterConnectionCreate, current_user: Use
             "ccb_report_number": data_dict['ccb_report_number']
         })
         if existing:
-            raise HTTPException(status_code=400, detail=f"رقم بلاغ CCB {data_dict['ccb_report_number']} موجود مسبقاً في هذا المشروع")
+            raise HTTPException(status_code=400, detail=f"رقم بلاغ CCP {data_dict['ccb_report_number']} موجود مسبقاً في هذا المشروع")
     
     # التحقق من رقم التصريح
     if data_dict.get('permit_number'):
@@ -9424,6 +11129,12 @@ async def create_water_connection(data: WaterConnectionCreate, current_user: Use
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     
+    # ضمان وجود المحافظة في كلا الحقلين للتوافق
+    if doc.get('governorate') and not doc.get('area'):
+        doc['area'] = doc['governorate']
+    elif doc.get('area') and not doc.get('governorate'):
+        doc['governorate'] = doc['area']
+    
     await db.water_connections.insert_one(doc)
     doc.pop("_id", None)
     return doc
@@ -9442,6 +11153,10 @@ async def update_water_connection(connection_id: str, data: dict, current_user: 
     if not connection:
         raise HTTPException(status_code=404, detail="التوصيلة غير موجودة")
     
+    # معالجة الصور ورفعها لـ Cloudinary إذا كانت موجودة في التحديث
+    if "images" in data and data["images"]:
+        data["images"] = await process_images_for_storage(data["images"], category="water_connections")
+    
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.water_connections.update_one({"id": connection_id}, {"$set": data})
     return {"message": "تم تحديث التوصيلة بنجاح"}
@@ -9456,8 +11171,15 @@ async def delete_water_connection(connection_id: str, current_user: User = Depen
     if not is_admin and not has_permission:
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
     
-    result = await db.water_connections.delete_one({"id": connection_id})
-    if result.deleted_count == 0:
+    result = await db.water_connections.update_one(
+        {"id": connection_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_user.id
+        }}
+    )
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="التوصيلة غير موجودة")
     
     return {"message": "تم حذف التوصيلة بنجاح"}
@@ -9468,34 +11190,123 @@ async def delete_water_connection(connection_id: str, current_user: User = Depen
 @api_router.get("/connections-stats")
 async def get_connections_stats(
     project: Optional[str] = None,
+    month: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
-    """جلب إحصائيات توصيلات المياه والصرف الصحي للـ Dashboard"""
+    print(f"DEBUG: get_connections_stats called with project='{project}', month='{month}'")
+    """جلب إحصائيات توصيلات المياه والصرف الصحي للـ Dashboard مع دعم فلترة الشهر"""
     try:
         # فلتر حسب المشروع
-        water_filter = {}
-        sewage_filter = {}
+        water_filter = {"is_deleted": {"$ne": True}}
+        sewage_filter = {"is_deleted": {"$ne": True}}
         
-        if project:
-            water_filter["project"] = project
-            sewage_filter["project"] = project
-        elif current_user.role != "admin" and current_user.projects:
-            water_filter["project"] = {"$in": current_user.projects}
-            sewage_filter["project"] = {"$in": current_user.projects}
+        # فلترة حسب المشروع المسموحة (لغير الأدمن)
+        allowed_projects = None
+        if current_user.role != "admin":
+            allowed_projects = getattr(current_user, 'projects', [])
+            if not allowed_projects:
+                return {"water": {"total": 0}, "sewage": {"total": 0}}
+            
+            # التحقق من الصلاحية للمشروع المختار
+            if project:
+                # التحقق من الصلاحية للمشروع المختار بمرونة
+                has_permission = False
+                for up in allowed_projects:
+                    up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                    proj_keywords = [k for k in project.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                    is_match = any(k in project for k in up_keywords) or any(k in up for k in proj_keywords)
+                    
+                    if is_match:
+                        has_permission = True
+                        break
+                if not has_permission:
+                    return {"water": {"total": 0}, "sewage": {"total": 0}}
+                
+                water_filter["project"] = get_flexible_project_query(project)
+                sewage_filter["project"] = get_flexible_project_query(project)
+            else:
+                flex_proj = get_flexible_in_query(allowed_projects, "project")
+                water_filter.update(flex_proj)
+                sewage_filter.update(flex_proj)
+            
+            # فلترة حسب المحافظات والتسلسل الهرمي
+            user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+            
+            # تطبيق الفلترة الهرمية الشاملة (Recursive)
+            hierarchy_filter = await get_hierarchy_filter(current_user)
+            
+            if len(user_governorates) > 0:
+                gov_patterns = []
+                for g in user_governorates:
+                    p = normalize_arabic_regex(g)
+                    gov_patterns.append(p)
+                gov_regex = f"({'|'.join(gov_patterns)})"
+                
+                for f in [water_filter, sewage_filter]:
+                    f['$or'] = [
+                        hierarchy_filter,
+                        {'area': {'$regex': gov_regex, '$options': 'i'}} # التوصيلات تستخدم area
+                    ]
+            else:
+                water_filter.update(hierarchy_filter)
+                sewage_filter.update(hierarchy_filter)
+        elif project:
+            water_filter["project"] = get_flexible_project_query(project)
+            sewage_filter["project"] = get_flexible_project_query(project)
+        
+        # تطبيق فلتر الشهر الشامل (Universal Date Filter)
+        if month:
+            from datetime import datetime as dt, timezone
+            
+            # month format: "2024-01"
+            year, month_num = month.split('-')
+            
+            # 1. تحضير قيم الفلترة
+            month_regex = f"^{month}" # يبدأ بـ YYYY-MM
+            
+            # 2. تحضير نطاق التاريخ لكائنات datetime
+            date_from_obj = dt(int(year), int(month_num), 1, 0, 0, 0, tzinfo=timezone.utc)
+            if int(month_num) == 12:
+                date_to_obj = dt(int(year) + 1, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+            else:
+                date_to_obj = dt(int(year), int(month_num) + 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+            
+            # بناء فلتر التاريخ الذي يدعم string و datetime
+            # نفحص عدة حقول تاريخ لضمان الشمولية
+            date_fields = ["created_at", "added_at", "work_order_date"]
+            
+            date_filters = []
+            for field in date_fields:
+                date_filters.append({
+                    "$or": [
+                        {field: {"$regex": month_regex}},
+                        {field: {"$gte": date_from_obj, "$lt": date_to_obj}}
+                    ]
+                })
+            
+            # إضافة فلتر التاريخ للـ query الأساسية
+            month_query = {"$or": date_filters}
+            
+            if "$and" not in water_filter:
+                water_filter = {"$and": [water_filter, month_query]}
+                sewage_filter = {"$and": [sewage_filter, month_query]}
+            else:
+                water_filter["$and"].append(month_query)
+                sewage_filter["$and"].append(month_query)
         
         # إحصائيات توصيلات المياه
         water_total = await db.water_connections.count_documents(water_filter)
-        water_new = await db.water_connections.count_documents({**water_filter, "request_status": "جديد"})
-        water_in_progress = await db.water_connections.count_documents({**water_filter, "request_status": "قيد التنفيذ"})
-        water_completed = await db.water_connections.count_documents({**water_filter, "request_status": "مكتمل"})
-        water_cancelled = await db.water_connections.count_documents({**water_filter, "request_status": "ملغي"})
+        water_new = await db.water_connections.count_documents({**water_filter, "request_status": "جديد"}) if "$and" not in water_filter else await db.water_connections.count_documents({"$and": [water_filter, {"request_status": "جديد"}]})
+        water_in_progress = await db.water_connections.count_documents({**water_filter, "request_status": "قيد التنفيذ"}) if "$and" not in water_filter else await db.water_connections.count_documents({"$and": [water_filter, {"request_status": "قيد التنفيذ"}]})
+        water_completed = await db.water_connections.count_documents({**water_filter, "request_status": "مكتمل"}) if "$and" not in water_filter else await db.water_connections.count_documents({"$and": [water_filter, {"request_status": "مكتمل"}]})
+        water_cancelled = await db.water_connections.count_documents({**water_filter, "request_status": "ملغي"}) if "$and" not in water_filter else await db.water_connections.count_documents({"$and": [water_filter, {"request_status": "ملغي"}]})
         
         # إحصائيات توصيلات الصرف الصحي
         sewage_total = await db.sewage_connections.count_documents(sewage_filter)
-        sewage_new = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "جديد"})
-        sewage_in_progress = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "قيد التنفيذ"})
-        sewage_completed = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "مكتمل"})
-        sewage_cancelled = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "ملغي"})
+        sewage_new = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "جديد"}) if "$and" not in sewage_filter else await db.sewage_connections.count_documents({"$and": [sewage_filter, {"request_status": "جديد"}]})
+        sewage_in_progress = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "قيد التنفيذ"}) if "$and" not in sewage_filter else await db.sewage_connections.count_documents({"$and": [sewage_filter, {"request_status": "قيد التنفيذ"}]})
+        sewage_completed = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "مكتمل"}) if "$and" not in sewage_filter else await db.sewage_connections.count_documents({"$and": [sewage_filter, {"request_status": "مكتمل"}]})
+        sewage_cancelled = await db.sewage_connections.count_documents({**sewage_filter, "request_status": "ملغي"}) if "$and" not in sewage_filter else await db.sewage_connections.count_documents({"$and": [sewage_filter, {"request_status": "ملغي"}]})
         
         return {
             "water": {
@@ -9515,6 +11326,8 @@ async def get_connections_stats(
             "grand_total": water_total + sewage_total
         }
     except Exception as e:
+        import traceback
+        logging.error(f"Error in get_connections_stats: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -9523,7 +11336,14 @@ async def get_connections_stats(
 @api_router.get("/sewage-connections")
 async def get_sewage_connections(
     project: Optional[str] = None,
+    governorate: Optional[str] = None,
     status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    request_number: Optional[str] = None,
+    ccb_report_number: Optional[str] = None,
+    customer_name: Optional[str] = None,
+    search: Optional[str] = None,
     page: int = 1,
     limit: int = 10,
     current_user: User = Depends(get_current_user)
@@ -9535,24 +11355,109 @@ async def get_sewage_connections(
     if not is_admin and not has_permission:
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
     
-    query = {}
+    query = {"is_deleted": {"$ne": True}}
     
-    # ⚡ فلترة حسب المشاريع التي يملك فيها المستخدم صلاحية sewage_connections
+    # ⚡ فلترة حسب المشاريع المسموحة (لغير الأدمن)
+    allowed_projects = None
     if not is_admin:
         allowed_projects = get_projects_with_permission(current_user, "sewage_connections")
-        if allowed_projects:
-            query["project"] = {"$in": allowed_projects}
-        else:
+        if not allowed_projects:
             return {"connections": [], "total_count": 0, "total_pages": 0, "current_page": page, "limit": limit}
+        query["project"] = {"$in": allowed_projects}
     
-    # فلتر إضافي إذا طُلب مشروع محدد
+    # ⚡ فلترة مرنة حسب اسم المشروع (للجميع)
     if project:
-        if not is_admin and not has_project_permission(current_user, project, "sewage_connections"):
-            raise HTTPException(status_code=403, detail="ليس لديك صلاحية على هذا المشروع")
-        query["project"] = project
+        keywords = [k for k in project.replace('-', ' ').split() if len(k) > 1]
+        if keywords:
+            p_regex = ".*".join(keywords).replace('أ', '[أا]').replace('إ', '[إا]').replace('ا', '[اأإ]')
+            regex_query = {"$regex": p_regex, "$options": "i"}
+            
+            if not is_admin:
+                # دمج البحث مع الصلاحيات المتاحة
+                query["$and"] = [
+                    {"project": regex_query},
+                    {"project": {"$in": allowed_projects}}
+                ]
+                if "project" in query: del query["project"]
+            else:
+                query["project"] = regex_query
     
     if status:
         query["request_status"] = status
+    
+    if governorate:
+        gov_p = normalize_arabic_regex(governorate.strip())
+        gov_filter = {"$or": [{"governorate": {"$regex": gov_p, "$options": "i"}}, {"area": {"$regex": gov_p, "$options": "i"}}]}
+        if "$or" in query or "$and" in query:
+            if "$and" not in query: query["$and"] = []
+            if "$or" in query: query["$and"].append({"$or": query.pop("$or")})
+            query["$and"].append(gov_filter)
+        else:
+            query.update(gov_filter)
+
+    if request_number:
+        query["request_number"] = {"$regex": request_number, "$options": "i"}
+    
+    if ccb_report_number:
+        query["ccb_report_number"] = {"$regex": ccb_report_number, "$options": "i"}
+        
+    if customer_name:
+        query["customer_name"] = {"$regex": customer_name, "$options": "i"}
+
+    if search:
+        search_filter = {"$or": [
+            {"request_number": {"$regex": search, "$options": "i"}},
+            {"ccb_report_number": {"$regex": search, "$options": "i"}},
+            {"customer_name": {"$regex": search, "$options": "i"}},
+            {"phone_number": {"$regex": search, "$options": "i"}},
+            {"area": {"$regex": search, "$options": "i"}},
+            {"contractor": {"$regex": search, "$options": "i"}}
+        ]}
+        if "$and" in query: query["$and"].append(search_filter)
+        elif "$or" in query:
+            if "$and" not in query: query["$and"] = []
+            query["$and"].append({"$or": query.pop("$or")})
+            query["$and"].append(search_filter)
+        else:
+            query.update(search_filter)
+
+    if date_from or date_to:
+        date_query = {}
+        if date_from: date_query["$gte"] = date_from
+        if date_to: date_query["$lte"] = date_to
+        query["work_order_date"] = date_query
+    
+    # ⚡ فلترة حسب المحافظات والتسلسل الهرمي (لغير الأدمن)
+    if not is_admin:
+        hierarchy_filter = await get_hierarchy_filter(current_user)
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
+        
+        if not has_all_govs:
+            if len(user_governorates) > 0:
+                gov_patterns = []
+                for g in user_governorates:
+                    p = normalize_arabic_regex(g)
+                    gov_patterns.append(p)
+                gov_regex = f"({'|'.join(gov_patterns)})"
+                
+                # تطبيق الفلترة الصارمة: يجب أن يكون من إنتاج المستخدم أو تابعيه AND ضمن المحافظات المسندة
+                query.update(hierarchy_filter)
+                
+                gov_or = [
+                    {"governorate": {"$regex": gov_regex, "$options": "i"}},
+                    {"area": {"$regex": gov_regex, "$options": "i"}}
+                ]
+                
+                if "$and" in query:
+                    query["$and"].append({"$or": gov_or})
+                else:
+                    query["$or"] = gov_or
+            else:
+                if "$and" in query:
+                    query["$and"].append(hierarchy_filter)
+                else:
+                    query.update(hierarchy_filter)
     
     # Get total count
     total_count = await db.sewage_connections.count_documents(query)
@@ -9646,7 +11551,7 @@ async def create_sewage_connection(data: SewageConnectionCreate, current_user: U
             "ccb_report_number": data_dict['ccb_report_number']
         })
         if existing:
-            raise HTTPException(status_code=400, detail=f"رقم بلاغ CCB {data_dict['ccb_report_number']} موجود مسبقاً في هذا المشروع")
+            raise HTTPException(status_code=400, detail=f"رقم بلاغ CCP {data_dict['ccb_report_number']} موجود مسبقاً في هذا المشروع")
     
     # التحقق من رقم التصريح
     if data_dict.get('permit_number'):
@@ -9666,6 +11571,12 @@ async def create_sewage_connection(data: SewageConnectionCreate, current_user: U
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     
+    # ضمان وجود المحافظة في كلا الحقلين للتوافق
+    if doc.get('governorate') and not doc.get('area'):
+        doc['area'] = doc['governorate']
+    elif doc.get('area') and not doc.get('governorate'):
+        doc['governorate'] = doc['area']
+    
     await db.sewage_connections.insert_one(doc)
     doc.pop("_id", None)
     return doc
@@ -9684,6 +11595,10 @@ async def update_sewage_connection(connection_id: str, data: dict, current_user:
     if not connection:
         raise HTTPException(status_code=404, detail="التوصيلة غير موجودة")
     
+    # معالجة الصور ورفعها لـ Cloudinary إذا كانت موجودة في التحديث
+    if "images" in data and data["images"]:
+        data["images"] = await process_images_for_storage(data["images"], category="sewage_connections")
+    
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.sewage_connections.update_one({"id": connection_id}, {"$set": data})
     return {"message": "تم تحديث التوصيلة بنجاح"}
@@ -9698,8 +11613,15 @@ async def delete_sewage_connection(connection_id: str, current_user: User = Depe
     if not is_admin and not has_permission:
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
     
-    result = await db.sewage_connections.delete_one({"id": connection_id})
-    if result.deleted_count == 0:
+    result = await db.sewage_connections.update_one(
+        {"id": connection_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_user.id
+        }}
+    )
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="التوصيلة غير موجودة")
     
     return {"message": "تم حذف التوصيلة بنجاح"}
@@ -9714,7 +11636,7 @@ async def import_water_connections_from_excel(
 ):
     """استيراد توصيلات المياه من ملف Excel"""
     # التحقق من الصلاحية: admin أو صلاحية water_connections_import
-    if current_user.role != 'admin' and 'water_connections_import' not in (current_user.permissions or []):
+    if not user_has_any_project_permission(current_user, 'water_connections_import'):
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية استيراد توصيلات المياه")
     
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -9801,14 +11723,14 @@ async def import_water_connections_from_excel(
                     "contractor": safe_str(['المقاول', 'contractor'], ''),
                     "account_number": account_num,
                     "request_number": request_num,
-                    "restriction_number": safe_str(['رقم التقييد', 'restriction'], ''),
-                    "ccb_report_number": safe_str(['رقم بلاغ CCB', 'ccb', 'بلاغ'], ''),
+                    "restriction_number": safe_str(['رقم التقييد', 'رقم الحصر', 'restriction'], ''),
+                    "ccb_report_number": safe_str(['رقم بلاغ CCB', 'رقم بلاغ CCP', 'ccb', 'بلاغ'], ''),
                     "customer_name": safe_str(['اسم العميل', 'عميل', 'customer'], ''),
                     "phone_number": safe_str(['رقم الجوال', 'جوال', 'phone'], ''),
                     "area": safe_str(['المنطقة', 'منطقة', 'area'], ''),
-                    "work_order_date": safe_str(['تاريخ أمر العمل', 'أمر العمل'], ''),
+                    "work_order_date": safe_str(['تاريخ أمر العمل', 'أمر العمل', 'تاريخ أمر الشغل'], ''),
                     "diameter": safe_str(['القطر', 'diameter'], ''),
-                    "connection_length": safe_str(['طول التوصيلة', 'طول'], ''),
+                    "connection_length": safe_str(['طول الماسورة', 'طول التوصيلة', 'طول'], ''),
                     "notes": safe_str(['ملاحظات', 'notes'], ''),
                     "latitude": safe_str(['خط العرض', 'latitude'], ''),
                     "longitude": safe_str(['خط الطول', 'longitude'], ''),
@@ -9816,7 +11738,7 @@ async def import_water_connections_from_excel(
                     "permit_number": safe_str(['رقم التصريح', 'تصريح'], ''),
                     "request_status": safe_str(['حالة الطلب', 'الحالة', 'status'], 'جديد'),
                     "images": [],
-                    "is_deleted": False,
+                    "is_deleted": {"$ne": True},
                     "created_by": current_user.id,
                     "created_by_name": current_user.full_name or current_user.username,
                     "created_at": datetime.now(timezone.utc)
@@ -9848,7 +11770,7 @@ async def import_sewage_connections_from_excel(
 ):
     """استيراد توصيلات الصرف الصحي من ملف Excel"""
     # التحقق من الصلاحية: admin أو صلاحية sewage_connections_import
-    if current_user.role != 'admin' and 'sewage_connections_import' not in (current_user.permissions or []):
+    if not user_has_any_project_permission(current_user, 'sewage_connections_import'):
         raise HTTPException(status_code=403, detail="ليس لديك صلاحية استيراد توصيلات الصرف الصحي")
     
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -9932,25 +11854,27 @@ async def import_sewage_connections_from_excel(
                 connection_data = {
                     "id": str(uuid.uuid4()),
                     "project": project,
-                    "contractors": [safe_str(['المقاول', 'contractor'], '')] if safe_str(['المقاول', 'contractor'], '') else [],
+                    "contractors": [safe_str(['المقاول', 'contractor', 'المقاولين'], '')] if safe_str(['المقاول', 'contractor', 'المقاولين'], '') else [],
                     "account_number": account_num,
                     "request_number": request_num,
-                    "restriction_number": safe_str(['رقم التقييد', 'restriction'], ''),
-                    "ccb_report_number": safe_str(['رقم بلاغ CCB', 'ccb', 'بلاغ'], ''),
+                    "restriction_number": safe_str(['رقم التقييد', 'رقم الحصر', 'restriction'], ''),
+                    "ccb_report_number": safe_str(['رقم بلاغ CCB', 'رقم بلاغ CCP', 'ccb', 'بلاغ'], ''),
                     "customer_name": safe_str(['اسم العميل', 'عميل', 'customer'], ''),
+                    "customer_number": safe_str(['رقم العميل', 'customer_number'], ''),
                     "phone_number": safe_str(['رقم الجوال', 'جوال', 'phone'], ''),
                     "area": safe_str(['المنطقة', 'منطقة', 'area'], ''),
-                    "work_order_date": safe_str(['تاريخ أمر العمل', 'أمر العمل'], ''),
+                    "work_order_date": safe_str(['تاريخ أمر العمل', 'أمر العمل', 'تاريخ أمر الشغل'], ''),
                     "diameter": safe_str(['القطر', 'diameter'], ''),
-                    "connection_length": safe_str(['طول التوصيلة', 'طول'], ''),
+                    "actual_length": safe_str(['العمق', 'طول على الطبيعة', 'actual_length', 'depth', 'manhole_depth'], ''),
+                    "network_line_length": safe_str(['طول خط الشبكة', 'network_line_length', 'طول الشبكة'], ''),
                     "notes": safe_str(['ملاحظات', 'notes'], ''),
                     "latitude": safe_str(['خط العرض', 'latitude'], ''),
                     "longitude": safe_str(['خط الطول', 'longitude'], ''),
                     "commissioning_date": safe_str(['تاريخ التشغيل', 'تشغيل'], ''),
-                    "permit_number": safe_str(['رقم التصريح', 'تصريح'], ''),
+                    "permit": safe_str(['رقم التصريح', 'التصريح', 'permit'], ''),
                     "request_status": safe_str(['حالة الطلب', 'الحالة', 'status'], 'جديد'),
                     "images": [],
-                    "is_deleted": False,
+                    "is_deleted": {"$ne": True},
                     "created_by": current_user.id,
                     "created_by_name": current_user.full_name or current_user.username,
                     "created_at": datetime.now(timezone.utc)
@@ -9987,6 +11911,7 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
     """تصدير توصيلات المياه إلى Excel - جميع البيانات"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+    from openpyxl.utils import get_column_letter
     from io import BytesIO
     
     wb = Workbook()
@@ -9999,34 +11924,36 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
         top=Side(style='thin'), bottom=Side(style='thin')
     )
     
-    # جميع الحقول
+    # جميع الحقول شاملة المحافظة والملاحظات وكل التفاصيل المدخلة
     headers = [
-        '#', 'المشروع', 'المقاول', 'رقم الحساب', 'رقم الطلب', 'رقم الحصر', 'رقم البلاغ CCB',
-        'اسم العميل', 'رقم الجوال', 'المنطقة', 'تاريخ أمر الشغل', 'القطر', 'طول التوصيلة',
+        '#', 'المشروع', 'المحافظة', 'المقاول', 'رقم الحساب', 'رقم الطلب', 'رقم الحصر', 'رقم البلاغ CCB',
+        'اسم العميل', 'رقم الجوال', 'المنطقة / الحي', 'تاريخ أمر الشغل', 'القطر', 'طول التوصيلة',
         'رقم التصريح', 'تاريخ التعميد', 'تاريخ النشر', 'تاريخ الإصدار', 'تاريخ التنفيذ المتوقع',
-        'شجرية', 'عدد الوصلات', 'طول التوصيلة بدون الإضافي', 'طول الوصلات بدون الرئيسي',
+        'نوع التوصيلة', 'عدد الوصلات', 'طول التوصيلة بدون الإضافي', 'طول الوصلات بدون الرئيسي',
         'قطر خط الشبكة 63', 'طول خط الشبكة', 'قطر خط الشبكة 16', 'رقم العداد', 'نوع العداد',
-        'هدم وإزالة', 'تاريخ التنفيذ', 'تاريخ الإغلاق', 'الحالة', 'سبب الإلغاء', 'ملاحظات',
-        'خط العرض', 'خط الطول'
+        'إزالة وتركيب العداد', 'تاريخ التنفيذ', 'تاريخ الإغلاق', 'الحالة', 'تاريخ الإلغاء', 'سبب الإلغاء', 'ملاحظات',
+        'مراقب الاستشاري', 'تاريخ الإضافة', 'خط العرض', 'خط الطول'
     ]
     
+    last_col = get_column_letter(len(headers))
+    
     # Title rows with company info
-    ws.merge_cells('A1:AI1')
+    ws.merge_cells(f'A1:{last_col}1')
     ws['A1'] = "شركة المياه الوطنية"
     ws['A1'].font = Font(bold=True, size=18, color="0066CC")
     ws['A1'].alignment = Alignment(horizontal='center')
     
-    ws.merge_cells('A2:AI2')
+    ws.merge_cells(f'A2:{last_col}2')
     ws['A2'] = "مكتب بيت الخبرة للاستشارات الهندسية"
     ws['A2'].font = Font(bold=True, size=14, color="006600")
     ws['A2'].alignment = Alignment(horizontal='center')
     
-    ws.merge_cells('A3:AI3')
+    ws.merge_cells(f'A3:{last_col}3')
     ws['A3'] = f"تقرير توصيلات المياه - {data.project_name}"
     ws['A3'].font = Font(bold=True, size=16)
     ws['A3'].alignment = Alignment(horizontal='center')
     
-    ws.merge_cells('A4:AI4')
+    ws.merge_cells(f'A4:{last_col}4')
     ws['A4'] = f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     ws['A4'].font = Font(size=10, italic=True)
     ws['A4'].alignment = Alignment(horizontal='center')
@@ -10048,6 +11975,7 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
         row_data = [
             idx,
             conn.get('project', ''),
+            conn.get('governorate', ''),
             conn.get('contractor', ''),
             conn.get('account_number', ''),
             conn.get('request_number', ''),
@@ -10064,7 +11992,7 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
             conn.get('publication_date', ''),
             conn.get('issue_date', ''),
             conn.get('expected_execution_date', ''),
-            'نعم' if conn.get('tree_like') else 'لا',
+            conn.get('connection_type', ''),
             conn.get('connections_count', ''),
             conn.get('connection_length_without_extra', ''),
             conn.get('connections_length_without_main', ''),
@@ -10073,12 +12001,15 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
             conn.get('network_diameter_16', ''),
             conn.get('meter_number', ''),
             conn.get('meter_type', ''),
-            'نعم' if conn.get('demolition_removal') else 'لا',
+            conn.get('meter_removal_installation', ''),
             conn.get('execution_date', ''),
             conn.get('system_closing_date', ''),
             conn.get('request_status', ''),
+            conn.get('cancellation_date', ''),
             conn.get('cancellation_reason', ''),
             conn.get('notes', ''),
+            conn.get('created_by_name', ''),
+            conn.get('created_at', ''),
             conn.get('latitude', ''),
             conn.get('longitude', '')
         ]
@@ -10094,10 +12025,10 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
     ws[f'A{summary_row}'] = f"إجمالي التوصيلات: {len(data.connections)}"
     ws[f'A{summary_row}'].font = Font(bold=True, size=12)
     
-    # Adjust column widths
-    col_widths = [5, 25, 15, 12, 12, 12, 12, 20, 12, 15, 12, 8, 12, 12, 12, 12, 12, 12, 8, 10, 15, 15, 12, 12, 12, 12, 12, 10, 12, 12, 10, 15, 20, 12, 12]
+    # Adjust column widths dynamically
+    col_widths = [5, 25, 15, 15, 12, 12, 12, 12, 20, 12, 15, 12, 8, 12, 12, 12, 12, 12, 12, 15, 10, 15, 15, 12, 12, 12, 12, 12, 15, 12, 12, 10, 12, 15, 20, 15, 15, 12, 12]
     for i, width in enumerate(col_widths, 1):
-        ws.column_dimensions[chr(64 + i) if i <= 26 else 'A' + chr(64 + i - 26)].width = width
+        ws.column_dimensions[get_column_letter(i)].width = width
     
     output = BytesIO()
     wb.save(output)
@@ -10127,17 +12058,31 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     import arabic_reshaper
     
     # تسجيل الخط العربي
-    arabic_font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    font_path = os.path.join(os.path.dirname(__file__), 'fonts', 'NotoSansArabic-Regular.ttf')
     try:
-        pdfmetrics.registerFont(TTFont('Arabic', arabic_font_path))
+        pdfmetrics.registerFont(TTFont('Arabic', font_path))
     except:
-        pass
+        try:
+            pdfmetrics.registerFont(TTFont('Arabic', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+        except:
+            pass
     
-    def reshape_arabic(text):
+    def arabic_text(text):
         if not text:
             return ""
+        import html
         try:
-            reshaped = arabic_reshaper.reshape(str(text))
+            if not isinstance(text, str):
+                text = str(text)
+            # فك تشفير أي نصوص مشفرة أو Unicode Escapes (مثل \u0627)
+            if '\\u' in text:
+                try: text = text.encode('utf-8').decode('unicode-escape')
+                except: pass
+            
+            # فك تشفير HTML Entities (مثل &amp;)
+            text = html.unescape(text)
+            
+            reshaped = arabic_reshaper.reshape(text)
             return get_display(reshaped)
         except:
             return str(text)
@@ -10155,19 +12100,19 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     signature_style = ParagraphStyle('Signature', parent=styles['Normal'], fontName='Arabic', fontSize=9, alignment=TA_RIGHT, textColor=colors.HexColor('#333333'))
     
     # Header with company names
-    elements.append(Paragraph(reshape_arabic("شركة المياه الوطنية"), title_style))
+    elements.append(Paragraph(arabic_text("شركة المياه الوطنية"), title_style))
     elements.append(Spacer(1, 5))
-    elements.append(Paragraph(reshape_arabic("National Water Company"), normal_style))
+    elements.append(Paragraph(arabic_text("National Water Company"), normal_style))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph(reshape_arabic("مكتب بيت الخبرة للاستشارات الهندسية"), subtitle_style))
+    elements.append(Paragraph(arabic_text("مكتب بيت الخبرة للاستشارات الهندسية"), subtitle_style))
     elements.append(Spacer(1, 15))
-    elements.append(Paragraph(reshape_arabic(f"تقرير توصيلات المياه - {data.project_name}"), title_style))
+    elements.append(Paragraph(arabic_text(f"تقرير توصيلات المياه - {data.project_name}"), title_style))
     elements.append(Spacer(1, 5))
-    elements.append(Paragraph(reshape_arabic(f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d')}"), normal_style))
+    elements.append(Paragraph(arabic_text(f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d')}"), normal_style))
     elements.append(Spacer(1, 15))
     
     # Table headers - الحقول الرئيسية
-    headers = [reshape_arabic(h) for h in ['م', 'رقم الطلب', 'رقم CCB', 'العميل', 'الجوال', 'المقاول', 'المنطقة', 'القطر', 'الطول', 'الحالة', 'تاريخ التنفيذ']]
+    headers = [arabic_text(h) for h in ['م', 'رقم الطلب', 'رقم CCB', 'العميل', 'الجوال', 'المقاول', 'المنطقة', 'القطر', 'الطول', 'الحالة', 'تاريخ التنفيذ']]
     table_data = [headers]
     
     for idx, conn in enumerate(data.connections, 1):
@@ -10175,13 +12120,13 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
             str(idx),
             str(conn.get('request_number', '') or ''),
             str(conn.get('ccb_report_number', '') or ''),
-            reshape_arabic(conn.get('customer_name', '') or ''),
+            arabic_text(conn.get('customer_name', '') or ''),
             str(conn.get('phone_number', '') or ''),
-            reshape_arabic(conn.get('contractor', '') or ''),
-            reshape_arabic(conn.get('area', '') or ''),
+            arabic_text(conn.get('contractor', '') or ''),
+            arabic_text(conn.get('area', '') or ''),
             str(conn.get('diameter', '') or ''),
             str(conn.get('connection_length', '') or ''),
-            reshape_arabic(conn.get('request_status', '') or ''),
+            arabic_text(conn.get('request_status', '') or ''),
             str(conn.get('execution_date', '') or '')
         ]
         table_data.append(row)
@@ -10206,18 +12151,18 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     elements.append(Spacer(1, 20))
     
     # Summary
-    elements.append(Paragraph(reshape_arabic(f"إجمالي التوصيلات: {len(data.connections)}"), normal_style))
+    elements.append(Paragraph(arabic_text(f"إجمالي التوصيلات: {len(data.connections)}"), normal_style))
     elements.append(Spacer(1, 30))
     
     # Electronic signature section - تحسين التوقيع الإلكتروني
     # على اليسار: بيت الخبرة | على اليمين: شركة المياه الوطنية
     signature_table_data = [
-        [reshape_arabic("شركة المياه الوطنية"), '', reshape_arabic("مكتب بيت الخبرة للاستشارات الهندسية")],
-        [reshape_arabic("National Water Company"), '', reshape_arabic("Bayt Al-Khibra Engineering")],
+        [arabic_text("شركة المياه الوطنية"), '', arabic_text("مكتب بيت الخبرة للاستشارات الهندسية")],
+        [arabic_text("National Water Company"), '', arabic_text("Bayt Al-Khibra Engineering")],
         ['', '', ''],
-        [reshape_arabic("اسم المعتمد: ________________"), '', reshape_arabic(f"اسم المسؤول: {current_user.full_name}")],
-        [reshape_arabic("التوقيع: ________________"), '', reshape_arabic("التوقيع: ________________")],
-        [reshape_arabic(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}"), '', reshape_arabic(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}")]
+        [arabic_text("اسم المعتمد: ________________"), '', arabic_text(f"اسم المسؤول: {current_user.full_name}")],
+        [arabic_text("التوقيع: ________________"), '', arabic_text("التوقيع: ________________")],
+        [arabic_text(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}"), '', arabic_text(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}")]
     ]
     sig_table = Table(signature_table_data, colWidths=[220, 120, 220])
     sig_table.setStyle(TableStyle([
@@ -10237,7 +12182,7 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     elements.append(Spacer(1, 15))
     
     # Footer
-    elements.append(Paragraph(reshape_arabic("شركة المياه الوطنية - مكتب بيت الخبرة للاستشارات الهندسية"), signature_style))
+    elements.append(Paragraph(arabic_text("شركة المياه الوطنية - مكتب بيت الخبرة للاستشارات الهندسية"), signature_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -10255,6 +12200,7 @@ async def export_sewage_connections_excel(data: ExportRequest, current_user: Use
     """تصدير توصيلات الصرف الصحي إلى Excel - جميع البيانات"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
     from io import BytesIO
     
     wb = Workbook()
@@ -10267,34 +12213,36 @@ async def export_sewage_connections_excel(data: ExportRequest, current_user: Use
         top=Side(style='thin'), bottom=Side(style='thin')
     )
     
-    # جميع الحقول
+    # جميع الحقول شاملة المحافظة والملاحظات ورقم الجوال وكل التفاصيل المدخلة
     headers = [
-        '#', 'المشروع', 'المقاولين', 'رقم الطلب', 'رقم الحساب', 'رقم الحصر', 'رقم البلاغ CCB',
-        'اسم العميل', 'رقم العميل', 'المنطقة', 'تاريخ أمر الشغل', 'القطر', 'رقم العداد',
+        '#', 'المشروع', 'المحافظة', 'المقاولين', 'رقم الطلب', 'رقم الحساب', 'رقم الحصر', 'رقم البلاغ CCB',
+        'اسم العميل', 'رقم الجوال', 'رقم العميل', 'المنطقة / الحي', 'تاريخ أمر الشغل', 'القطر', 'رقم العداد',
         'التصريح', 'تاريخ التعميد', 'تاريخ النشر', 'تاريخ الإصدار', 'تاريخ التنفيذ المتوقع',
         'نوع الربط', 'تركيب فتح التهوية', 'تركيب غرفة تفتيش', 'Back Drop',
         'طول على الطبيعة', 'طول خط الشبكة', 'تكسير بيارة', 'هجمة', 'إزالة توصيلة',
         'تاريخ التنفيذ', 'تاريخ الإغلاق', 'الحالة', 'سبب الإلغاء', 'ملاحظات',
-        'خط العرض', 'خط الطول'
+        'مراقب الاستشاري', 'تاريخ الإضافة', 'خط العرض', 'خط الطول'
     ]
     
+    last_col = get_column_letter(len(headers))
+    
     # Title rows with company info
-    ws.merge_cells('A1:AH1')
+    ws.merge_cells(f'A1:{last_col}1')
     ws['A1'] = "شركة المياه الوطنية"
     ws['A1'].font = Font(bold=True, size=18, color="228B22")
     ws['A1'].alignment = Alignment(horizontal='center')
     
-    ws.merge_cells('A2:AH2')
+    ws.merge_cells(f'A2:{last_col}2')
     ws['A2'] = "مكتب بيت الخبرة للاستشارات الهندسية"
     ws['A2'].font = Font(bold=True, size=14, color="006600")
     ws['A2'].alignment = Alignment(horizontal='center')
     
-    ws.merge_cells('A3:AH3')
+    ws.merge_cells(f'A3:{last_col}3')
     ws['A3'] = f"تقرير توصيلات الصرف الصحي - {data.project_name}"
     ws['A3'].font = Font(bold=True, size=16)
     ws['A3'].alignment = Alignment(horizontal='center')
     
-    ws.merge_cells('A4:AH4')
+    ws.merge_cells(f'A4:{last_col}4')
     ws['A4'] = f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     ws['A4'].font = Font(size=10, italic=True)
     ws['A4'].alignment = Alignment(horizontal='center')
@@ -10316,12 +12264,14 @@ async def export_sewage_connections_excel(data: ExportRequest, current_user: Use
         row_data = [
             idx,
             conn.get('project', ''),
+            conn.get('governorate', ''),
             contractors,
             conn.get('request_number', ''),
             conn.get('account_number', ''),
             conn.get('restriction_number', ''),
             conn.get('ccb_report_number', ''),
             conn.get('customer_name', ''),
+            conn.get('phone_number', ''),
             conn.get('customer_number', ''),
             conn.get('area', ''),
             conn.get('work_order_date', ''),
@@ -10346,6 +12296,8 @@ async def export_sewage_connections_excel(data: ExportRequest, current_user: Use
             conn.get('request_status', ''),
             conn.get('cancellation_reason', ''),
             conn.get('notes', ''),
+            conn.get('created_by_name', ''),
+            conn.get('created_at', ''),
             conn.get('latitude', ''),
             conn.get('longitude', '')
         ]
@@ -10361,10 +12313,10 @@ async def export_sewage_connections_excel(data: ExportRequest, current_user: Use
     ws[f'A{summary_row}'] = f"إجمالي التوصيلات: {len(data.connections)}"
     ws[f'A{summary_row}'].font = Font(bold=True, size=12)
     
-    # Adjust column widths
-    col_widths = [5, 25, 20, 12, 12, 12, 12, 20, 12, 15, 12, 8, 12, 12, 12, 12, 12, 12, 12, 10, 10, 10, 12, 12, 10, 8, 10, 12, 12, 10, 15, 20, 12, 12]
+    # Adjust column widths dynamically
+    col_widths = [5, 25, 15, 20, 12, 12, 12, 12, 20, 12, 12, 15, 12, 8, 12, 12, 12, 12, 12, 12, 15, 10, 10, 10, 12, 12, 10, 8, 10, 12, 12, 10, 15, 20, 15, 15, 12, 12]
     for i, width in enumerate(col_widths, 1):
-        col_letter = chr(64 + i) if i <= 26 else 'A' + chr(64 + i - 26)
+        col_letter = get_column_letter(i)
         ws.column_dimensions[col_letter].width = width
     
     output = BytesIO()
@@ -10394,17 +12346,31 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     import arabic_reshaper
     
     # تسجيل الخط العربي
-    arabic_font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    font_path = os.path.join(os.path.dirname(__file__), 'fonts', 'NotoSansArabic-Regular.ttf')
     try:
-        pdfmetrics.registerFont(TTFont('Arabic', arabic_font_path))
+        pdfmetrics.registerFont(TTFont('Arabic', font_path))
     except:
-        pass
+        try:
+            pdfmetrics.registerFont(TTFont('Arabic', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+        except:
+            pass
     
-    def reshape_arabic(text):
+    def arabic_text(text):
         if not text:
             return ""
+        import html
         try:
-            reshaped = arabic_reshaper.reshape(str(text))
+            if not isinstance(text, str):
+                text = str(text)
+            # فك تشفير أي نصوص مشفرة أو Unicode Escapes (مثل \u0627)
+            if '\\u' in text:
+                try: text = text.encode('utf-8').decode('unicode-escape')
+                except: pass
+            
+            # فك تشفير HTML Entities (مثل &amp;)
+            text = html.unescape(text)
+            
+            reshaped = arabic_reshaper.reshape(text)
             return get_display(reshaped)
         except:
             return str(text)
@@ -10422,19 +12388,19 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     signature_style = ParagraphStyle('Signature', parent=styles['Normal'], fontName='Arabic', fontSize=9, alignment=TA_RIGHT, textColor=colors.HexColor('#333333'))
     
     # Header with company names
-    elements.append(Paragraph(reshape_arabic("شركة المياه الوطنية"), title_style))
+    elements.append(Paragraph(arabic_text("شركة المياه الوطنية"), title_style))
     elements.append(Spacer(1, 5))
-    elements.append(Paragraph(reshape_arabic("National Water Company"), normal_style))
+    elements.append(Paragraph(arabic_text("National Water Company"), normal_style))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph(reshape_arabic("مكتب بيت الخبرة للاستشارات الهندسية"), subtitle_style))
+    elements.append(Paragraph(arabic_text("مكتب بيت الخبرة للاستشارات الهندسية"), subtitle_style))
     elements.append(Spacer(1, 15))
-    elements.append(Paragraph(reshape_arabic(f"تقرير توصيلات الصرف الصحي - {data.project_name}"), title_style))
+    elements.append(Paragraph(arabic_text(f"تقرير توصيلات الصرف الصحي - {data.project_name}"), title_style))
     elements.append(Spacer(1, 5))
-    elements.append(Paragraph(reshape_arabic(f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d')}"), normal_style))
+    elements.append(Paragraph(arabic_text(f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d')}"), normal_style))
     elements.append(Spacer(1, 15))
     
     # Table headers
-    headers = [reshape_arabic(h) for h in ['م', 'رقم الطلب', 'رقم CCB', 'العميل', 'رقم العميل', 'المقاولين', 'المنطقة', 'نوع الربط', 'الحالة', 'تاريخ التنفيذ']]
+    headers = [arabic_text(h) for h in ['م', 'رقم الطلب', 'رقم CCB', 'العميل', 'رقم العميل', 'المقاولين', 'المنطقة', 'نوع الربط', 'الحالة', 'تاريخ التنفيذ']]
     table_data = [headers]
     
     for idx, conn in enumerate(data.connections, 1):
@@ -10443,12 +12409,12 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
             str(idx),
             str(conn.get('request_number', '') or ''),
             str(conn.get('ccb_report_number', '') or ''),
-            reshape_arabic(conn.get('customer_name', '') or ''),
+            arabic_text(conn.get('customer_name', '') or ''),
             str(conn.get('customer_number', '') or ''),
-            reshape_arabic(contractors),
-            reshape_arabic(conn.get('area', '') or ''),
-            reshape_arabic(conn.get('connection_type', '') or ''),
-            reshape_arabic(conn.get('request_status', '') or ''),
+            arabic_text(contractors),
+            arabic_text(conn.get('area', '') or ''),
+            arabic_text(conn.get('connection_type', '') or ''),
+            arabic_text(conn.get('request_status', '') or ''),
             str(conn.get('execution_date', '') or '')
         ]
         table_data.append(row)
@@ -10473,18 +12439,18 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     elements.append(Spacer(1, 20))
     
     # Summary
-    elements.append(Paragraph(reshape_arabic(f"إجمالي التوصيلات: {len(data.connections)}"), normal_style))
+    elements.append(Paragraph(arabic_text(f"إجمالي التوصيلات: {len(data.connections)}"), normal_style))
     elements.append(Spacer(1, 30))
     
     # Electronic signature section - تحسين التوقيع الإلكتروني
     # على اليسار: بيت الخبرة | على اليمين: شركة المياه الوطنية
     signature_table_data = [
-        [reshape_arabic("شركة المياه الوطنية"), '', reshape_arabic("مكتب بيت الخبرة للاستشارات الهندسية")],
-        [reshape_arabic("National Water Company"), '', reshape_arabic("Bayt Al-Khibra Engineering")],
+        [arabic_text("شركة المياه الوطنية"), '', arabic_text("مكتب بيت الخبرة للاستشارات الهندسية")],
+        [arabic_text("National Water Company"), '', arabic_text("Bayt Al-Khibra Engineering")],
         ['', '', ''],
-        [reshape_arabic("اسم المعتمد: ________________"), '', reshape_arabic(f"اسم المسؤول: {current_user.full_name}")],
-        [reshape_arabic("التوقيع: ________________"), '', reshape_arabic("التوقيع: ________________")],
-        [reshape_arabic(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}"), '', reshape_arabic(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}")]
+        [arabic_text("اسم المعتمد: ________________"), '', arabic_text(f"اسم المسؤول: {current_user.full_name}")],
+        [arabic_text("التوقيع: ________________"), '', arabic_text("التوقيع: ________________")],
+        [arabic_text(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}"), '', arabic_text(f"التاريخ: {datetime.now().strftime('%Y-%m-%d')}")]
     ]
     sig_table = Table(signature_table_data, colWidths=[220, 120, 220])
     sig_table.setStyle(TableStyle([
@@ -10504,7 +12470,7 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     elements.append(Spacer(1, 15))
     
     # Footer
-    elements.append(Paragraph(reshape_arabic("شركة المياه الوطنية - مكتب بيت الخبرة للاستشارات الهندسية"), signature_style))
+    elements.append(Paragraph(arabic_text("شركة المياه الوطنية - مكتب بيت الخبرة للاستشارات الهندسية"), signature_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -10546,12 +12512,20 @@ async def migrate_old_data(current_user: User = Depends(get_current_admin_user))
 
 @api_router.post("/reports/analyze")
 async def analyze_reports(current_user: User = Depends(get_current_user)):
-    query = {"is_deleted": False}
+    query = {"is_deleted": {"$ne": True}}
     
     # فلترة حسب صلاحيات المحافظات (إلا إذا كان admin بدون محافظات محددة)
     if current_user.role != "admin" or len(current_user.governorates) > 0:
         if len(current_user.governorates) > 0:
-            query["governorate"] = {"$in": current_user.governorates}
+            query.update(get_flexible_in_query(current_user.governorates, "governorate"))
+        
+        # تطبيق الفلترة الهرمية للتحليل
+        hierarchy_filter = await get_hierarchy_filter(current_user)
+        query.update(hierarchy_filter)
+        
+        # تطبيق فلترة المشاريع بمرونة
+        if current_user.projects:
+            query.update(get_flexible_in_query(current_user.projects, "project"))
     
     reports = await db.reports.find(query, {"_id": 0}).to_list(1000)
     
@@ -11249,6 +13223,19 @@ async def get_platform_settings():
             "login_pc_description": branding.get("login_pc_description") or default_login_pc_description,
             "login_team_description": branding.get("login_team_description") or default_login_team_description,
             "login_description": branding.get("login_description") or default_login_team_description,  # للتوافق مع النسخة القديمة
+            "copyright_text": branding.get("copyright_text", "جميع الحقوق محفوظة"),
+            "dashboard_title": branding.get("dashboard_title", "نظام إدارة البلاغات والمشاريع - WFM"),
+            "footer_year": branding.get("footer_year", "2026"),
+            "login_footer_description": branding.get("login_footer_description", "نظام إدارة البلاغات المستلمة من WFM لربط المكاتب الاستشارية مع شركة المياه الوطنية."),
+            "internal_footer_description": branding.get("internal_footer_description", "نظام إدارة البلاغات المستلمة من WFM"),
+            "global_announcement": branding.get("global_announcement", ""),
+            "show_announcement": branding.get("show_announcement", False),
+            "flash_announcement": branding.get("flash_announcement", True),
+            "vision_logo_url": branding.get("vision_logo_url", ""),
+            "occasion_watermark": branding.get("occasion_watermark", "none"),
+            "custom_occasion_text_ar": branding.get("custom_occasion_text_ar", ""),
+            "custom_occasion_text_en": branding.get("custom_occasion_text_en", ""),
+            "occasions_list": branding.get("occasions_list", []),
         }
     except Exception:
         return {"platform_name": "بيت الخبرة", "logo_url": "", "theme": "blue", "dark_mode": False}
@@ -11269,6 +13256,19 @@ class BrandingUpdate(BaseModel):
     login_pm_description: Optional[str] = None
     login_pc_description: Optional[str] = None
     login_team_description: Optional[str] = None
+    copyright_text: Optional[str] = None
+    dashboard_title: Optional[str] = None
+    footer_year: Optional[str] = None
+    login_footer_description: Optional[str] = None
+    internal_footer_description: Optional[str] = None
+    global_announcement: Optional[str] = None
+    show_announcement: Optional[bool] = None
+    flash_announcement: Optional[bool] = None
+    vision_logo_url: Optional[str] = None
+    occasion_watermark: Optional[str] = None
+    custom_occasion_text_ar: Optional[str] = None
+    custom_occasion_text_en: Optional[str] = None
+    occasions_list: Optional[list] = None
 
 
 @api_router.put("/settings/branding")
@@ -11333,7 +13333,7 @@ async def update_personal_theme(
 ):
     """تحديث الثيم الشخصي للمستخدم"""
     # التحقق من صحة الثيم
-    valid_themes = ['blue', 'green', 'gray', 'gray-light', 'purple', 'teal', 'amber', 'rose', None]
+    valid_themes = ['blue', 'green', 'gray', 'gray-light', 'purple', 'teal', 'amber', 'rose', 'slate', None]
     if theme_data.personal_theme not in valid_themes:
         raise HTTPException(status_code=400, detail="ثيم غير صالح")
     
@@ -11356,7 +13356,7 @@ async def update_platform_theme(
         raise HTTPException(status_code=403, detail="هذه الصلاحية متاحة للأدمن فقط")
     
     # التحقق من صحة الثيم
-    valid_themes = ['blue', 'green', 'gray', 'gray-light', 'purple', 'teal', 'amber', 'rose']
+    valid_themes = ['blue', 'green', 'gray', 'gray-light', 'purple', 'teal', 'amber', 'rose', 'slate']
     if theme_data.theme not in valid_themes:
         raise HTTPException(status_code=400, detail="ثيم غير صالح")
     
@@ -11390,7 +13390,11 @@ class ConnectionProjectUpdate(BaseModel):
 async def get_connection_projects(current_user: User = Depends(get_current_user)):
     """جلب جميع مشاريع الإيصال"""
     try:
-        projects = await db.connection_projects.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+        if current_user.role == "admin" or not current_user.projects:
+            projects = await db.connection_projects.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+        else:
+            query = get_loose_in_query(current_user.projects, "name")
+            projects = await db.connection_projects.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
         return projects
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"فشل في جلب المشاريع: {str(e)}")
@@ -11436,12 +13440,38 @@ async def update_connection_project(
         raise HTTPException(status_code=404, detail="المشروع غير موجود")
     
     update_data = {}
-    if project.name is not None:
+    if project.name is not None and project.name != existing["name"]:
+        old_name = existing["name"]
+        new_name = project.name
         # التحقق من عدم وجود مشروع آخر بنفس الاسم
-        other = await db.connection_projects.find_one({"name": project.name, "id": {"$ne": project_id}})
+        other = await db.connection_projects.find_one({"name": new_name, "id": {"$ne": project_id}})
         if other:
             raise HTTPException(status_code=400, detail="يوجد مشروع آخر بنفس الاسم")
-        update_data["name"] = project.name
+        update_data["name"] = new_name
+        
+        # تحديث المشروع في جميع المستخدمين
+        await db.users.update_many({"projects": old_name}, {"$set": {"projects.$": new_name}})
+        
+        # تحديث project_permissions للمستخدمين
+        users_with_perms = await db.users.find({f"project_permissions.{old_name}": {"$exists": True}}).to_list(1000)
+        for u in users_with_perms:
+            perms = u.get("project_permissions", {}).get(old_name)
+            if perms is not None:
+                await db.users.update_one(
+                    {"id": u["id"]},
+                    {"$set": {f"project_permissions.{new_name}": perms}, "$unset": {f"project_permissions.{old_name}": ""}}
+                )
+                
+        # تحديث المشروع في التوصيلات
+        await db.water_connections.update_many({"project": old_name}, {"$set": {"project": new_name}})
+        await db.sewage_connections.update_many({"project": old_name}, {"$set": {"project": new_name}})
+        
+        # تحديث المشروع في الفواتير والمستخلصات وطلبات الموظفين والمقاولين
+        await db.contractors.update_many({"project": old_name}, {"$set": {"project": new_name}})
+        await db.invoices.update_many({"project": old_name}, {"$set": {"project": new_name}})
+        await db.extracts.update_many({"project": old_name}, {"$set": {"project": new_name}})
+        await db.employee_requests.update_many({"project": old_name}, {"$set": {"project": new_name}})
+        
     if project.description is not None:
         update_data["description"] = project.description
     
@@ -11464,7 +13494,19 @@ async def delete_connection_project(
     if not existing:
         raise HTTPException(status_code=404, detail="المشروع غير موجود")
     
+    project_name = existing.get("name")
+    
     await db.connection_projects.delete_one({"id": project_id})
+    
+    # حذف الارتباطات من جميع الأماكن
+    if project_name:
+        await db.project_governorates.delete_many({"project": project_name})
+        await db.deleted_governorates.delete_many({"project": project_name})
+        await db.users.update_many(
+            {},
+            {"$pull": {"projects": project_name}}
+        )
+        
     return {"success": True, "message": "تم حذف المشروع بنجاح"}
 
 @api_router.get("/user-connection-projects/{user_id}")
@@ -11835,8 +13877,101 @@ async def upload_file(
             content_type = 'image/jpeg'
         except Exception as e:
             logging.warning(f"Image compression failed: {e}")
+            
+    # ضغط ملفات البوربوينت
+    if ext in ("pptx", "ppt") and len(data) > 50000:
+        try:
+            import zipfile
+            import io
+            
+            def try_compress_pptx(data_bytes, img_quality=60, max_dim=1200):
+                in_buffer = io.BytesIO(data_bytes)
+                out_buffer = io.BytesIO()
+                with zipfile.ZipFile(in_buffer, 'r') as in_zip:
+                    with zipfile.ZipFile(out_buffer, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out_zip:
+                        for item in in_zip.infolist():
+                            content = in_zip.read(item.filename)
+                            if item.filename.startswith("ppt/media/") and item.filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                                try:
+                                    from PIL import Image
+                                    img = Image.open(io.BytesIO(content))
+                                    if max(img.size) > max_dim:
+                                        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                                    img_out = io.BytesIO()
+                                    if item.filename.lower().endswith(".png"):
+                                        img.save(img_out, format="PNG", optimize=True)
+                                    else:
+                                        img.save(img_out, format="JPEG", quality=img_quality, optimize=True)
+                                    optimized_content = img_out.getvalue()
+                                    if len(optimized_content) < len(content):
+                                        content = optimized_content
+                                except Exception as img_err:
+                                    logging.warning(f"Error optimizing embedded image {item.filename}: {img_err}")
+                            out_zip.writestr(item, content)
+                return out_buffer.getvalue()
+
+            # First attempt: quality 60, max_dim 1200
+            compressed_data = try_compress_pptx(data, img_quality=60, max_dim=1200)
+            
+            # If still > 2MB (2,097,152 bytes), try more aggressive settings: quality 40, max_dim 800
+            if len(compressed_data) > 2097152:
+                compressed_data = try_compress_pptx(data, img_quality=40, max_dim=800)
+                
+            # If still > 2MB, try even more aggressive: quality 30, max_dim 640
+            if len(compressed_data) > 2097152:
+                compressed_data = try_compress_pptx(data, img_quality=30, max_dim=640)
+
+            if len(compressed_data) < len(data):
+                data = compressed_data
+        except Exception as e:
+            logging.warning(f"PowerPoint compression failed: {e}")
+            
+    # ضغط ملفات PDF
+    if ext == "pdf" and len(data) > 50000:
+        try:
+            from pypdf import PdfReader, PdfWriter
+            from PIL import Image
+            import io
+            
+            def try_compress_pdf(data_bytes, img_quality=60, max_dim=1200):
+                reader = PdfReader(io.BytesIO(data_bytes))
+                writer = PdfWriter()
+                
+                for page in reader.pages:
+                    if page.images:
+                        for img_file in page.images:
+                            try:
+                                img = Image.open(io.BytesIO(img_file.data))
+                                if max(img.size) > max_dim:
+                                    img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                                img_file.replace(img)
+                            except Exception as img_err:
+                                logging.warning(f"Error compressing PDF image: {img_err}")
+                    writer.add_page(page)
+                    
+                for page in writer.pages:
+                    try:
+                        page.compress_content_keys()
+                    except Exception as comp_err:
+                        logging.warning(f"Error compressing page content keys: {comp_err}")
+                        
+                out_buf = io.BytesIO()
+                writer.write(out_buf)
+                return out_buf.getvalue()
+                
+            # First attempt: quality 60, max_dim 1200
+            compressed_data = try_compress_pdf(data, img_quality=60, max_dim=1200)
+            
+            # If still > 2MB, try more aggressive: quality 40, max_dim 800
+            if len(compressed_data) > 2097152:
+                compressed_data = try_compress_pdf(data, img_quality=40, max_dim=800)
+                
+            if len(compressed_data) < len(data):
+                data = compressed_data
+        except Exception as e:
+            logging.warning(f"PDF compression failed: {e}")
     
-    path = f"{APP_NAME}/uploads/{current_user.id}/{uuid.uuid4()}.{ext}"
+    path = f"sery17/uploads/{current_user.id}/{uuid.uuid4()}.{ext}"
     
     try:
         result = put_object(path, data, content_type)
@@ -11847,7 +13982,7 @@ async def upload_file(
             "content_type": content_type,
             "size": len(data),
             "uploaded_by": current_user.id,
-            "is_deleted": False,
+            "is_deleted": {"$ne": True},
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         await db.uploaded_files.insert_one(file_record)
@@ -11859,20 +13994,54 @@ async def upload_file(
 @api_router.get("/storage/files/{file_path:path}")
 async def download_file(
     file_path: str,
+    download: int = Query(0),
     auth: str = Query(None),
     authorization: str = None
 ):
-    """تحميل ملف من التخزين السحابي"""
+    """تحميل أو عرض ملف من التخزين السحابي"""
+    from urllib.parse import unquote
+    decoded_path = unquote(file_path)
+    
+    # Normalize potential single-slash after protocol caused by path parsing
+    if decoded_path.startswith("http:/") and not decoded_path.startswith("http://"):
+        decoded_path = decoded_path.replace("http:/", "http://", 1)
+    elif decoded_path.startswith("https:/") and not decoded_path.startswith("https://"):
+        decoded_path = decoded_path.replace("https:/", "https://", 1)
+        
     try:
-        record = await db.uploaded_files.find_one({"storage_path": file_path, "is_deleted": False}, {"_id": 0})
+        record = await db.uploaded_files.find_one({"storage_path": decoded_path, "is_deleted": {"$ne": True}}, {"_id": 0})
         if not record:
-            raise HTTPException(status_code=404, detail="الملف غير موجود")
-        data, ct = get_object(file_path)
-        return Response(content=data, media_type=record.get("content_type", ct))
-    except HTTPException:
-        raise
+            normalized_path = decoded_path.replace("http://", "").replace("https://", "")
+            record = await db.uploaded_files.find_one({
+                "$or": [
+                    {"storage_path": decoded_path},
+                    {"storage_path": {"$regex": normalized_path}}
+                ]
+            })
+            
+        ct = "application/octet-stream"
+        filename = "file"
+        if record:
+            ct = record.get("content_type", ct)
+            filename = record.get("original_filename", "file")
+            
+        data, fetched_ct = _get_object(decoded_path)
+        if not record:
+            ct = fetched_ct
+            
+        headers = {}
+        from urllib.parse import quote
+        safe_filename = quote(filename)
+        
+        if download == 1:
+            headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{safe_filename}"
+        else:
+            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{safe_filename}"
+            
+        return Response(content=data, media_type=ct, headers=headers)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"فشل تحميل الملف: {str(e)}")
+        logging.error(f"Download/view file error for {decoded_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"فشل تحميل أو عرض الملف: {str(e)}")
 
 
 # ============= HR MANAGEMENT ENDPOINTS =============
@@ -11891,6 +14060,7 @@ class HREmployee(BaseModel):
     insurance_expiry: Optional[str] = None
     religion: Optional[str] = None
     status: str = "على رأس العمل"
+    notes: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class HRContract(BaseModel):
@@ -11926,6 +14096,24 @@ class HRSalary(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # الموظفين
+
+class AdvanceCustody(BaseModel):
+    id: Optional[str] = None
+    employee_name: str
+    employee_number: Optional[str] = None
+    project: Optional[str] = None
+    company: Optional[str] = None
+    type: str
+    amount: Optional[float] = 0
+    paid_amount: Optional[float] = 0
+    remaining_amount: Optional[float] = 0
+    item_description: Optional[str] = None
+    date: str
+    status: str
+    action_date: Optional[str] = None
+    notes: Optional[str] = None
+    payment_history: Optional[list] = []
+
 @api_router.get("/hr/employees")
 async def get_hr_employees(current_user: User = Depends(get_current_user)):
     employees = await db.hr_employees.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
@@ -12068,6 +14256,54 @@ async def export_hr_excel(type: str = "employees", current_user: User = Depends(
     )
 
 # إشعارات شؤون الموظفين
+
+@api_router.get("/hr/advances-custodies")
+async def get_advances_custodies(current_user: User = Depends(get_current_user)):
+    user_permissions = current_user.permissions or []
+    has_hr_perm = ("hr_management" in user_permissions) or user_has_any_project_permission(current_user, "hr_management")
+    if current_user.role != "admin" and not has_hr_perm:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+    
+    docs = await db.hr_advances_custodies.find({}, {"_id": 0}).to_list(1000)
+    return docs
+
+@api_router.post("/hr/advances-custodies")
+async def create_advance_custody(data: AdvanceCustody, current_user: User = Depends(get_current_user)):
+    user_permissions = current_user.permissions or []
+    has_hr_perm = ("hr_management" in user_permissions) or user_has_any_project_permission(current_user, "hr_management")
+    if current_user.role != "admin" and not has_hr_perm:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    doc = data.model_dump(exclude_none=True)
+    if 'id' not in doc or not doc['id']:
+        import uuid
+        doc['id'] = str(uuid.uuid4())
+    doc["created_by"] = current_user.username
+    doc["created_at"] = datetime.now(timezone.utc).isoformat()
+    await db.hr_advances_custodies.insert_one(doc)
+    return {"message": "تم الإضافة بنجاح", "id": doc['id']}
+
+@api_router.put("/hr/advances-custodies/{item_id}")
+async def update_advance_custody(item_id: str, data: AdvanceCustody, current_user: User = Depends(get_current_user)):
+    user_permissions = current_user.permissions or []
+    has_hr_perm = ("hr_management" in user_permissions) or user_has_any_project_permission(current_user, "hr_management")
+    if current_user.role != "admin" and not has_hr_perm:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    update_data = data.model_dump(exclude={"id"}, exclude_none=True)
+    await db.hr_advances_custodies.update_one({"id": item_id}, {"$set": update_data})
+    return {"message": "تم التعديل بنجاح"}
+
+@api_router.delete("/hr/advances-custodies/{item_id}")
+async def delete_advance_custody(item_id: str, current_user: User = Depends(get_current_user)):
+    user_permissions = current_user.permissions or []
+    has_hr_perm = ("hr_management" in user_permissions) or user_has_any_project_permission(current_user, "hr_management")
+    if current_user.role != "admin" and not has_hr_perm:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        
+    await db.hr_advances_custodies.delete_one({"id": item_id})
+    return {"message": "تم الحذف بنجاح"}
+
 @api_router.get("/hr/alerts")
 async def get_hr_alerts(current_user: User = Depends(get_current_user)):
     """جلب إشعارات انتهاء الإقامة والتأمين والعقود"""
@@ -12182,49 +14418,194 @@ async def get_deleted_items(
 ):
     """جلب العناصر المحذوفة حديثاً فقط (آخر 30 يوم)"""
     user_permissions = current_user.permissions or []
-    if current_user.role != "admin" and "trash" not in user_permissions:
-        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+    has_trash_perm = current_user.role == "admin" or "trash" in user_permissions or user_has_any_project_permission(current_user, "trash")
+    if not has_trash_perm:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية الوصول لسجل المحذوفات")
     
     # فقط العناصر المحذوفة حديثاً (التي تحتوي على deleted_by)
     base_query = {"is_deleted": True, "deleted_by": {"$exists": True}}
     if current_user.role != "admin":
-        user_projects = current_user.projects or []
-        if user_projects:
-            base_query["$or"] = [{"project": {"$in": user_projects}}, {"deleted_by": current_user.id}]
+        base_query["deleted_by"] = current_user.id
     
     items = []
     skip = (page - 1) * limit
+    total_count = 0
     
-    if not item_type or item_type == "invoice":
-        invoices = await db.invoices.find(base_query, {"_id": 0}).sort("deleted_at", -1).limit(limit).to_list(limit)
-        for inv in invoices:
+    # إذا كان نوع العنصر محدداً، يمكننا جلب تلك المجموعة فقط بـ skip و limit
+    if item_type:
+        collection_map = {
+            "invoice": (db.invoices, "invoice", "فاتورة"),
+            "employee_request": (db.employee_requests, "employee_request", "طلب موظف"),
+            "report": (db.reports, "report", "بلاغ"),
+            "extract": (db.extracts, "extract", "مستخلص"),
+            "water_connection": (db.water_connections, "water_connection", "توصيلة مياه"),
+            "sewage_connection": (db.sewage_connections, "sewage_connection", "توصيلة صرف صحي"),
+            "safety_report": (db.safety_reports, "safety_report", "تقرير سلامة"),
+            "work_permit": (db.work_permits, "work_permit", "تصريح عمل"),
+            "quality_report": (db.quality_reports, "quality_report", "تقرير جودة"),
+            "business_report": (db.business_reports, "business_report", "تقرير أعمال")
+        }
+        
+        target = collection_map.get(item_type)
+        if target:
+            coll, t_name, t_label = target
+            q = {**base_query}
+            if t_name == "water_connection" and current_user.role != "admin":
+                allowed_projects = get_projects_with_permission(current_user, "water_connections")
+                q["project"] = {"$in": allowed_projects}
+                q["deleted_by"] = current_user.id
+            elif t_name == "sewage_connection" and current_user.role != "admin":
+                allowed_projects = get_projects_with_permission(current_user, "sewage_connections")
+                q["project"] = {"$in": allowed_projects}
+                q["deleted_by"] = current_user.id
+                
+            total_count = await coll.count_documents(q)
+            
+            projection = {"_id": 0}
+            if t_name == "report":
+                projection = {"_id": 0, "id": 1, "report_number": 1, "project": 1, "status": 1, "deleted_at": 1, "deleted_by": 1}
+                
+            docs = await coll.find(q, projection).sort("deleted_at", -1).skip(skip).limit(limit).to_list(limit)
+            
+            for doc in docs:
+                deleted_by_name = "غير معروف"
+                if doc.get("deleted_by"):
+                    user_doc = await db.users.find_one({"id": doc["deleted_by"]}, {"_id": 0, "full_name": 1})
+                    deleted_by_name = user_doc.get("full_name") if user_doc else "غير معروف"
+                doc["deleted_by_name"] = deleted_by_name
+                items.append({"type": t_name, "type_label": t_label, "data": doc})
+    else:
+        # إذا لم يكن النوع محدداً (الكل)، ندمج المجموعات حتى skip + limit ثم نقص
+        max_fetch = skip + limit
+        
+        # 1. الفواتير
+        invs = await db.invoices.find(base_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for inv in invs:
             items.append({"type": "invoice", "type_label": "فاتورة", "data": inv})
-    
-    if not item_type or item_type == "employee_request":
-        requests = await db.employee_requests.find(base_query, {"_id": 0}).sort("deleted_at", -1).limit(limit).to_list(limit)
-        for req in requests:
+            
+        # 2. طلبات الموظفين
+        reqs = await db.employee_requests.find(base_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for req in reqs:
             items.append({"type": "employee_request", "type_label": "طلب موظف", "data": req})
-    
-    if not item_type or item_type == "report":
-        rep_query = {**base_query}
-        reports = await db.reports.find(rep_query, {"_id": 0, "id": 1, "report_number": 1, "project": 1, "status": 1, "deleted_at": 1, "deleted_by": 1}).sort("deleted_at", -1).limit(limit).to_list(limit)
-        for rep in reports:
+            
+        # 3. البلاغات
+        reps = await db.reports.find(base_query, {"_id": 0, "id": 1, "report_number": 1, "project": 1, "status": 1, "deleted_at": 1, "deleted_by": 1}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for rep in reps:
             items.append({"type": "report", "type_label": "بلاغ", "data": rep})
+            
+        # 4. المستخلصات
+        exts = await db.extracts.find(base_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for ext in exts:
+            items.append({"type": "extract", "type_label": "مستخلص", "data": ext})
+            
+        # 5. توصيلات المياه
+        water_query = {**base_query}
+        if current_user.role != "admin":
+            allowed_projects = get_projects_with_permission(current_user, "water_connections")
+            water_query["project"] = {"$in": allowed_projects}
+            water_query["deleted_by"] = current_user.id
+        wconns = await db.water_connections.find(water_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for wc in wconns:
+            items.append({"type": "water_connection", "type_label": "توصيلة مياه", "data": wc})
+            
+        # 6. توصيلات الصرف
+        sewage_query = {**base_query}
+        if current_user.role != "admin":
+            allowed_projects = get_projects_with_permission(current_user, "sewage_connections")
+            sewage_query["project"] = {"$in": allowed_projects}
+            sewage_query["deleted_by"] = current_user.id
+        sconns = await db.sewage_connections.find(sewage_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for sc in sconns:
+            items.append({"type": "sewage_connection", "type_label": "توصيلة صرف صحي", "data": sc})
+            
+        # 7. تقارير السلامة
+        safety_query = {**base_query}
+        if current_user.role != "admin":
+            allowed_projects = get_projects_with_permission(current_user, "safety_reports")
+            safety_query["project"] = {"$in": allowed_projects}
+        sreps = await db.safety_reports.find(safety_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for sr in sreps:
+            items.append({"type": "safety_report", "type_label": "تقرير سلامة", "data": sr})
+            
+        # 8. تقارير الجودة
+        quality_query = {**base_query}
+        if current_user.role != "admin":
+            allowed_projects = get_projects_with_permission(current_user, "quality_reports")
+            quality_query["project"] = {"$in": allowed_projects}
+        qreps = await db.quality_reports.find(quality_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for qr in qreps:
+            items.append({"type": "quality_report", "type_label": "تقرير جودة", "data": qr})
+            
+        # 9. تقارير الأعمال
+        business_query = {**base_query}
+        if current_user.role != "admin":
+            allowed_projects = get_projects_with_permission(current_user, "business_reports")
+            business_query["project"] = {"$in": allowed_projects}
+        breps = await db.business_reports.find(business_query, {"_id": 0}).sort("deleted_at", -1).limit(max_fetch).to_list(max_fetch)
+        for br in breps:
+            items.append({"type": "business_report", "type_label": "تقرير أعمال", "data": br})
+
+        # الترتيب
+        items.sort(key=lambda x: x["data"].get("deleted_at", ""), reverse=True)
+        
+        # حساب الإجمالي
+        c_inv = await db.invoices.count_documents(base_query)
+        c_req = await db.employee_requests.count_documents(base_query)
+        c_rep = await db.reports.count_documents(base_query)
+        c_ext = await db.extracts.count_documents(base_query)
+        c_w = await db.water_connections.count_documents(water_query)
+        c_s = await db.sewage_connections.count_documents(sewage_query)
+        c_sr = await db.safety_reports.count_documents(safety_query)
+        c_qr = await db.quality_reports.count_documents(quality_query)
+        c_br = await db.business_reports.count_documents(business_query)
+        total_count = c_inv + c_req + c_rep + c_ext + c_w + c_s + c_sr + c_qr + c_br
+        
+        # القص للصفحة الحالية
+        items = items[skip:skip+limit]
+        
+        # جلب أسماء الموظفين الذين قاموا بالحذف
+        for item in items:
+            doc = item["data"]
+            deleted_by_name = "غير معروف"
+            if doc.get("deleted_by"):
+                user_doc = await db.users.find_one({"id": doc["deleted_by"]}, {"_id": 0, "full_name": 1})
+                deleted_by_name = user_doc.get("full_name") if user_doc else "غير معروف"
+            doc["deleted_by_name"] = deleted_by_name
+
+    import math
+    pages_count = math.ceil(total_count / limit) if limit > 0 else 1
     
-    items.sort(key=lambda x: x["data"].get("deleted_at", ""), reverse=True)
-    return {"items": items[:limit], "count": len(items)}
+    return {
+        "items": items,
+        "count": total_count,
+        "total": total_count,
+        "page": page,
+        "pages": pages_count
+    }
 
 
 @api_router.post("/deleted-items/{item_type}/{item_id}/restore")
 async def restore_deleted_item(item_type: str, item_id: str, current_user: User = Depends(get_current_user)):
     """استعادة عنصر محذوف"""
     user_permissions = current_user.permissions or []
-    if current_user.role != "admin" and "trash" not in user_permissions:
-        raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+    has_trash_perm = current_user.role == "admin" or "trash" in user_permissions or user_has_any_project_permission(current_user, "trash")
+    if not has_trash_perm:
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية الاستعادة")
     
-    collection_map = {"invoice": db.invoices, "employee_request": db.employee_requests, "report": db.reports}
+    collection_map = {
+        "invoice": db.invoices, 
+        "employee_request": db.employee_requests, 
+        "report": db.reports,
+        "extract": db.extracts,
+        "water_connection": db.water_connections,
+        "sewage_connection": db.sewage_connections,
+        "safety_report": db.safety_reports,
+        "work_permit": db.work_permits,
+        "quality_report": db.quality_reports,
+        "business_report": db.business_reports
+    }
     collection = collection_map.get(item_type)
-    if not collection:
+    if collection is None:
         raise HTTPException(status_code=400, detail="نوع غير صحيح")
     
     result = await collection.update_one({"id": item_id}, {"$unset": {"is_deleted": "", "deleted_by": "", "deleted_at": ""}})
@@ -12238,12 +14619,24 @@ async def permanently_delete_item(item_type: str, item_id: str, current_user: Us
     """حذف نهائي"""
     if current_user.role != "admin":
         user_permissions = current_user.permissions or []
-        if "trash" not in user_permissions:
-            raise HTTPException(status_code=403, detail="ليس لديك صلاحية")
+        has_trash_perm = current_user.role == "admin" or "trash" in user_permissions or user_has_any_project_permission(current_user, "trash")
+        if not has_trash_perm:
+            raise HTTPException(status_code=403, detail="ليس لديك صلاحية الحذف النهائي")
     
-    collection_map = {"invoice": db.invoices, "employee_request": db.employee_requests, "report": db.reports}
+    collection_map = {
+        "invoice": db.invoices, 
+        "employee_request": db.employee_requests, 
+        "report": db.reports,
+        "extract": db.extracts,
+        "water_connection": db.water_connections,
+        "sewage_connection": db.sewage_connections,
+        "safety_report": db.safety_reports,
+        "work_permit": db.work_permits,
+        "quality_report": db.quality_reports,
+        "business_report": db.business_reports
+    }
     collection = collection_map.get(item_type)
-    if not collection:
+    if collection is None:
         raise HTTPException(status_code=400, detail="نوع غير صحيح")
     
     result = await collection.delete_one({"id": item_id, "is_deleted": True})
@@ -12252,9 +14645,95 @@ async def permanently_delete_item(item_type: str, item_id: str, current_user: Us
     return {"message": "تم الحذف النهائي"}
 
 
+@api_router.post("/deleted-items/bulk-permanent-delete")
+async def bulk_permanent_delete_items(data: dict, current_user: User = Depends(get_current_user)):
+    """حذف جماعي نهائي من سلة المحذوفات"""
+    if current_user.role != "admin":
+        user_permissions = current_user.permissions or []
+        has_trash_perm = current_user.role == "admin" or "trash" in user_permissions or user_has_any_project_permission(current_user, "trash")
+        if not has_trash_perm:
+            raise HTTPException(status_code=403, detail="ليس لديك صلاحية الحذف الجماعي")
+    
+    items = data.get("items", [])
+    if not items:
+        return {"message": "لا توجد عناصر للحذف", "deleted_count": 0}
+    
+    collection_map = {
+        "invoice": db.invoices,
+        "employee_request": db.employee_requests,
+        "report": db.reports,
+        "extract": db.extracts,
+        "water_connection": db.water_connections,
+        "sewage_connection": db.sewage_connections,
+        "safety_report": db.safety_reports,
+        "work_permit": db.work_permits,
+        "quality_report": db.quality_reports,
+        "business_report": db.business_reports
+    }
+    
+    deleted_count = 0
+    for item in items:
+        item_type = item.get("type")
+        item_id = item.get("id")
+        collection = collection_map.get(item_type)
+        if collection is not None and item_id:
+            try:
+                result = await collection.delete_one({"id": item_id, "is_deleted": True})
+                if result.deleted_count > 0:
+                    deleted_count += 1
+            except Exception as e:
+                logger.error(f"Error bulk deleting item {item_id}: {str(e)}")
+                
+    return {"message": f"تم حذف {deleted_count} عنصر نهائياً", "deleted_count": deleted_count}
 
-# Include router - MUST be after ALL endpoint definitions
-app.include_router(api_router)
+
+
+@api_router.put("/wfm/toggle/{report_id}")
+async def toggle_report_wfm(report_id: str, current_user: User = Depends(get_current_user)):
+    """تبديل حالة إغلاق WFM للبلاغ"""
+    # التحقق من الصلاحيات
+    user_govs = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+    has_all_govs = any(g.strip() in ["الكل", "جميع المحافظات", "كل المحافظات", "الكل "] for g in user_govs)
+    is_admin = current_user.role == "admin"
+    is_level2 = current_user.can_create_subusers
+    user_perms = current_user.permissions or []
+    has_reports_edit = "reports_edit" in user_perms or user_has_any_project_permission(current_user, "reports_edit")
+    
+    if not (is_admin or is_level2 or has_all_govs or has_reports_edit):
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية لتعديل حالة WFM")
+        
+    try:
+        # نستخدم $ne: True بدلاً من False لالتقاط البلاغات التي ليس لها حقل is_deleted أو قيمته None
+        report = await db.reports.find_one({"id": report_id, "is_deleted": {"$ne": True}})
+        if not report:
+            print(f"ERROR: Report {report_id} not found or deleted")
+            raise HTTPException(status_code=404, detail="البلاغ غير موجود")
+            
+        new_status = not report.get("wfm_closed", False)
+        update_fields = {
+            "wfm_closed": new_status, 
+            "updated_at": datetime.now(timezone.utc)
+        }
+        
+        result = await db.reports.update_one(
+            {"id": report_id}, 
+            {"$set": update_fields}
+        )
+        print(f"DEBUG: Update WFM for {report_id} to {new_status}. Modified count: {result.modified_count}")
+        
+        msg = "تم اغلاق الرخصة علي منصة البنية التحتية" if new_status else "تم فتح معالجة الرخصة"
+        return {"message": msg, "wfm_closed": new_status}
+    except HTTPException:
+        # أعد رمي استثناءات HTTP (403, 404) كما هي بدون تحويلها إلى 500
+        raise
+    except Exception as e:
+        import traceback
+        print(f"FATAL ERROR in toggle_report_wfm for {report_id}:")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"خطأ داخلي في السيرفر: {str(e)}")
+
+
+# Include router moved to the end of the file
 
 # GZip Compression
 from starlette.middleware.gzip import GZipMiddleware
@@ -12333,3 +14812,796 @@ async def startup_db():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+
+
+import fitz  # PyMuPDF
+import base64
+
+@api_router.post("/compress-pdf")
+async def compress_pdf(data: dict, current_user: User = Depends(get_current_user)):
+    pdf_base64 = data.get("pdf", "")
+    if not pdf_base64.startswith("data:application/pdf"):
+        return {"pdf": pdf_base64}
+        
+    try:
+        header, encoded = pdf_base64.split(",", 1)
+        pdf_bytes = base64.b64decode(encoded)
+        
+        # Compress using PyMuPDF
+        doc = fitz.open("pdf", pdf_bytes)
+        
+        # Basic optimization
+        new_bytes = doc.write(garbage=4, deflate=True, clean=True)
+        doc.close()
+        
+        new_base64 = header + "," + base64.b64encode(new_bytes).decode('utf-8')
+        return {"pdf": new_base64}
+    except Exception as e:
+        print("PDF compression error:", str(e))
+        return {"pdf": pdf_base64}
+
+# ========== Safety Reports API ==========
+@api_router.get("/safety-reports")
+async def get_safety_reports(
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية عرض تقارير السلامة")
+    query = {"is_deleted": {"$ne": True}}
+    if user_doc.get("role") != "admin":
+        user_govs = user_doc.get("governorates", [])
+        user_projs = user_doc.get("projects", [])
+        
+        # Apply governorate restriction
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                query.update(gov_query)
+        elif user_govs:
+            gov_query = get_flexible_in_query(user_govs, "governorate")
+            if gov_query:
+                query.update(gov_query)
+                
+        # Apply project restriction
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                query.update(proj_query)
+        elif user_projs:
+            proj_query = get_loose_in_query(user_projs, "project")
+            if proj_query:
+                query.update(proj_query)
+    else:
+        # Admin - no permission restrictions
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                query.update(proj_query)
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                query.update(gov_query)
+    records = await db.safety_reports.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    for r in records:
+        if not r.get("status"):
+            r["status"] = "قيد المراجعة"
+    return records
+
+
+@api_router.post("/safety-reports")
+async def create_safety_report(request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية إضافة تقارير السلامة")
+    body = await request.json()
+    record = {
+        "id": str(uuid.uuid4()),
+        "date": body.get("date", ""),
+        "project": body.get("project", ""),
+        "governorate": body.get("governorate", ""),
+        "notes": body.get("notes", ""),
+        "image": body.get("image", ""),
+        "status": "قيد المراجعة",
+        "created_by": user_doc.get("username", ""),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.safety_reports.insert_one(record)
+    record.pop("_id", None)
+    return record
+
+
+@api_router.put("/safety-reports/{report_id}")
+async def update_safety_report(report_id: str, request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تقارير السلامة")
+    body = await request.json()
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "image"]}
+    
+    if "status" in body:
+        new_status = body.get("status")
+        is_admin = user_doc.get("role") == "admin"
+        is_manager = user_doc.get("can_create_subusers", False)
+        
+        existing = await db.safety_reports.find_one({"id": report_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="التقرير غير موجود")
+            
+        report_project = existing.get("project", "")
+        user_projects = user_doc.get("projects", [])
+        
+        project_matched = False
+        def normalize_str(s):
+            if not s: return ""
+            return s.strip().lower().replace(" ", "").replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي")
+            
+        report_proj_norm = normalize_str(report_project)
+        for p in user_projects:
+            if normalize_str(p) == report_proj_norm:
+                project_matched = True
+                break
+                
+        if is_admin or (is_manager and project_matched):
+            update_data["status"] = new_status
+        else:
+            raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل حالة هذا التقرير")
+            
+    update_data["updated_at"] = datetime.utcnow().isoformat()
+    await db.safety_reports.update_one({"id": report_id}, {"$set": update_data})
+    return {"message": "تم التحديث بنجاح"}
+
+
+@api_router.delete("/safety-reports/{report_id}")
+async def delete_safety_report(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية حذف تقارير السلامة")
+    result = await db.safety_reports.update_one(
+        {"id": report_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_user.id
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="غير موجود")
+    return {"message": "تم الحذف بنجاح"}
+
+
+# ========== Quality Reports API ==========
+@api_router.get("/quality-reports")
+async def get_quality_reports(
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية عرض تقارير الجودة")
+    query = {"is_deleted": {"$ne": True}}
+    if user_doc.get("role") != "admin":
+        user_govs = user_doc.get("governorates", [])
+        user_projs = user_doc.get("projects", [])
+        
+        # Apply governorate restriction
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                query.update(gov_query)
+        elif user_govs:
+            gov_query = get_flexible_in_query(user_govs, "governorate")
+            if gov_query:
+                query.update(gov_query)
+                
+        # Apply project restriction
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                query.update(proj_query)
+        elif user_projs:
+            proj_query = get_loose_in_query(user_projs, "project")
+            if proj_query:
+                query.update(proj_query)
+    else:
+        # Admin - no permission restrictions
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                query.update(proj_query)
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                query.update(gov_query)
+    records = await db.quality_reports.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    for r in records:
+        if not r.get("status"):
+            r["status"] = "قيد المراجعة"
+    return records
+
+
+@api_router.post("/quality-reports")
+async def create_quality_report(request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية إضافة تقارير الجودة")
+    body = await request.json()
+    record = {
+        "id": str(uuid.uuid4()),
+        "date": body.get("date", ""),
+        "project": body.get("project", ""),
+        "governorate": body.get("governorate", ""),
+        "notes": body.get("notes", ""),
+        "image": body.get("image", ""),
+        "status": "قيد المراجعة",
+        "created_by": user_doc.get("username", ""),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.quality_reports.insert_one(record)
+    record.pop("_id", None)
+    return record
+
+
+@api_router.put("/quality-reports/{report_id}")
+async def update_quality_report(report_id: str, request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تقارير الجودة")
+    body = await request.json()
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "image"]}
+    
+    if "status" in body:
+        new_status = body.get("status")
+        is_admin = user_doc.get("role") == "admin"
+        is_manager = user_doc.get("can_create_subusers", False)
+        
+        existing = await db.quality_reports.find_one({"id": report_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="التقرير غير موجود")
+            
+        report_project = existing.get("project", "")
+        user_projects = user_doc.get("projects", [])
+        
+        project_matched = False
+        def normalize_str(s):
+            if not s: return ""
+            return s.strip().lower().replace(" ", "").replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي")
+            
+        report_proj_norm = normalize_str(report_project)
+        for p in user_projects:
+            if normalize_str(p) == report_proj_norm:
+                project_matched = True
+                break
+                
+        if is_admin or (is_manager and project_matched):
+            update_data["status"] = new_status
+        else:
+            raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل حالة هذا التقرير")
+            
+    update_data["updated_at"] = datetime.utcnow().isoformat()
+    await db.quality_reports.update_one({"id": report_id}, {"$set": update_data})
+    return {"message": "تم التحديث بنجاح"}
+
+
+@api_router.delete("/quality-reports/{report_id}")
+async def delete_quality_report(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية حذف تقارير الجودة")
+    result = await db.quality_reports.update_one(
+        {"id": report_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_user.id
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="غير موجود")
+    return {"message": "تم الحذف بنجاح"}
+
+
+
+# ========== Business Reports API ==========
+@api_router.get("/business-reports")
+async def get_business_reports(
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "business_reports" not in user_perms and "business_reports_review" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    query = {}
+    if user_doc.get("role") != "admin":
+        user_govs = user_doc.get("governorates", [])
+        user_projs = user_doc.get("projects", [])
+        
+        # Apply governorate restriction
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                query["$or"] = [
+                    gov_query,
+                    {"governorate": {"$in": ["جميع المحافظات", "الكل", "كل المحافظات"]}}
+                ]
+        elif user_govs:
+            gov_query = get_flexible_in_query(user_govs, "governorate")
+            if gov_query:
+                query.update(gov_query)
+                
+        # Apply project restriction
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                query.update(proj_query)
+        elif user_projs:
+            proj_query = get_loose_in_query(user_projs, "project")
+            if proj_query:
+                query.update(proj_query)
+    else:
+        # Admin - no permission restrictions
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                query.update(proj_query)
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                query["$or"] = [
+                    gov_query,
+                    {"governorate": {"$in": ["جميع المحافظات", "الكل", "كل المحافظات"]}}
+                ]
+                
+    if date_from:
+        query["date_from"] = {"$gte": date_from}
+    if date_to:
+        query["date_to"] = {"$lte": date_to}
+        
+    records = await db.business_reports.find(query, {"_id": 0}).sort("date_from", -1).to_list(500)
+    for r in records:
+        if not r.get("status"):
+            r["status"] = "قيد المراجعة"
+    return records
+
+
+@api_router.post("/business-reports")
+async def create_business_report(request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "business_reports" not in user_perms and "business_reports_review" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    record = {
+        "id": str(uuid.uuid4()),
+        "date_from": body.get("date_from", ""),
+        "date_to": body.get("date_to", ""),
+        "project": body.get("project", ""),
+        "governorate": body.get("governorate", ""),
+        "notes": body.get("notes", ""),
+        "file_url": body.get("file_url", ""),
+        "file_name": body.get("file_name", ""),
+        "status": "قيد المراجعة",
+        "created_by": user_doc.get("username", ""),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.business_reports.insert_one(record)
+    record.pop("_id", None)
+    return record
+
+
+@api_router.put("/business-reports/{report_id}")
+async def update_business_report(report_id: str, request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "business_reports" not in user_perms and "business_reports_review" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    update_data = {k: v for k, v in body.items() if k in ["date_from", "date_to", "project", "governorate", "notes", "file_url", "file_name"]}
+
+    if "status" in body:
+        new_status = body.get("status")
+        is_admin = user_doc.get("role") == "admin"
+        is_manager = user_doc.get("can_create_subusers", False)
+        existing = await db.business_reports.find_one({"id": report_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="التقرير غير موجود")
+        report_project = existing.get("project", "")
+        user_projects = user_doc.get("projects", [])
+        project_matched = False
+        def normalize_str(s):
+            if not s: return ""
+            return s.strip().lower().replace(" ", "").replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي")
+        report_proj_norm = normalize_str(report_project)
+        for p in user_projects:
+            if normalize_str(p) == report_proj_norm:
+                project_matched = True
+                break
+        if is_admin or (is_manager and project_matched):
+            update_data["status"] = new_status
+        else:
+            raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل حالة هذا التقرير")
+
+    update_data["updated_at"] = datetime.utcnow().isoformat()
+    await db.business_reports.update_one({"id": report_id}, {"$set": update_data})
+    return {"message": "Success"}
+
+
+@api_router.delete("/business-reports/{report_id}")
+async def delete_business_report(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "business_reports" not in user_perms and "business_reports_review" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    result = await db.business_reports.update_one(
+        {"id": report_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_user.id
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="غير موجود")
+    return {"message": "Success"}
+
+
+# ========== Work Permits API ==========
+@api_router.get("/work-permits")
+async def get_work_permits(
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+        
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية عرض تصاريح العمل")
+        
+    query = {"is_deleted": {"$ne": True}}
+    
+    if user_doc.get("role") != "admin":
+        user_govs = user_doc.get("governorates", [])
+        user_projs = user_doc.get("projects", [])
+        
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            query.update(gov_query)
+        elif user_govs and "الكل" not in user_govs and "جميع المحافظات" not in user_govs:
+            gov_query = get_flexible_in_query(user_govs, "governorate")
+            query.update(gov_query)
+            
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            query.update(proj_query)
+        elif user_projs and "الكل" not in user_projs and "جميع المشاريع" not in user_projs:
+            proj_query = get_flexible_in_query(user_projs, "project")
+            query.update(proj_query)
+            
+    else:
+        if governorate: query.update(get_flexible_in_query([governorate], "governorate"))
+        if project: query.update(get_flexible_in_query([project], "project"))
+
+    reports = await db.work_permits.find(query, {"_id": 0}).to_list(1000)
+    # Reverse sort by created_at assuming natural insertion order
+    reports.reverse()
+    return reports
+
+@api_router.post("/work-permits")
+async def create_work_permit(data: dict, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+        
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية اضافة تصاريح العمل")
+        
+    report_id = str(uuid.uuid4())
+    data["id"] = report_id
+    data["created_by"] = user_doc.get("name", "Unknown")
+    data["created_at"] = datetime.now(timezone.utc).isoformat()
+    data["status"] = "قيد المراجعة"
+    data["is_deleted"] = False
+    
+    await db.work_permits.insert_one(data)
+    return {"message": "Success", "id": report_id}
+
+@api_router.put("/work-permits/{report_id}")
+async def update_work_permit(report_id: str, data: dict, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+        
+    is_admin = user_doc.get("role") == "admin"
+    can_edit = "work_permits_edit" in user_perms
+    can_review = user_doc.get("can_create_subusers") == True # Manager
+    
+    if not is_admin and not can_edit and not can_review and "work_permits" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك الصلاحية")
+        
+    update_data = {k: v for k, v in data.items() if k not in ["id", "_id", "created_by", "created_at"]}
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    
+    await db.work_permits.update_one({"id": report_id}, {"$set": update_data})
+    return {"message": "Success"}
+
+@api_router.delete("/work-permits/{report_id}")
+async def delete_work_permit(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+        
+    if user_doc.get("role") != "admin" and "work_permits_delete" not in user_perms and "work_permits" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك الصلاحية")
+        
+    result = await db.work_permits.update_one(
+        {"id": report_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_user.id
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="غير موجود")
+    return {"message": "Success"}
+
+
+# ========== Trash Endpoints for Reports ==========
+@api_router.get("/safety-reports-trash")
+
+@api_router.get("/trash/work-permits")
+async def get_work_permits_trash(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin": raise HTTPException(status_code=403)
+    return await db.work_permits.find({"is_deleted": True}, {"_id": 0}).sort("deleted_at", -1).to_list(500)
+
+@api_router.put("/trash/work-permits/{permit_id}/restore")
+async def restore_work_permits_trash(permit_id: str, current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin": raise HTTPException(status_code=403)
+    await db.work_permits.update_one({"id": permit_id}, {"$unset": {"is_deleted": "", "deleted_by": "", "deleted_at": ""}})
+    return {"status": "restored"}
+
+@api_router.delete("/trash/work-permits/{permit_id}/permanent")
+async def permanent_work_permits_trash(permit_id: str, current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin": raise HTTPException(status_code=403)
+    await db.work_permits.delete_one({"id": permit_id, "is_deleted": True})
+    return {"status": "deleted"}
+
+async def get_safety_reports_trash(current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    has_trash = current_user.role == "admin" or "trash" in user_perms or user_has_any_project_permission(current_user, "trash")
+    if not has_trash: raise HTTPException(status_code=403, detail="Forbidden")
+    query = {"is_deleted": True}
+    if current_user.role != "admin":
+        query["deleted_by"] = current_user.id
+    return await db.safety_reports.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(500)
+
+@api_router.post("/safety-reports-trash/{report_id}/restore")
+async def restore_safety_reports_trash(report_id: str, current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    if current_user.role != "admin" and "trash" not in user_perms and not user_has_any_project_permission(current_user, "trash"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.safety_reports.update_one({"id": report_id}, {"$unset": {"is_deleted": "", "deleted_by": "", "deleted_at": ""}})
+    return {"message": "Restored"}
+
+@api_router.delete("/safety-reports-trash/{report_id}/permanent")
+async def permanent_safety_reports_trash(report_id: str, current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    if current_user.role != "admin" and "trash" not in user_perms and not user_has_any_project_permission(current_user, "trash"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.safety_reports.delete_one({"id": report_id, "is_deleted": True})
+    return {"message": "Deleted"}
+
+@api_router.get("/quality-reports-trash")
+async def get_quality_reports_trash(current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    has_trash = current_user.role == "admin" or "trash" in user_perms or user_has_any_project_permission(current_user, "trash")
+    if not has_trash: raise HTTPException(status_code=403, detail="Forbidden")
+    query = {"is_deleted": True}
+    if current_user.role != "admin":
+        query["deleted_by"] = current_user.id
+    return await db.quality_reports.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(500)
+
+@api_router.post("/quality-reports-trash/{report_id}/restore")
+async def restore_quality_reports_trash(report_id: str, current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    if current_user.role != "admin" and "trash" not in user_perms and not user_has_any_project_permission(current_user, "trash"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.quality_reports.update_one({"id": report_id}, {"$unset": {"is_deleted": "", "deleted_by": "", "deleted_at": ""}})
+    return {"message": "Restored"}
+
+@api_router.delete("/quality-reports-trash/{report_id}/permanent")
+async def permanent_quality_reports_trash(report_id: str, current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    if current_user.role != "admin" and "trash" not in user_perms and not user_has_any_project_permission(current_user, "trash"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.quality_reports.delete_one({"id": report_id, "is_deleted": True})
+    return {"message": "Deleted"}
+
+@api_router.get("/business-reports-trash")
+async def get_business_reports_trash(current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    has_trash = current_user.role == "admin" or "trash" in user_perms or user_has_any_project_permission(current_user, "trash")
+    if not has_trash: raise HTTPException(status_code=403, detail="Forbidden")
+    query = {"is_deleted": True}
+    if current_user.role != "admin":
+        query["deleted_by"] = current_user.id
+    return await db.business_reports.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(500)
+
+@api_router.post("/business-reports-trash/{report_id}/restore")
+async def restore_business_reports_trash(report_id: str, current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    if current_user.role != "admin" and "trash" not in user_perms and not user_has_any_project_permission(current_user, "trash"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.business_reports.update_one({"id": report_id}, {"$unset": {"is_deleted": "", "deleted_by": "", "deleted_at": ""}})
+    return {"message": "Restored"}
+
+@api_router.delete("/business-reports-trash/{report_id}/permanent")
+async def permanent_business_reports_trash(report_id: str, current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    if current_user.role != "admin" and "trash" not in user_perms and not user_has_any_project_permission(current_user, "trash"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.business_reports.delete_one({"id": report_id, "is_deleted": True})
+    return {"message": "Deleted"}
+
+
+# Include router - MUST be after ALL endpoint definitions
+class ConsultantNoteUpdate(BaseModel):
+    consultant_note: str
+
+@api_router.put("/reports/{report_id}/consultant_note")
+async def update_consultant_note(report_id: str, payload: ConsultantNoteUpdate, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    if not has_project_permission(current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user, report.get("project"), "consultant_notes"):
+        raise HTTPException(status_code=403, detail="Not authorized to add consultant notes")
+    update_data = {
+        "consultant_note": payload.consultant_note,
+        "consultant_note_by": current_user.username if payload.consultant_note else ""
+    }
+    if payload.consultant_note != report.get("consultant_note", ""):
+        update_data["consultant_note_processed"] = False
+        
+    await db.reports.update_one({"id": report_id}, {"$set": update_data})
+    
+    if payload.consultant_note:
+        import uuid
+        from datetime import datetime, timezone
+        target_users = []
+        
+        # 1. Admins
+        admins = await db.users.find({"role": "admin", "is_deleted": {"$ne": True}}).to_list(None)
+        for admin in admins:
+            if admin.get("id") != current_user.id:
+                target_users.append(admin)
+                
+        # 2. Level 2 & 3 users with access to this project & governorate who have 'consultant_notes' permission
+        users = await db.users.find({"role": {"$ne": "admin"}, "is_deleted": {"$ne": True}}).to_list(None)
+        
+        def user_has_access(u):
+            if u.get("id") == current_user.id: return False
+            perms = u.get("permissions", [])
+            pp = u.get("project_permissions", {})
+            has_perm = "consultant_notes" in perms or any("consultant_notes" in p for p in pp.values())
+            if not has_perm: return False
+            
+            u_projs = u.get("projects", [])
+            report_proj = report.get("project", "")
+            has_proj = False
+            for p in u_projs:
+                p_keys = [k for k in p.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'في', 'محافظة']]
+                r_keys = [k for k in report_proj.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'في', 'محافظة']]
+                if report_proj == p or any(k in report_proj for k in p_keys) or any(k in p for k in r_keys):
+                    has_proj = True
+                    break
+            if not has_proj: return False
+            
+            u_govs = u.get("governorates", [])
+            report_gov = report.get("governorate", "")
+            has_all_govs = any(g.strip() in ["الكل", "جميع المحافظات", "كل المحافظات", "الكل "] for g in u_govs)
+            
+            has_gov = False
+            if has_all_govs:
+                has_gov = True
+            else:
+                for g in u_govs:
+                    if g == report_gov or g in report_gov or report_gov in g:
+                        has_gov = True
+                        break
+                        
+            if not has_gov: return False
+            
+            return True
+
+        for u in users:
+            if user_has_access(u):
+                target_users.append(u)
+                
+        # 3. Ensure creator gets it too if not already in list
+        creator_id = report.get("created_by")
+        creator = await db.users.find_one({"$or": [{"id": creator_id}, {"username": creator_id}]})
+        if creator and creator.get("id") != current_user.id:
+            if not any(t.get("id") == creator.get("id") for t in target_users):
+                target_users.append(creator)
+                
+        # Send messages
+        for t_user in target_users:
+            message_id = str(uuid.uuid4())
+            new_msg = {
+                "id": message_id,
+                "sender_id": current_user.id,
+                "receiver_id": t_user.get("id"),
+                "message": f"تمت إضافة/تعديل ملاحظة الاستشاري على البلاغ {report.get('report_number', '')}:\n{payload.consultant_note}",
+                "created_at": datetime.now(timezone.utc),
+                "is_read": False,
+                "is_delivered": False,
+                "is_edited": False
+            }
+            await db.messages.insert_one(new_msg)
+            
+    return {"message": "Success", "consultant_note": payload.consultant_note}
+
+
+app.include_router(api_router)

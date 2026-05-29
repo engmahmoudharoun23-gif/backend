@@ -107,7 +107,17 @@ async def toggle_user_active(user_id: str) -> Optional[dict]:
     await db.users.update_one({"id": user_id}, {"$set": {"is_active": new_status}})
     return await get_user_by_id(user_id)
 
-async def update_user_permissions(user_id: str, permissions: List[str]) -> Optional[dict]:
+async def update_user_permissions(user_id: str, permissions_data: dict) -> Optional[dict]:
     """Update user permissions"""
-    await db.users.update_one({"id": user_id}, {"$set": {"permissions": permissions}})
+    update_data = {
+        "permissions": permissions_data.get("permissions", [])
+    }
+    if "project_permissions" in permissions_data:
+        update_data["project_permissions"] = permissions_data["project_permissions"]
+    if "connection_permissions" in permissions_data:
+        update_data["connection_permissions"] = permissions_data["connection_permissions"]
+    if "projects" in permissions_data:
+        update_data["projects"] = permissions_data["projects"]
+        
+    await db.users.update_one({"id": user_id}, {"$set": update_data})
     return await get_user_by_id(user_id)

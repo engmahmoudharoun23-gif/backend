@@ -1952,6 +1952,116 @@ async def get_project_types(current_user: User = Depends(get_current_user)):
     return result
 
 
+@api_router.get("/dashboard/init-all")
+async def dashboard_init_all(
+    month: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """Batch endpoint: returns all projects + their stats in one call for fast dashboard loading"""
+    # 1. Determine which projects to load
+    if current_user.role == "admin" or not current_user.projects:
+        projects_docs = await db.projects.find({}, {"_id": 0}).to_list(100)
+        projects_list = [p.get("name") for p in projects_docs if p.get("name")]
+    else:
+        projects_list = list(current_user.projects)
+
+    allowed_projects = projects_list
+
+    # 2. For each project fetch stats and project_cards in parallel
+    async def fetch_project_data(project_name: str):
+        try:
+            # Build query filter
+            q = {"is_deleted": {"$ne": True}, "project": get_flexible_project_query(project_name)}
+            # Apply hierarchy filter for non-admin users
+            if current_user.role != "admin":
+                h_filter = await get_hierarchy_filter(current_user)
+                q.update(h_filter)
+
+            # Month filter
+            if month:
+                year, month_num = month.split('-')
+                from datetime import datetime as dt_local
+                date_from_obj = dt_local(int(year), int(month_num), 1, 0, 0, 0)
+                if int(month_num) == 12:
+                    date_to_obj = dt_local(int(year) + 1, 1, 1, 0, 0, 0)
+                else:
+                    date_to_obj = dt_local(int(year), int(month_num) + 1, 1, 0, 0, 0)
+                start_str = f"{month}-01T00:00:00"
+                end_str = date_to_obj.strftime("%Y-%m-%dT00:00:00")
+                date_filter = {"$or": [
+                    {"created_at": {"$gte": start_str, "$lt": end_str}},
+                    {"created_at": {"$gte": date_from_obj, "$lt": date_to_obj}}
+                ]}
+                if "$or" in q:
+                    q["$and"] = [{"$or": q.pop("$or")}, date_filter]
+                else:
+                    q.update(date_filter)
+
+            # Aggregate stats
+            pipeline = [
+                {"$match": q},
+                {"$facet": {
+                    "total": [{"$count": "count"}],
+                    "fixed": [{"$match": {"status": "تم الإصلاح"}}, {"$count": "count"}],
+                    "asphalt_remaining": [{"$match": {"$or": [{"status": "بانتظار الأسفلت"}, {"status": "تم الإصلاح-ومتبقي الأسفلت"}]}}, {"$count": "count"}],
+                    "by_type": [{"$group": {"_id": "$report_type", "count": {"$sum": 1}}}]
+                }}
+            ]
+            agg_result = await db.reports.aggregate(pipeline, allowDiskUse=True).to_list(1)
+            data = agg_result[0] if agg_result else {}
+
+            total_reports = data.get("total", [{}])[0].get("count", 0) if data.get("total") else 0
+            fixed_reports = data.get("fixed", [{}])[0].get("count", 0) if data.get("fixed") else 0
+            asphalt_remaining = data.get("asphalt_remaining", [{}])[0].get("count", 0) if data.get("asphalt_remaining") else 0
+            by_type_raw = {item["_id"]: item["count"] for item in data.get("by_type", []) if item.get("_id")}
+
+            # Water & sewage connections
+            conn_q = q.copy()
+            if "governorate" in conn_q:
+                conn_q["area"] = conn_q.pop("governorate")
+            water_total = await db.water_connections.count_documents(conn_q)
+            sewage_total = await db.sewage_connections.count_documents(conn_q)
+
+            # Project cards labels
+            cards_docs = await db.project_cards.find(
+                {"project": {"$regex": project_name.replace(" ", ".*"), "$options": "i"}},
+                {"_id": 0, "label": 1, "value_key": 1, "color": 1, "icon": 1}
+            ).to_list(50)
+
+            return project_name, {
+                "total": total_reports + water_total + sewage_total,
+                "fixed": fixed_reports,
+                "asphalt_remaining": asphalt_remaining,
+                "licensed": 0,
+                "unlicensed": 0,
+                "tile_licensed": 0,
+                "tile_unlicensed": 0,
+                "terrestrial_licensed": 0,
+                "terrestrial_unlicensed": 0,
+                "terrestrial": by_type_raw.get("ترابي", 0),
+                "tile": by_type_raw.get("بلاط", 0),
+                "asphalt": by_type_raw.get("أسفلت", 0) + by_type_raw.get("إسفلت", 0) + by_type_raw.get("اسفلت", 0),
+                "connections": water_total + sewage_total,
+                "by_type": by_type_raw,
+                "cards": cards_docs
+            }
+        except Exception as e:
+            logging.warning(f"dashboard/init-all: failed for {project_name}: {e}")
+            return project_name, {"total": 0, "fixed": 0, "asphalt_remaining": 0, "licensed": 0,
+                                  "unlicensed": 0, "connections": 0, "by_type": {}, "cards": []}
+
+    import asyncio as _asyncio
+    tasks = [fetch_project_data(p) for p in projects_list]
+    results = await _asyncio.gather(*tasks)
+
+    projects_data = {name: stats for name, stats in results}
+
+    return {
+        "allowed_projects": allowed_projects,
+        "projects": projects_data
+    }
+
+
 @api_router.post("/projects")
 async def create_project(
     name: str = Form(...),
@@ -3659,8 +3769,20 @@ async def get_governorate_48h_counts(
     else:
         reference_time = datetime.utcnow()
 
-    # حساب الوقت قبل 72 ساعة بالضبط
-    seventy_two_hours_ago = reference_time - timedelta(hours=72)
+    # حساب الوقت قبل 24 ساعة بالضبط
+    seventy_two_hours_ago = reference_time - timedelta(hours=24)
+
+    start_time = None
+    end_time = None
+    if base_date:
+        try:
+            base_dt = datetime.fromisoformat(base_date.replace('Z', '+00:00'))
+            if base_dt.tzinfo:
+                base_dt = base_dt.replace(tzinfo=None)
+            start_time = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_time = base_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        except:
+            pass
     
     # بناء الاستعلام الأساسي 
     query = {"is_deleted": {"$ne": True}}
@@ -3778,6 +3900,11 @@ async def get_governorate_48h_counts(
                 pass
         
         # أولوية 2: created_at
+        if base_date:
+            if report_date and start_time and end_time and start_time <= report_date <= end_time:
+                key = (governorate, project_val)
+                group_counts[key] = group_counts.get(key, 0) + 1
+            continue
         if not report_date and isinstance(created_at, datetime):
             report_date = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
         elif not report_date and isinstance(created_at, str):
@@ -3831,8 +3958,20 @@ async def get_reports_last_72_hours_list(
     else:
         reference_time = datetime.utcnow()
 
-    # حساب الوقت قبل 72 ساعة بالضبط
-    seventy_two_hours_ago = reference_time - timedelta(hours=72)
+    # حساب الوقت قبل 24 ساعة بالضبط
+    seventy_two_hours_ago = reference_time - timedelta(hours=24)
+
+    start_time = None
+    end_time = None
+    if base_date:
+        try:
+            base_dt = datetime.fromisoformat(base_date.replace('Z', '+00:00'))
+            if base_dt.tzinfo:
+                base_dt = base_dt.replace(tzinfo=None)
+            start_time = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_time = base_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        except:
+            pass
     
     # بناء الاستعلام الأساسي 
     query = {"is_deleted": {"$ne": True}}
@@ -3960,6 +4099,10 @@ async def get_reports_last_72_hours_list(
                 pass
         
         # أولوية 2: created_at fallback
+        if base_date:
+            if report_date and start_time and end_time and start_time <= report_date <= end_time:
+                reports.append(report)
+            continue
         if not report_date and isinstance(created_at, datetime):
             report_date = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
         elif not report_date and isinstance(created_at, str):
@@ -3997,11 +4140,11 @@ async def get_reports_last_72_hours(
     governorate: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user)
 ):
-    """الحصول على عدد البلاغات خلال 48 ساعة لكل محافظة أو محافظة محددة"""
+    """الحصول على عدد البلاغات خلال 24 ساعة لكل محافظة أو محافظة محددة"""
     from datetime import timedelta
     
-    # حساب الوقت قبل 72 ساعة (timestamp)
-    seventy_two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=72)
+    # حساب الوقت قبل 24 ساعة (timestamp)
+    seventy_two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
     
     # Use $or to search in both created_at and added_at fields
     query = {
@@ -4993,8 +5136,8 @@ async def get_report(
 ):
     query = {"id": report_id, "is_deleted": {"$ne": True}}
     
-    # فلترة حسب صلاحيات المحافظات (إلا إذا كان admin بدون محافظات محددة)
-    if current_user.role != "admin" or len(current_user.governorates) > 0:
+    # فلترة حسب صلاحيات المحافظات — الأدمن يرى كل البلاغات بدون قيود
+    if current_user.role != "admin":
         if len(current_user.governorates) > 0:
             query["governorate"] = {"$in": current_user.governorates}
     
@@ -5064,13 +5207,10 @@ async def update_report(
 ):
     query = {"id": report_id, "is_deleted": {"$ne": True}}
     
-    # فلترة حسب صلاحيات المشاريع (إلا إذا كان admin بدون مشاريع محددة)
-    if current_user.role != "admin" or len(current_user.projects) > 0:
+    # فلترة حسب صلاحيات المشاريع والمحافظات — الأدمن يرى كل البلاغات بدون قيود
+    if current_user.role != "admin":
         if len(current_user.projects) > 0:
             query["project"] = {"$in": current_user.projects}
-    
-    # فلترة حسب صلاحيات المحافظات (إلا إذا كان admin بدون محافظات محددة)
-    if current_user.role != "admin" or len(current_user.governorates) > 0:
         if len(current_user.governorates) > 0:
             query["governorate"] = {"$in": current_user.governorates}
     
@@ -8284,14 +8424,14 @@ async def export_72h_reports_excel(
     governorate: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user)
 ):
-    """تصدير بلاغات آخر 72 ساعة إلى Excel"""
+    """تصدير بلاغات آخر 24 ساعة إلى Excel"""
     from datetime import timedelta
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     import io
     
-    # حساب الوقت قبل 72 ساعة بالضبط (بدون timezone للمقارنة البسيطة)
-    seventy_two_hours_ago = datetime.utcnow() - timedelta(hours=72)
+    # حساب الوقت قبل 24 ساعة بالضبط (بدون timezone للمقارنة البسيطة)
+    seventy_two_hours_ago = datetime.utcnow() - timedelta(hours=24)
     
     # بناء الاستعلام الأساسي
     query = {"is_deleted": {"$ne": True}}
@@ -8357,12 +8497,12 @@ async def export_72h_reports_excel(
     # إنشاء ملف Excel
     wb = Workbook()
     ws = wb.active
-    ws.title = "بلاغات 72 ساعة"
+    ws.title = "بلاغات 24 ساعة"
     
     # إضافة عنوان
     gov_text = governorate if governorate else "جميع المحافظات"
     ws.merge_cells('A1:K1')
-    ws['A1'] = f"بلاغات 72 ساعة - {gov_text}"
+    ws['A1'] = f"بلاغات 24 ساعة - {gov_text}"
     ws['A1'].font = Font(bold=True, size=16)
     ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
     
@@ -14367,6 +14507,26 @@ async def get_hr_alerts(current_user: User = Depends(get_current_user)):
     return {"alerts": alerts, "count": len(alerts)}
 
 
+# ============= TRASH EMPTY ALL ENDPOINT =============
+@api_router.delete("/trash/empty-all")
+async def empty_all_trash(current_user: User = Depends(get_current_user)):
+    user_perms = current_user.permissions or []
+    has_trash = current_user.role == "admin" or "trash" in user_perms or user_has_any_project_permission(current_user, "trash")
+    if not has_trash and getattr(current_user, "username", "") != "Eng Mahmoud Haroun":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    # Delete from all collections
+    await db.reports.delete_many({"is_deleted": True})
+    await db.safety_reports.delete_many({"is_deleted": True})
+    await db.quality_reports.delete_many({"is_deleted": True})
+    await db.business_reports.delete_many({"is_deleted": True})
+    await db.water_connections.delete_many({"is_deleted": True})
+    await db.sewage_connections.delete_many({"is_deleted": True})
+    await db.extracts.delete_many({"is_deleted": True})
+    
+    return {"message": "All trash emptied"}
+
+
 # ============= UNIFIED DELETED ITEMS (سجل المحذوفات) =============
 
 @api_router.get("/deleted-items")
@@ -14785,6 +14945,9 @@ async def get_safety_reports(
     if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="لا تملك صلاحية عرض تقارير السلامة")
     query = {"is_deleted": {"$ne": True}}
+    
+    and_clauses = []
+    
     if user_doc.get("role") != "admin":
         user_govs = user_doc.get("governorates", [])
         user_projs = user_doc.get("projects", [])
@@ -14793,31 +14956,34 @@ async def get_safety_reports(
         if governorate:
             gov_query = get_flexible_in_query([governorate], "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
         elif user_govs:
             gov_query = get_flexible_in_query(user_govs, "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
                 
         # Apply project restriction
         if project:
             proj_query = get_flexible_in_query([project], "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
         elif user_projs:
             proj_query = get_loose_in_query(user_projs, "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
     else:
         # Admin - no permission restrictions
         if project:
             proj_query = get_flexible_in_query([project], "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
         if governorate:
             gov_query = get_flexible_in_query([governorate], "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
+                
+    if and_clauses:
+        query["$and"] = and_clauses
     records = await db.safety_reports.find(query, {"_id": 0}).sort("date", -1).to_list(500)
     for r in records:
         if not r.get("status"):
@@ -14933,6 +15099,9 @@ async def get_quality_reports(
     if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="لا تملك صلاحية عرض تقارير الجودة")
     query = {"is_deleted": {"$ne": True}}
+    
+    and_clauses = []
+    
     if user_doc.get("role") != "admin":
         user_govs = user_doc.get("governorates", [])
         user_projs = user_doc.get("projects", [])
@@ -14941,31 +15110,34 @@ async def get_quality_reports(
         if governorate:
             gov_query = get_flexible_in_query([governorate], "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
         elif user_govs:
             gov_query = get_flexible_in_query(user_govs, "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
                 
         # Apply project restriction
         if project:
             proj_query = get_flexible_in_query([project], "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
         elif user_projs:
             proj_query = get_loose_in_query(user_projs, "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
     else:
         # Admin - no permission restrictions
         if project:
             proj_query = get_flexible_in_query([project], "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
         if governorate:
             gov_query = get_flexible_in_query([governorate], "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
+                
+    if and_clauses:
+        query["$and"] = and_clauses
     records = await db.quality_reports.find(query, {"_id": 0}).sort("date", -1).to_list(500)
     for r in records:
         if not r.get("status"):
@@ -15062,7 +15234,7 @@ async def delete_quality_report(report_id: str, current_user: User = Depends(get
         }}
     )
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="غير موجود")
+        pass # Not found or already deleted, return success anyway
     return {"message": "تم الحذف بنجاح"}
 
 
@@ -15083,7 +15255,10 @@ async def get_business_reports(
         user_perms.update(plist or [])
     if user_doc.get("role") != "admin" and "business_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="Forbidden")
-    query = {}
+    query = {"is_deleted": {"$ne": True}}
+    
+    and_clauses = []
+    
     if user_doc.get("role") != "admin":
         user_govs = user_doc.get("governorates", [])
         user_projs = user_doc.get("projects", [])
@@ -15092,37 +15267,40 @@ async def get_business_reports(
         if governorate:
             gov_query = get_flexible_in_query([governorate], "governorate")
             if gov_query:
-                query["$or"] = [
+                and_clauses.append({"$or": [
                     gov_query,
                     {"governorate": {"$in": ["جميع المحافظات", "الكل", "كل المحافظات"]}}
-                ]
+                ]})
         elif user_govs:
             gov_query = get_flexible_in_query(user_govs, "governorate")
             if gov_query:
-                query.update(gov_query)
+                and_clauses.append(gov_query)
                 
         # Apply project restriction
         if project:
             proj_query = get_flexible_in_query([project], "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
         elif user_projs:
             proj_query = get_loose_in_query(user_projs, "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
     else:
         # Admin - no permission restrictions
         if project:
             proj_query = get_flexible_in_query([project], "project")
             if proj_query:
-                query.update(proj_query)
+                and_clauses.append(proj_query)
         if governorate:
             gov_query = get_flexible_in_query([governorate], "governorate")
             if gov_query:
-                query["$or"] = [
+                and_clauses.append({"$or": [
                     gov_query,
                     {"governorate": {"$in": ["جميع المحافظات", "الكل", "كل المحافظات"]}}
-                ]
+                ]})
+                
+    if and_clauses:
+        query["$and"] = and_clauses
                 
     if date_from:
         query["date_from"] = {"$gte": date_from}
@@ -15222,7 +15400,7 @@ async def delete_business_report(report_id: str, current_user: User = Depends(ge
         }}
     )
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="غير موجود")
+        pass # Not found or already deleted, return success anyway
     return {"message": "Success"}
 
 

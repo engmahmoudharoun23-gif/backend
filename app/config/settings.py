@@ -100,6 +100,15 @@ ALL_PERMISSIONS = [
     {"key": "water_connections", "label": "توصيلات المياه", "group": "مشروع إيصال"},
     {"key": "sewage_connections", "label": "توصيلات الصرف الصحي", "group": "مشروع إيصال"},
     {"key": "chat", "label": "المحادثات", "group": "عام"},
+    {"key": "safety_reports", "label": "تقارير السلامة", "group": "التقارير"},
+    {"key": "safety_reports_edit", "label": "تعديل تقارير السلامة", "group": "التقارير"},
+    {"key": "safety_reports_delete", "label": "حذف تقارير السلامة", "group": "التقارير"},
+    {"key": "quality_reports", "label": "تقارير الجودة", "group": "التقارير"},
+    {"key": "quality_reports_edit", "label": "تعديل تقارير الجودة", "group": "التقارير"},
+    {"key": "quality_reports_delete", "label": "حذف تقارير الجودة", "group": "التقارير"},
+    {"key": "business_reports", "label": "تقارير الأعمال", "group": "التقارير"},
+    {"key": "business_reports_edit", "label": "تعديل تقارير الأعمال", "group": "التقارير"},
+    {"key": "business_reports_delete", "label": "حذف تقارير الأعمال", "group": "التقارير"},
     {"key": "business_reports_review", "label": "مراجعة تقارير الأعمال", "group": "التقارير"},
 ]
 

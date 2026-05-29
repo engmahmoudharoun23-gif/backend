@@ -20,6 +20,8 @@ class UserBase(BaseModel):
     projects: List[str] = []
     can_create_subusers: bool = True
     permissions: List[str] = []
+    project_permissions: Optional[dict] = None
+    connection_permissions: Optional[dict] = None
     is_active: bool = True
 
 
@@ -38,6 +40,8 @@ class UserUpdate(BaseModel):
     projects: Optional[List[str]] = None
     can_create_subusers: Optional[bool] = None
     permissions: Optional[List[str]] = None
+    project_permissions: Optional[dict] = None
+    connection_permissions: Optional[dict] = None
     is_active: Optional[bool] = None
     password: Optional[str] = None
 
@@ -65,6 +69,8 @@ class UserResponse(BaseModel):
     projects: List[str] = []
     can_create_subusers: bool = True
     permissions: List[str] = []
+    project_permissions: Optional[dict] = None
+    connection_permissions: Optional[dict] = None
     is_active: bool = True
     created_at: Optional[datetime] = None
     created_by: Optional[str] = None
@@ -116,3 +122,6 @@ class VerifyResetCodeRequest(BaseModel):
 class PermissionsUpdate(BaseModel):
     """Permissions update request"""
     permissions: List[str]
+    project_permissions: Optional[dict] = None
+    connection_permissions: Optional[dict] = None
+    projects: Optional[List[str]] = None
