@@ -323,6 +323,14 @@ def get_flexible_project_query(project_name):
     if not project_name:
         return None
     
+    # ⚡ توحيد الاسم الخاص بكشف التسربات لتسهيل المطابقة بغض النظر عن طريقة كتابته
+    norm = normalize_arabic(project_name)
+    if "كشف" in norm and "تسرب" in norm:
+        # هذا هو مشروع كشف التسربات وإصلاحها
+        # نرجّع تعبيراً نمطياً يطابق أي صيغة تحتوي على "كشف" و "تسرب"
+        full_regex = r"^(مشروع\s+)?(ال)?كشف[\s\-_]*(ال)?تسرب([اأإآ]ت)?([\s\-_]*(ال)?و[اأإآ]صل[اأإآ]ح[هة][اأإآ])?$"
+        return {"$regex": full_regex, "$options": "i"}
+    
     # تنظيف النص وتقسيمه لكلمات بشكل عدواني (تجاهل المسافات والشرطات)
     cleaned_name = re.sub(r'[\s\-_]+', ' ', project_name).strip()
     keywords = [k.strip() for k in cleaned_name.split() if len(k.strip()) > 1]
@@ -1997,14 +2005,38 @@ async def dashboard_init_all(
                 else:
                     q.update(date_filter)
 
-            # Aggregate stats
+            # Aggregate stats - including license counts per type
             pipeline = [
                 {"$match": q},
                 {"$facet": {
                     "total": [{"$count": "count"}],
                     "fixed": [{"$match": {"status": "تم الإصلاح"}}, {"$count": "count"}],
                     "asphalt_remaining": [{"$match": {"$or": [{"status": "بانتظار الأسفلت"}, {"status": "تم الإصلاح-ومتبقي الأسفلت"}]}}, {"$count": "count"}],
-                    "by_type": [{"$group": {"_id": "$report_type", "count": {"$sum": 1}}}]
+                    "by_type": [{"$group": {"_id": "$report_type", "count": {"$sum": 1}}}],
+                    "asphalt_reports": [
+                        {"$match": {"report_type": {"$in": ["أسفلت", "اسفلت", "إسفلت", "asphalt", "Asphalt"]}}},
+                        {"$group": {
+                            "_id": None,
+                            "licensed": {"$sum": {"$cond": [{"$regexMatch": {"input": {"$ifNull": ["$license_number", ""]}, "regex": "[0-9]"}}, 1, 0]}},
+                            "unlicensed": {"$sum": {"$cond": [{"$not": {"$regexMatch": {"input": {"$ifNull": ["$license_number", ""]}, "regex": "[0-9]"}}}, 1, 0]}}
+                        }}
+                    ],
+                    "tile_reports": [
+                        {"$match": {"report_type": {"$in": ["بلاط", "tile", "Tile"]}}},
+                        {"$group": {
+                            "_id": None,
+                            "licensed": {"$sum": {"$cond": [{"$regexMatch": {"input": {"$ifNull": ["$license_number", ""]}, "regex": "[0-9]"}}, 1, 0]}},
+                            "unlicensed": {"$sum": {"$cond": [{"$not": {"$regexMatch": {"input": {"$ifNull": ["$license_number", ""]}, "regex": "[0-9]"}}}, 1, 0]}}
+                        }}
+                    ],
+                    "terrestrial_reports": [
+                        {"$match": {"report_type": {"$in": ["ترابي", "terrestrial", "Terrestrial"]}}},
+                        {"$group": {
+                            "_id": None,
+                            "licensed": {"$sum": {"$cond": [{"$regexMatch": {"input": {"$ifNull": ["$license_number", ""]}, "regex": "[0-9]"}}, 1, 0]}},
+                            "unlicensed": {"$sum": {"$cond": [{"$not": {"$regexMatch": {"input": {"$ifNull": ["$license_number", ""]}, "regex": "[0-9]"}}}, 1, 0]}}
+                        }}
+                    ]
                 }}
             ]
             agg_result = await db.reports.aggregate(pipeline, allowDiskUse=True).to_list(1)
@@ -2014,6 +2046,19 @@ async def dashboard_init_all(
             fixed_reports = data.get("fixed", [{}])[0].get("count", 0) if data.get("fixed") else 0
             asphalt_remaining = data.get("asphalt_remaining", [{}])[0].get("count", 0) if data.get("asphalt_remaining") else 0
             by_type_raw = {item["_id"]: item["count"] for item in data.get("by_type", []) if item.get("_id")}
+
+            # استخراج إحصائيات الرخص لكل نوع
+            asphalt_stats = data["asphalt_reports"][0] if data.get("asphalt_reports") else {}
+            licensed = asphalt_stats.get("licensed", 0)
+            unlicensed = asphalt_stats.get("unlicensed", 0)
+
+            tile_stats = data["tile_reports"][0] if data.get("tile_reports") else {}
+            tile_licensed = tile_stats.get("licensed", 0)
+            tile_unlicensed = tile_stats.get("unlicensed", 0)
+
+            terrestrial_stats = data["terrestrial_reports"][0] if data.get("terrestrial_reports") else {}
+            terrestrial_licensed = terrestrial_stats.get("licensed", 0)
+            terrestrial_unlicensed = terrestrial_stats.get("unlicensed", 0)
 
             # Water & sewage connections
             conn_q = q.copy()
@@ -2032,12 +2077,12 @@ async def dashboard_init_all(
                 "total": total_reports + water_total + sewage_total,
                 "fixed": fixed_reports,
                 "asphalt_remaining": asphalt_remaining,
-                "licensed": 0,
-                "unlicensed": 0,
-                "tile_licensed": 0,
-                "tile_unlicensed": 0,
-                "terrestrial_licensed": 0,
-                "terrestrial_unlicensed": 0,
+                "licensed": licensed,
+                "unlicensed": unlicensed,
+                "tile_licensed": tile_licensed,
+                "tile_unlicensed": tile_unlicensed,
+                "terrestrial_licensed": terrestrial_licensed,
+                "terrestrial_unlicensed": terrestrial_unlicensed,
                 "terrestrial": by_type_raw.get("ترابي", 0),
                 "tile": by_type_raw.get("بلاط", 0),
                 "asphalt": by_type_raw.get("أسفلت", 0) + by_type_raw.get("إسفلت", 0) + by_type_raw.get("اسفلت", 0),
@@ -2045,6 +2090,7 @@ async def dashboard_init_all(
                 "by_type": by_type_raw,
                 "cards": cards_docs
             }
+
         except Exception as e:
             logging.warning(f"dashboard/init-all: failed for {project_name}: {e}")
             return project_name, {"total": 0, "fixed": 0, "asphalt_remaining": 0, "licensed": 0,
@@ -5006,6 +5052,9 @@ async def delete_sewage_connection_notification(conn_id: str, current_user: User
 async def get_consultant_notes(
     project: str = Query(None),
     governorate: str = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1),
+    search: str = Query(None),
     current_user: User = Depends(get_current_user)
 ):
     user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
@@ -5035,52 +5084,59 @@ async def get_consultant_notes(
     user_projs = user_doc.get("projects", [])
     user_govs = user_doc.get("governorates", [])
     
+    and_conditions = []
+    
     if role != "admin":
         if not project and user_projs:
             proj_filter = get_loose_in_query(user_projs, "project")
+            if proj_filter: and_conditions.append(proj_filter)
         elif project:
             proj_filter = get_flexible_in_query([project], "project")
-        else:
-            proj_filter = {}
+            if proj_filter: and_conditions.append(proj_filter)
             
         if not governorate and user_govs:
             gov_filter = get_flexible_in_query(user_govs, "governorate")
+            if gov_filter: and_conditions.append(gov_filter)
         elif governorate:
             gov_filter = get_flexible_in_query([governorate], "governorate")
-        else:
-            gov_filter = {}
-            
-        if proj_filter and gov_filter:
-            query["$and"] = [proj_filter, gov_filter]
-        elif proj_filter:
-            query.update(proj_filter)
-        elif gov_filter:
-            query.update(gov_filter)
+            if gov_filter: and_conditions.append(gov_filter)
             
     else:
-        filters = []
         if project:
-            filters.append(get_flexible_in_query([project], "project"))
+            proj_filter = get_flexible_in_query([project], "project")
+            if proj_filter: and_conditions.append(proj_filter)
         if governorate:
-            filters.append(get_flexible_in_query([governorate], "governorate"))
+            gov_filter = get_flexible_in_query([governorate], "governorate")
+            if gov_filter: and_conditions.append(gov_filter)
             
-        if len(filters) > 1:
-            query["$and"] = filters
-        elif filters:
-            query.update(filters[0])
+    if search:
+        search_clean = search.strip()
+        and_conditions.append({
+            "$or": [
+                {"report_number": {"$regex": search_clean, "$options": "i"}},
+                {"id": {"$regex": search_clean, "$options": "i"}}
+            ]
+        })
+        
+    if and_conditions:
+        query["$and"] = and_conditions
 
     print("=== DEBUG get_consultant_notes ===")
     print("User:", current_user.username)
     print("Query:", query)
     
+    skip = (page - 1) * limit
+    
+    total = await db.reports.count_documents(query)
+    
     reports = await db.reports.find(
         query, 
-        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "consultant_note": 1, "consultant_note_reply": 1, "consultant_note_replied_by": 1, "consultant_note_processed": 1, "created_at": 1, "status": 1}
-    ).sort("created_at", -1).to_list(200)
+        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "consultant_note": 1, "consultant_note_by": 1, "consultant_note_reply": 1, "consultant_note_replied_by": 1, "consultant_note_processed": 1, "created_at": 1, "status": 1}
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
-    print("Found Reports:", len(reports))
+    print("Found Reports:", len(reports), "Total Count:", total)
     
-    return {"reports": reports}
+    return {"reports": reports, "total": total, "page": page, "limit": limit}
 
 
 @api_router.put("/reports/{report_id}/consultant_note_processed")
@@ -5126,6 +5182,29 @@ async def update_consultant_note_reply(report_id: str, payload: ConsultantNoteRe
     await db.reports.update_one({"id": report_id}, {"$set": update_data})
     
     return {"success": True, "reply": payload.reply, "replied_by": update_data["consultant_note_replied_by"]}
+
+
+@api_router.delete("/reports/{report_id}/consultant_note")
+async def delete_consultant_note(report_id: str, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    user_doc = current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user
+    if not has_project_permission(user_doc, report.get("project"), "consultant_notes"):
+        raise HTTPException(status_code=403, detail="Not authorized to delete consultant notes")
+        
+    await db.reports.update_one(
+        {"id": report_id},
+        {"$unset": {
+            "consultant_note": "",
+            "consultant_note_by": "",
+            "consultant_note_reply": "",
+            "consultant_note_replied_by": "",
+            "consultant_note_processed": ""
+        }}
+    )
+    return {"success": True, "message": "Consultant note deleted successfully"}
 
 
 @api_router.get("/reports/{report_id}", response_model=ReportResponse)
