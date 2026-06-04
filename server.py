@@ -3931,13 +3931,13 @@ async def get_governorate_48h_counts(
                         break
                 if not has_permission:
                     return []
+            else:
                 # إذا لم يختر مشروع، نفلتر بجميع مشاريعه بمرونة
                 query.update(get_flexible_in_query(current_user.projects, "project"))
         
         # التصفية الهرمية
         user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
         
-        # تجميع معرفات المستخدمين (المسؤول + التابعين له هرمياً)
         # تطبيق الفلترة الهرمية الشاملة (Recursive)
         hierarchy_filter = await get_hierarchy_filter(current_user)
         
@@ -4123,7 +4123,8 @@ async def get_reports_last_72_hours_list(
             if project and not has_permission:
                 return {"reports": []}
             elif not project:
-                query["project"] = {"$in": current_user.projects}
+                # استخدام البحث المرن بدلاً من المطابقة التامة لضمان ظهور جميع البلاغات
+                query.update(get_flexible_in_query(current_user.projects, "project"))
         
         # 2. تجميع معرفات المستخدمين (الهرمية)
         sub_users_docs = await db.users.find(
@@ -4136,12 +4137,24 @@ async def get_reports_last_72_hours_list(
             if u.get("username"): sub_user_ids.append(u["username"])
         all_authorized_creators = [current_user.id, current_user.username] + sub_user_ids
 
-        # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته
+        # 3. تطبيق فلتر الهرمية (يشمل البلاغات المضافة من الأدمن والمديرين في محافظات المستخدم)
         permissions = getattr(current_user, 'permissions', [])
         has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        # التحقق من reports_view سواء في الصلاحيات العامة أو في صلاحيات المشروع
         has_reports_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
         if not getattr(current_user, 'can_create_subusers', False) and not has_reports_view and not has_reports_review:
-            query['created_by'] = {'$in': [current_user.id, current_user.username]}
+            # المستوى الثالث: يرى بلاغاته + بلاغات الأدمن والمديرين في محافظاته
+            # جلب معرفات الأدمن والمديرين
+            admin_ids = [current_user.id, current_user.username]
+            admins_cursor = db.users.find(
+                {"$or": [{"role": "admin"}, {"can_create_subusers": True}]},
+                {"id": 1, "username": 1}
+            )
+            async for adm in admins_cursor:
+                if adm.get("id"): admin_ids.append(adm["id"])
+                if adm.get("username"): admin_ids.append(adm["username"])
+            admin_ids.append("مكتب بيت الخبرة للاستشارات الهندسية")
+            query['created_by'] = {'$in': list(set(admin_ids))}
             if not has_all_govs and user_governorates:
                 if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
                     norm_req = normalize_arabic(governorate)
@@ -4302,8 +4315,7 @@ async def get_reports_last_72_hours(
     if current_user.role != "admin":
         permissions = getattr(current_user, 'permissions', [])
         has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
-        has_reports_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
-        if not getattr(current_user, 'can_create_subusers', False) and not has_reports_view and not has_reports_review:
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
             query["created_by"] = {"$in": [current_user.id, current_user.username]}
             conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
@@ -4533,8 +4545,7 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
         # للمستوى الثالث العادي، يرون فقط بلاغاتهم بانتظار المراجعة
         permissions = getattr(current_user, 'permissions', [])
         has_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
-        has_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
-        if not getattr(current_user, 'can_create_subusers', False) and not has_view and not has_review:
+        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_review:
             query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
             count = await db.reports.count_documents(query)
             return {"count": count}
