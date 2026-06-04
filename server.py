@@ -4139,7 +4139,8 @@ async def get_reports_last_72_hours_list(
         # 3. التطبيق الصارم: المستوى الثالث يرى فقط بلاغاته
         permissions = getattr(current_user, 'permissions', [])
         has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
-        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
+        has_reports_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and not has_reports_view and not has_reports_review:
             query['created_by'] = {'$in': [current_user.id, current_user.username]}
             if not has_all_govs and user_governorates:
                 if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
@@ -4301,7 +4302,8 @@ async def get_reports_last_72_hours(
     if current_user.role != "admin":
         permissions = getattr(current_user, 'permissions', [])
         has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
-        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_reports_review:
+        has_reports_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and not has_reports_view and not has_reports_review:
             query["created_by"] = {"$in": [current_user.id, current_user.username]}
             conn_query["created_by"] = {"$in": [current_user.id, current_user.username]}
             if current_user.governorates and not any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in current_user.governorates):
@@ -4531,7 +4533,8 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
         # للمستوى الثالث العادي، يرون فقط بلاغاتهم بانتظار المراجعة
         permissions = getattr(current_user, 'permissions', [])
         has_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
-        if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_review:
+        has_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
+        if not getattr(current_user, 'can_create_subusers', False) and not has_view and not has_review:
             query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
             count = await db.reports.count_documents(query)
             return {"count": count}
