@@ -450,7 +450,7 @@ def get_loose_in_query(items: List[str], field_name: str = "project") -> dict:
 
 # قائمة جميع الصلاحيات المتاحة
 ALL_PERMISSIONS = [
-    {"key": "dashboard", "label": "لوحة التحكم", "group": "عام"},
+    {"key": "dashboard", "label": "لوحة التحكم وتحليل البيانات", "group": "عام"},
     {"key": "reports_view", "label": "عرض البلاغات", "group": "البلاغات"},
     {"key": "reports_add", "label": "إضافة بلاغ", "group": "البلاغات"},
     {"key": "reports_edit", "label": "تعديل بلاغ", "group": "البلاغات"},
