@@ -114,6 +114,29 @@ cache = SimpleCache()
 stats_cache = {}
 CACHE_TTL = 10  # 10 ثواني
 
+# ======================================================
+# دالة تطبيع حالة الأسفلت - توحيد كل الصيغ إلى قيمة واحدة
+# تضمن عدم تكرار مشكلة عدم العد الصحيح مهما كان المشروع
+# ======================================================
+_ASPHALT_CANONICAL = "تم الإصلاح-ومتبقي الأسفلت"
+import re as _re
+_ASPHALT_PATTERN = _re.compile(r"متبقيـ*[اأإ]سفلت", _re.IGNORECASE)
+
+def normalize_asphalt_status(status_val: str) -> str:
+    """
+    يُوحّد كل صيغ حالة 'بانتظار الأسفلت' و'تم الإصلاح - ومتبقي الأسفلت'
+    إلى قيم قياسية ثابتة لضمان حساب صحيح في كل الاستعلامات.
+    يعمل مع أي مشروع حالي أو مستقبلي.
+    """
+    if not status_val:
+        return status_val
+    s = status_val.strip()
+    # توحيد حالة 'تم الإصلاح - ومتبقي الأسفلت' بكل صيغها
+    if _ASPHALT_PATTERN.search(s):
+        return _ASPHALT_CANONICAL
+    return s
+
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -305,6 +328,7 @@ class User(BaseModel):
     created_by: Optional[str] = None  # ID المستخدم الذي أنشأ هذا الحساب
     can_create_subusers: bool = True  # هل يمكن للمستخدم إنشاء مستخدمين فرعيين
     permissions: List[str] = []  # صلاحيات المستخدم (عامة - غير مرتبطة بمشروع)
+    allowed_chat_users: List[str] = []  # قائمة معرفات المستخدمين المسموح بالتحدث معهم بشكل استثنائي
     connection_permissions: Optional[dict] = None  # صلاحيات التوصيلات حسب المشروع (legacy)
     project_permissions: Optional[Dict[str, List[str]]] = None  # صلاحيات لكل مشروع على حدة {"project_name": ["perm1", "perm2"]}
     personal_theme: Optional[str] = None  # الثيم الشخصي للمستخدم
@@ -367,7 +391,7 @@ def get_flexible_project_query(project_name):
     # الربط بين الكلمات بـ [\s\-_]* للسماح بمسافات أو شرطات فقط بينها (أكثر دقة من .*)
     # مع تدعيم البداية والنهاية لضمان عدم خلط المشاريع (مثل إيصال وإيصال الرياض)
     # السماح بكلمة "مشروع" اختيارياً في البداية
-    full_regex = r"^(مشروع\s+)?" + r"[\s\-_]*".join(regex_parts) + r"[\s\-_]*$"
+    full_regex = r"^(مشروع\s+)?" + r"[\s\-_]*".join(regex_parts) + r".*$"
     return {"$regex": full_regex, "$options": "i"}
 
 
@@ -467,6 +491,7 @@ ALL_PERMISSIONS = [
     {"key": "reports_import", "label": "استيراد بلاغات من Excel", "group": "البلاغات"},
     {"key": "reports_notifications", "label": "إشعارات البلاغات الجديدة", "group": "البلاغات"},
     {"key": "consultant_notes", "label": "ملاحظات الاستشاري", "group": "البلاغات"},
+    {"key": "report_notes", "label": "ملاحظات البلاغات", "group": "البلاغات"},
     {"key": "water_connections", "label": "توصيلات المياه", "group": "التوصيلات"},
     {"key": "water_connections_import", "label": "استيراد توصيلات المياه من Excel", "group": "التوصيلات"},
     {"key": "sewage_connections", "label": "توصيلات الصرف الصحي", "group": "التوصيلات"},
@@ -503,13 +528,17 @@ ALL_PERMISSIONS = [
     {"key": "business_reports_delete", "label": "حذف تقرير الأعمال", "group": "التقارير"},
     {"key": "business_reports_review", "label": "مراجعة تقارير الأعمال", "group": "التقارير"},
     {"key": "consultant_close", "label": "إغلاق الرخصة بواسطة الاستشاري", "group": "البلاغات"},
+    {"key": "violations", "label": "المخالفات الميدانية", "group": "التقارير"},
+    {"key": "work_permits", "label": "تصاريح العمل", "group": "التقارير"},
+    {"key": "work_permits_edit", "label": "تعديل تصاريح العمل", "group": "التقارير"},
+    {"key": "work_permits_delete", "label": "حذف تصاريح العمل", "group": "التقارير"},
 ]
 
 
 # الصلاحيات المرتبطة بمشروع (يمكن منحها لكل مشروع على حدة)
 PROJECT_SCOPED_PERMISSIONS = {
     "reports_view", "reports_add", "reports_edit", "reports_delete",
-    "reports_review", "reports_import", "reports_notifications", "consultant_notes",
+    "reports_review", "reports_import", "reports_notifications", "consultant_notes", "report_notes",
     "water_connections", "water_connections_import",
     "sewage_connections", "sewage_connections_import",
     "invoices", "review_invoices", "review_invoices_3", "view_all_invoices",
@@ -518,7 +547,8 @@ PROJECT_SCOPED_PERMISSIONS = {
     "contractors", "projects", "users_manage", "team", "project_settings",
     "cars", "cars_manage", "fleet_maintenance", "hr_management",
     "dashboard", "trash", "settings", "support_messages",
-    "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close"
+    "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close",
+    "violations", "work_permits", "work_permits_edit", "work_permits_delete"
 }
 
 
@@ -842,7 +872,7 @@ class UserCreate(BaseModel):
     governorates: List[str] = []
     projects: List[str] = []
     permissions: List[str] = []  # صلاحيات المستخدم
-
+    allowed_chat_users: List[str] = []  # صلاحيات التحدث الاستثنائية
 
 class UserLogin(BaseModel):
     username: str
@@ -863,6 +893,7 @@ class UserResponse(BaseModel):
     can_create_subusers: bool = True
     has_sub_users: bool = False  # هل لديه فعلاً موظفين تحت إدارته (يحدد إن كان مديراً حقيقياً)
     permissions: List[str] = []  # صلاحيات المستخدم (عامة)
+    allowed_chat_users: List[str] = []  # صلاحيات التحدث الاستثنائية
     connection_permissions: Optional[dict] = None  # صلاحيات التوصيلات حسب المشروع (legacy)
     project_permissions: Optional[Dict[str, List[str]]] = None  # صلاحيات لكل مشروع
     personal_theme: Optional[str] = None  # الثيم الشخصي للمستخدم
@@ -1157,6 +1188,7 @@ class ReportResponse(BaseModel):
     review_status: str = "بانتظار المراجعة"  # بانتظار المراجعة / تمت المراجعة
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
+    reviewed_by_name: Optional[str] = None
 
 
 class Extract(BaseModel):
@@ -1298,6 +1330,10 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user_doc = await db.users.find_one({"id": user_id}, {"_id": 0})
     if user_doc is None:
         raise HTTPException(status_code=401, detail="User not found")
+        
+    if user_doc.get("current_session_token") and user_doc.get("current_session_token") != token:
+        raise HTTPException(status_code=401, detail="session_expired_logged_in_elsewhere")
+
     
     if isinstance(user_doc.get('created_at'), str):
         user_doc['created_at'] = datetime.fromisoformat(user_doc['created_at'])
@@ -1387,8 +1423,10 @@ async def get_hierarchy_filter(current_user: User) -> dict:
         return gov_filter
         
     # المستوى الثالث: إذا كان يمتلك صلاحية عرض البلاغات، يرى جميع البلاغات في محافظته
-    permissions = getattr(current_user, 'permissions', [])
-    if permissions and "reports_view" in permissions:
+    # نفحص الصلاحيات العامة وكذلك صلاحيات المشاريع (project_permissions)
+    permissions = getattr(current_user, 'permissions', []) or []
+    has_reports_view = "reports_view" in permissions or user_has_any_project_permission(current_user, "reports_view")
+    if has_reports_view:
         return gov_filter
         
     # المستوى الثالث العادي يرى بلاغاته فقط، نجلب معرفاته
@@ -1673,6 +1711,8 @@ async def login(login_data: UserLogin):
     
     access_token = create_access_token(data={"sub": user.id})
     
+    await db.users.update_one({"id": user.id}, {"$set": {"current_session_token": access_token}})
+    
     # حساب إذا كان المستخدم لديه فعلاً موظفين تحت إدارته (لتحديد Level 2 حقيقي)
     sub_user_count = await db.users.count_documents({"created_by": user.id})
     user_dict = user.model_dump()
@@ -1925,6 +1965,7 @@ async def get_activity_logs(current_user: User = Depends(get_current_user)):
 async def logout_others(current_user: User = Depends(get_current_user)):
     """تسجيل الخروج من جميع الأجهزة الأخرى"""
     access_token = create_access_token(data={"sub": current_user.id})
+    await db.users.update_one({"id": current_user.id}, {"$set": {"current_session_token": access_token}})
     return {
         "message": "تم تسجيل الخروج من الأجهزة الأخرى بنجاح",
         "access_token": access_token
@@ -2031,7 +2072,7 @@ async def dashboard_init_all(
                 {"$facet": {
                     "total": [{"$count": "count"}],
                     "fixed": [{"$match": {"status": "تم الإصلاح"}}, {"$count": "count"}],
-                    "asphalt_remaining": [{"$match": {"$or": [{"status": "بانتظار الأسفلت"}, {"status": "تم الإصلاح-ومتبقي الأسفلت"}]}}, {"$count": "count"}],
+                    "asphalt_remaining": [{"$match": {"$or": [{"status": "بانتظار الأسفلت"}, {"status": {"$regex": ".*متبقي.*[اأإ]سفلت.*", "$options": "i"}}]}}, {"$count": "count"}],
                     "by_type": [{"$group": {"_id": "$report_type", "count": {"$sum": 1}}}],
                     "asphalt_reports": [
                         {"$match": {"report_type": {"$in": ["أسفلت", "اسفلت", "إسفلت", "asphalt", "Asphalt"]}}},
@@ -2088,10 +2129,11 @@ async def dashboard_init_all(
             sewage_total = await db.sewage_connections.count_documents(conn_q)
 
             # Project cards labels
-            cards_docs = await db.project_cards.find(
+            project_cards_doc = await db.project_cards.find_one(
                 {"project": {"$regex": project_name.replace(" ", ".*"), "$options": "i"}},
-                {"_id": 0, "label": 1, "value_key": 1, "color": 1, "icon": 1}
-            ).to_list(50)
+                {"_id": 0, "cards": 1}
+            )
+            cards_docs = project_cards_doc.get("cards", []) if project_cards_doc else []
 
             return project_name, {
                 "total": total_reports + water_total + sewage_total,
@@ -2353,7 +2395,7 @@ class UserUpdate(BaseModel):
     governorates: Optional[List[str]] = None  # تحديث المحافظات
     projects: Optional[List[str]] = None  # تحديث المشاريع
     permissions: Optional[List[str]] = None  # تحديث الصلاحيات
-
+    allowed_chat_users: Optional[List[str]] = None  # تحديث صلاحيات التحدث الاستثنائية
 # API لجلب قائمة الصلاحيات المتاحة
 @api_router.get("/permissions")
 async def get_all_permissions(current_user: User = Depends(get_current_user)):
@@ -2587,6 +2629,10 @@ async def update_user(
                     raise HTTPException(status_code=403, detail=f"لا يمكنك إعطاء صلاحية غير متاحة لك")
             update_data["permissions"] = user_update.permissions
     
+    # تحديث تصاريح المحادثة الاستثنائية (للأدمن فقط)
+    if user_update.allowed_chat_users is not None and is_admin:
+        update_data["allowed_chat_users"] = user_update.allowed_chat_users
+
     # تنفيذ التحديث
     if update_data:
         await db.users.update_one({"id": user_id}, {"$set": update_data})
@@ -2800,7 +2846,7 @@ async def create_report(
         "report_date": None,
         "license_number": license_number,
         "report_type": report_type,
-        "status": status,
+        "status": normalize_asphalt_status(status),
         "governorate": governorate,
         "project": project,
         "depth_meters": depth_meters,
@@ -3011,7 +3057,7 @@ async def get_reports(
         query["status"] = "تم الإصلاح"
     elif license_status == 'status_asphalt':
         # تم الإصلاح - ومتبقي الأسفلت
-        query["status"] = "تم الإصلاح-ومتبقي الأسفلت"
+        query["status"] = {"$in": [_ASPHALT_CANONICAL, "بانتظار الأسفلت"]}
     elif license_status == 'status_in_progress':
         # قيد المعالجة - بلاغات لم تغلق بعد
         query["wfm_closed"] = {"$ne": True}
@@ -3598,7 +3644,7 @@ async def get_reports_stats(
                 'asphalt_remaining': [
                     {'$match': {'$or': [
                         {'status': 'بانتظار الأسفلت'},
-                        {'status': 'تم الإصلاح-ومتبقي الأسفلت'}
+                        {'status': {'$regex': '.*متبقي.*[اأإ]سفلت.*', '$options': 'i'}}
                     ]}},
                     {'$count': 'count'}
                 ],
@@ -4950,58 +4996,87 @@ async def mark_all_reports_as_seen(current_user: User = Depends(get_current_user
     تحديد جميع البلاغات والتوصيلات الجديدة كـ 'تمت رؤيتها' للمستخدم الحالي
     """
     try:
-        query = {
+        report_projects = get_projects_with_permission(current_user, "reports_notifications")
+        water_projects = list(set(get_projects_with_permission(current_user, "water_connections") + report_projects))
+        sewage_projects = list(set(get_projects_with_permission(current_user, "sewage_connections") + report_projects))
+        
+        governorates = current_user.governorates or []
+        is_admin = current_user.role == "admin"
+        
+        # Reports
+        rq = {
             "is_deleted": {"$ne": True},
-            "$or": [
-                {"seen_by": {"$exists": False}},
-                {"seen_by": {"$ne": current_user.id}}
+            "$and": [
+                {"$or": [
+                    {"seen_by": {"$exists": False}},
+                    {"seen_by": {"$ne": current_user.id}}
+                ]}
             ]
         }
-        
-        projects = current_user.projects or []
-        
-        # الفلترة تعتمد على المشاريع فقط - المشروع هو الفيصل
-        if current_user.role == "admin":
-            # Admin يرى جميع البلاغات
-            pass
-        elif len(projects) > 0:
-            # المستخدم لديه مشاريع محددة - يرى بلاغات مشاريعه فقط
-            expanded_projects = []
-            for p in projects:
-                expanded_projects.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
-            query["project"] = {"$in": expanded_projects}
-            
-            governorates = current_user.governorates or []
+        if not is_admin:
+            if report_projects:
+                expanded_reports = []
+                for p in report_projects:
+                    expanded_reports.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                rq["project"] = {"$in": expanded_reports}
             if governorates:
                 expanded_govs = []
                 for g in governorates:
                     clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
                     expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                rq["governorate"] = {"$in": expanded_govs}
+        
+        result_reports = await db.reports.update_many(rq, {"$addToSet": {"seen_by": current_user.id}})
+        
+        # Water
+        wq = {
+            "is_deleted": {"$ne": True},
+            "$and": [
+                {"$or": [
+                    {"seen_by": {"$exists": False}},
+                    {"seen_by": {"$ne": current_user.id}}
+                ]}
+            ]
+        }
+        if not is_admin:
+            if water_projects:
+                expanded_water = []
+                for p in water_projects:
+                    expanded_water.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                wq["project"] = {"$in": expanded_water}
+            if governorates:
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                wq["area"] = {"$in": expanded_govs}
                 
-                # We will apply this general query for all collections,
-                # if the collection uses "area" instead of "governorate", we might need two queries, 
-                # but to be safe and simple, let's use an $or
-                query["$or"] = [{"governorate": {"$in": expanded_govs}}, {"area": {"$in": expanded_govs}}, {"governorate": {"$exists": False}}, {"area": {"$exists": False}}]
-        else:
-            # المستخدم ليس لديه مشاريع - يرى بلاغاته فقط
-            pass  # Removed created_by filter so they can see all if they have no projects assigned but somehow reach here
+        result_water = await db.water_connections.update_many(wq, {"$addToSet": {"seen_by": current_user.id}})
         
-        result_reports = await db.reports.update_many(
-            query,
-            {"$addToSet": {"seen_by": current_user.id}}
-        )
-        
-        # تحديث توصيلات المياه
-        result_water = await db.water_connections.update_many(
-            query,
-            {"$addToSet": {"seen_by": current_user.id}}
-        )
-        
-        # تحديث توصيلات الصرف
-        result_sewage = await db.sewage_connections.update_many(
-            query,
-            {"$addToSet": {"seen_by": current_user.id}}
-        )
+        # Sewage
+        sq = {
+            "is_deleted": {"$ne": True},
+            "$and": [
+                {"$or": [
+                    {"seen_by": {"$exists": False}},
+                    {"seen_by": {"$ne": current_user.id}}
+                ]}
+            ]
+        }
+        if not is_admin:
+            if sewage_projects:
+                expanded_sewage = []
+                for p in sewage_projects:
+                    expanded_sewage.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                sq["project"] = {"$in": expanded_sewage}
+            if governorates:
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                sq["area"] = {"$in": expanded_govs}
+                
+        result_sewage = await db.sewage_connections.update_many(sq, {"$addToSet": {"seen_by": current_user.id}})
         
         total_modified = result_reports.modified_count + result_water.modified_count + result_sewage.modified_count
         return {"success": True, "count": total_modified, "message": f"تم تحديد {total_modified} عنصر كمرئي"}
@@ -5009,6 +5084,87 @@ async def mark_all_reports_as_seen(current_user: User = Depends(get_current_user
     except Exception as e:
         logger.error(f"Error marking all reports as seen: {str(e)}")
         raise HTTPException(status_code=500, detail="فشل في تحديث حالة الإشعارات")
+
+
+@api_router.delete("/reports/notifications/clear-all")
+async def clear_all_read_notifications(current_user: User = Depends(get_current_user)):
+    """
+    حذف جميع الإشعارات (المقروءة فقط) للمستخدم
+    """
+    try:
+        report_projects = get_projects_with_permission(current_user, "reports_notifications")
+        water_projects = list(set(get_projects_with_permission(current_user, "water_connections") + report_projects))
+        sewage_projects = list(set(get_projects_with_permission(current_user, "sewage_connections") + report_projects))
+        
+        governorates = current_user.governorates or []
+        is_admin = current_user.role == "admin"
+        
+        # Reports
+        rq = {
+            "is_deleted": {"$ne": True},
+            "seen_by": current_user.id
+        }
+        if not is_admin:
+            if report_projects:
+                expanded_reports = []
+                for p in report_projects:
+                    expanded_reports.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                rq["project"] = {"$in": expanded_reports}
+            if governorates:
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                rq["governorate"] = {"$in": expanded_govs}
+        
+        result_reports = await db.reports.update_many(rq, {"$addToSet": {"deleted_notifications": current_user.id}})
+        
+        # Water
+        wq = {
+            "is_deleted": {"$ne": True},
+            "seen_by": current_user.id
+        }
+        if not is_admin:
+            if water_projects:
+                expanded_water = []
+                for p in water_projects:
+                    expanded_water.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                wq["project"] = {"$in": expanded_water}
+            if governorates:
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                wq["area"] = {"$in": expanded_govs}
+                
+        result_water = await db.water_connections.update_many(wq, {"$addToSet": {"deleted_notifications": current_user.id}})
+        
+        # Sewage
+        sq = {
+            "is_deleted": {"$ne": True},
+            "seen_by": current_user.id
+        }
+        if not is_admin:
+            if sewage_projects:
+                expanded_sewage = []
+                for p in sewage_projects:
+                    expanded_sewage.extend([p, f"مشروع {p}", p.replace("مشروع ", "").strip()])
+                sq["project"] = {"$in": expanded_sewage}
+            if governorates:
+                expanded_govs = []
+                for g in governorates:
+                    clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+                    expanded_govs.extend([g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}"])
+                sq["area"] = {"$in": expanded_govs}
+                
+        result_sewage = await db.sewage_connections.update_many(sq, {"$addToSet": {"deleted_notifications": current_user.id}})
+        
+        total_modified = result_reports.modified_count + result_water.modified_count + result_sewage.modified_count
+        return {"success": True, "count": total_modified, "message": f"تم حذف {total_modified} إشعار"}
+        
+    except Exception as e:
+        logger.error(f"Error clearing notifications: {str(e)}")
+        raise HTTPException(status_code=500, detail="فشل في حذف الإشعارات")
 
 
 @api_router.delete("/reports/notifications/{report_id}")
@@ -5025,57 +5181,22 @@ async def delete_report_notification(report_id: str, current_user: User = Depend
         )
         
         if result.modified_count == 0:
-            # ربما البلاغ غير موجود أو المستخدم موجود بالفعل في القائمة
-            return {"success": True, "message": "تم حذف الإشعار"}
+            result = await db.water_connections.update_one(
+                {"id": report_id},
+                {"$addToSet": {"deleted_notifications": current_user.id}}
+            )
+            
+        if result.modified_count == 0:
+            result = await db.sewage_connections.update_one(
+                {"id": report_id},
+                {"$addToSet": {"deleted_notifications": current_user.id}}
+            )
         
         return {"success": True, "message": "تم حذف الإشعار"}
         
     except Exception as e:
         logger.error(f"Error deleting notification: {str(e)}")
         raise HTTPException(status_code=500, detail="فشل في حذف الإشعار")
-
-
-@api_router.delete("/reports/notifications/clear-all")
-async def clear_all_read_notifications(current_user: User = Depends(get_current_user)):
-    """
-    حذف جميع الإشعارات (المقروءة وغير المقروءة) للمستخدم
-    هذا يضيف المستخدم لقائمة deleted_notifications لجميع البلاغات
-    """
-    try:
-        # جلب مشاريع المستخدم
-        projects = current_user.projects or []
-        
-        # بناء الـ query حسب صلاحيات المستخدم
-        if current_user.role == "admin":
-            # Admin: حذف جميع الإشعارات
-            query = {"is_deleted": {"$ne": True}}
-        elif len(projects) > 0:
-            # المستخدم لديه مشاريع: حذف إشعارات مشاريعه
-            query = {"is_deleted": {"$ne": True}, "project": {"$in": projects}}
-        else:
-            return {"success": True, "count": 0, "message": "لا توجد إشعارات للحذف"}
-        
-        # إضافة المستخدم لقائمة deleted_notifications
-        result = await db.reports.update_many(
-            query,
-            {"$addToSet": {"deleted_notifications": current_user.id}}
-        )
-        
-        # نفس الشيء للتوصيلات
-        await db.water_connections.update_many(
-            query,
-            {"$addToSet": {"deleted_notifications": current_user.id}}
-        )
-        await db.sewage_connections.update_many(
-            query,
-            {"$addToSet": {"deleted_notifications": current_user.id}}
-        )
-        
-        return {"success": True, "count": result.modified_count, "message": f"تم حذف {result.modified_count} إشعار"}
-        
-    except Exception as e:
-        logger.error(f"Error clearing notifications: {str(e)}")
-        raise HTTPException(status_code=500, detail="فشل في حذف الإشعارات")
 
 
 # ============= إشعارات التوصيلات =============
@@ -5146,6 +5267,7 @@ async def get_consultant_notes(
     limit: int = Query(10, ge=1),
     search: str = Query(None),
     status_filter: str = Query(None),
+    count_only: Optional[bool] = False,
     current_user: User = Depends(get_current_user)
 ):
     user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
@@ -5258,6 +5380,121 @@ async def toggle_consultant_note_processed(report_id: str, current_user: User = 
     await db.reports.update_one({"id": report_id}, {"$set": update_data})
     return {"success": True, "consultant_note_processed": new_status, "consultant_note_processed_date": update_data.get("consultant_note_processed_date", "")}
 
+
+@api_router.get("/reports/report-notes")
+async def get_report_notes(
+    project: str = Query(None),
+    governorate: str = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1),
+    search: str = Query(None),
+    count_only: Optional[bool] = False,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    role = user_doc.get("role")
+    
+    if role != "admin":
+        has_perm = False
+        if "report_notes" in user_perms:
+            has_perm = True
+        else:
+            for p in pp.values():
+                if "report_notes" in p:
+                    has_perm = True
+                    break
+        if not has_perm:
+            raise HTTPException(status_code=403, detail="Forbidden")
+            
+    query = {
+        "notes": {"$exists": True, "$ne": "", "$type": "string"},
+        "is_deleted": {"$ne": True}
+    }
+    
+
+    user_projs = user_doc.get("projects", [])
+    user_govs = user_doc.get("governorates", [])
+    
+    and_conditions = []
+    
+    if role != "admin":
+        if not project and user_projs:
+            proj_filter = get_loose_in_query(user_projs, "project")
+            if proj_filter: and_conditions.append(proj_filter)
+        elif project:
+            proj_filter = get_flexible_in_query([project], "project")
+            if proj_filter: and_conditions.append(proj_filter)
+            
+        if not governorate and user_govs:
+            gov_filter = get_flexible_in_query(user_govs, "governorate")
+            if gov_filter: and_conditions.append(gov_filter)
+        elif governorate:
+            gov_filter = get_flexible_in_query([governorate], "governorate")
+            if gov_filter: and_conditions.append(gov_filter)
+            
+    else:
+        if project:
+            proj_filter = get_flexible_in_query([project], "project")
+            if proj_filter: and_conditions.append(proj_filter)
+        if governorate:
+            gov_filter = get_flexible_in_query([governorate], "governorate")
+            if gov_filter: and_conditions.append(gov_filter)
+            
+    if search:
+        search_clean = search.strip()
+        and_conditions.append({
+            "$or": [
+                {"report_number": {"$regex": search_clean, "$options": "i"}},
+                {"id": {"$regex": search_clean, "$options": "i"}}
+            ]
+        })
+        
+    if and_conditions:
+        query["$and"] = and_conditions
+
+    skip = (page - 1) * limit
+    total = await db.reports.count_documents(query)
+    
+    reports = await db.reports.find(
+        query, 
+        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "notes": 1, "report_note_processed": 1, "report_note_processed_date": 1, "created_at": 1, "status": 1}
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    
+    return {"reports": reports, "total": total, "page": page, "limit": limit}
+
+class ReportNoteUpdate(BaseModel):
+    notes: str
+
+@api_router.put("/reports/{report_id}/report-note")
+async def edit_report_note(report_id: str, payload: ReportNoteUpdate, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    user_role = getattr(current_user, "role", current_user.get("role") if isinstance(current_user, dict) else None)
+    can_create = getattr(current_user, "can_create_subusers", current_user.get("can_create_subusers") if isinstance(current_user, dict) else False)
+    
+    if user_role != "admin" and not can_create:
+        raise HTTPException(status_code=403, detail="Only Level 1 and Level 2 can edit report notes")
+        
+    await db.reports.update_one({"id": report_id}, {"$set": {"notes": payload.notes}})
+    return {"success": True, "notes": payload.notes}
+
+@api_router.delete("/reports/{report_id}/report-note")
+async def delete_report_note(report_id: str, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    user_role = getattr(current_user, "role", current_user.get("role") if isinstance(current_user, dict) else None)
+    can_create = getattr(current_user, "can_create_subusers", current_user.get("can_create_subusers") if isinstance(current_user, dict) else False)
+    
+    if user_role != "admin" and not can_create:
+        raise HTTPException(status_code=403, detail="Only Level 1 and Level 2 can delete report notes")
+        
+    # User requested to clear the note from the text box, not delete the report
+    await db.reports.update_one({"id": report_id}, {"$set": {"notes": ""}})
+    return {"success": True}
 
 class ConsultantNoteReply(BaseModel):
     reply: str
@@ -5444,7 +5681,7 @@ async def update_report(
     if report_type is not None:
         update_data["report_type"] = report_type
     if status is not None:
-        update_data["status"] = status
+        update_data["status"] = normalize_asphalt_status(status)
     if governorate is not None:
         update_data["governorate"] = governorate
     if project is not None:
@@ -8050,7 +8287,7 @@ async def export_selected_reports_excel(
         "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة",
         "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق (سم)", "القطر (ملم)",
         "اسم المقاول", "خط العرض", "خط الطول", "رخصة أسفلت",
-        "الملاحظات", "تاريخ الاستلام", "تاريخ الإغلاق", "عدد الصور", "مراقب الاستشاري"
+        "الملاحظات", "تاريخ الاستلام", "تاريخ المباشرة", "تاريخ الإغلاق", "عدد الصور", "مراقب الاستشاري"
     ]
     
     # تنسيق الرأس
@@ -8074,13 +8311,25 @@ async def export_selected_reports_excel(
     for row_idx, report in enumerate(reports, 2):
         created_at = report.get('created_at')
         if isinstance(created_at, str):
-            created_at = datetime.fromisoformat(created_at)
+            created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
         elif not isinstance(created_at, datetime):
             created_at = None
         
+        start_date = report.get('start_date')
+        if isinstance(start_date, str):
+            try:
+                start_date = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            except:
+                start_date = None
+        elif not isinstance(start_date, datetime):
+            start_date = None
+            
         closed_at = report.get('closed_at')
         if isinstance(closed_at, str):
-            closed_at = datetime.fromisoformat(closed_at)
+            try:
+                closed_at = datetime.fromisoformat(closed_at.replace('Z', '+00:00'))
+            except:
+                closed_at = None
         elif not isinstance(closed_at, datetime):
             closed_at = None
         
@@ -8111,6 +8360,7 @@ async def export_selected_reports_excel(
             'نعم' if report.get('asphalt_license_issued') else 'لا',
             report.get('notes', ''),
             created_at.strftime('%Y-%m-%d %H:%M') if created_at else '',
+            start_date.strftime('%Y-%m-%d') if start_date else '',
             closed_at.strftime('%Y-%m-%d %H:%M') if closed_at else '',
             images_count,
             report.get('created_by_name', '')
@@ -8625,74 +8875,88 @@ async def export_72h_reports_excel(
     current_user: User = Depends(get_current_user)
 ):
     """تصدير بلاغات آخر 24 ساعة إلى Excel"""
-    from datetime import timedelta
+    from datetime import timedelta, timezone
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     import io
     
-    # حساب الوقت قبل 24 ساعة بالضبط (بدون timezone للمقارنة البسيطة)
-    seventy_two_hours_ago = datetime.utcnow() - timedelta(hours=24)
+    # حساب الوقت قبل 24 ساعة
+    seventy_two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
     
-    # بناء الاستعلام الأساسي
-    query = {"is_deleted": {"$ne": True}}
+    # بناء الاستعلام الأساسي (باستخدام قاعدة بيانات Mongo للفلترة الزمنية مباشرة)
+    query = {
+        "is_deleted": {"$ne": True},
+        "$or": [
+            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
+            {"added_at": {"$gte": seventy_two_hours_ago}}
+        ]
+    }
     
-    # إضافة فلاتر المشروع والمحافظة
+    # إضافة فلاتر المشروع والمحافظة بالبحث المرن
     if project:
-        query["project"] = project
-    if governorate:
-        query["governorate"] = governorate
+        query["project"] = get_flexible_project_query(project)
+    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+        query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
     
-    # التصفية الهرمية حسب الصلاحيات
+    # التصفية الهرمية حسب الصلاحيات (نفس منطق العرض)
+    skip_query = False
     if current_user.role != "admin":
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
+        
+        # فلترة المشاريع
         if current_user.projects:
-            if project and project not in current_user.projects:
-                pass
+            has_permission = False
+            for up in current_user.projects:
+                up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                proj_keywords = [k for k in (project or "").replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
+                if project and (any(k in project for k in up_keywords) or any(k in up for k in proj_keywords)):
+                    has_permission = True
+                    break
+            if project and not has_permission:
+                skip_query = True
             elif not project:
-                query["project"] = {"$in": current_user.projects}
+                query.update(get_flexible_in_query(current_user.projects, "project"))
+
+        # فلترة المستخدمين والمحافظات
+        permissions = getattr(current_user, 'permissions', [])
+        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
+        has_reports_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
         
-        if current_user.governorates:
-            if governorate and governorate not in current_user.governorates:
-                pass
-            elif not governorate:
-                query["governorate"] = {"$in": current_user.governorates}
-                
-        # إذا لم يكن يملك صلاحية إنشاء مستخدمين (المستوى الثالث)، يعرض بلاغاته فقط
-        if not current_user.can_create_subusers:
-            query["created_by"] = {"$in": [current_user.id, current_user.username]}
+        if not getattr(current_user, 'can_create_subusers', False) and not has_reports_view and not has_reports_review:
+            # مستوى ثالث
+            admin_ids = [current_user.id, current_user.username]
+            admins_cursor = db.users.find({"$or": [{"role": "admin"}, {"can_create_subusers": True}]}, {"id": 1, "username": 1})
+            async for adm in admins_cursor:
+                if adm.get("id"): admin_ids.append(adm["id"])
+                if adm.get("username"): admin_ids.append(adm["username"])
+            admin_ids.append("مكتب بيت الخبرة للاستشارات الهندسية")
+            query['created_by'] = {'$in': list(set(admin_ids))}
+            
+            if not has_all_govs and user_governorates:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
+                        skip_query = True
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
         else:
-            # إذا كان مستوى ثاني، نجمع البلاغات الخاصة به وبمستخدميه
-            allowed_user_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            query["created_by"] = {"$in": allowed_user_ids}
+            # مستوى ثاني وما فوق
+            if not has_all_govs and user_governorates:
+                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
+                    norm_req = normalize_arabic(governorate)
+                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
+                        skip_query = True
+                else:
+                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
+                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
     
-    # جلب البلاغات
-    all_reports = await db.reports.find(query, {"_id": 0, "images": 0}).sort("created_at", -1).to_list(1000)
-    
-    # فلترة البلاغات حسب 72 ساعة بشكل يدوي (لدعم أنواع التخزين المختلفة)
-    reports = []
-    for report in all_reports:
-        created_at = report.get('created_at')
-        added_at = report.get('added_at')
-        
-        # تحويل التاريخ إلى datetime للمقارنة (بدون timezone)
-        report_date = None
-        
-        if isinstance(created_at, datetime):
-            # إزالة timezone إذا وجد
-            report_date = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
-        elif isinstance(created_at, str):
-            try:
-                # إزالة الـ timezone info للمقارنة البسيطة
-                clean_date = created_at.replace('+00:00', '').replace('Z', '').split('.')[0]
-                report_date = datetime.fromisoformat(clean_date)
-            except:
-                pass
-        
-        if not report_date and isinstance(added_at, datetime):
-            report_date = added_at.replace(tzinfo=None) if added_at.tzinfo else added_at
-        
-        # التحقق من أن التاريخ ضمن 72 ساعة
-        if report_date and report_date >= seventy_two_hours_ago:
-            reports.append(report)
+    # جلب البلاغات النهائية
+    if skip_query:
+        reports = []
+    else:
+        reports = await db.reports.find(query, {"_id": 0, "images": 0}).sort("created_at", -1).to_list(1000)
     
     # إنشاء ملف Excel
     wb = Workbook()
@@ -8853,7 +9117,7 @@ async def export_reports_excel(
     if license_status == 'status_fixed':
         query["status"] = "تم الإصلاح"
     elif license_status == 'status_asphalt':
-        query["status"] = "تم الإصلاح-ومتبقي الأسفلت"
+        query["status"] = {"$in": [_ASPHALT_CANONICAL, "بانتظار الأسفلت"]}
     elif license_status == 'status_in_progress':
         query["wfm_closed"] = {"$ne": True}
     elif license_status == 'status_wfm_closed':
@@ -9037,7 +9301,7 @@ async def export_reports_excel(
         "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة",
         "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق (سم)", "القطر (ملم)",
         "اسم المقاول", "خط العرض", "خط الطول", "رخصة أسفلت",
-        "الملاحظات", "تاريخ الاستلام", "تاريخ الإغلاق", "عدد الصور", "مراقب الاستشاري"
+        "الملاحظات", "تاريخ الاستلام", "تاريخ المباشرة", "تاريخ الإغلاق", "عدد الصور", "مراقب الاستشاري"
     ]
     
     # تنسيق الرأس (السطر الثاني)
@@ -9062,13 +9326,25 @@ async def export_reports_excel(
     for row_idx, report in enumerate(reports, 3):
         created_at = report.get('created_at')
         if isinstance(created_at, str):
-            created_at = datetime.fromisoformat(created_at)
+            created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
         elif not isinstance(created_at, datetime):
             created_at = None
         
+        start_date = report.get('start_date')
+        if isinstance(start_date, str):
+            try:
+                start_date = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            except:
+                start_date = None
+        elif not isinstance(start_date, datetime):
+            start_date = None
+            
         closed_at = report.get('closed_at')
         if isinstance(closed_at, str):
-            closed_at = datetime.fromisoformat(closed_at)
+            try:
+                closed_at = datetime.fromisoformat(closed_at.replace('Z', '+00:00'))
+            except:
+                closed_at = None
         elif not isinstance(closed_at, datetime):
             closed_at = None
         
@@ -9099,6 +9375,7 @@ async def export_reports_excel(
             'نعم' if report.get('asphalt_license_issued') else 'لا',
             report.get('notes', ''),  # الملاحظات
             created_at.strftime('%Y-%m-%d %H:%M') if created_at else '',
+            start_date.strftime('%Y-%m-%d') if start_date else '',
             closed_at.strftime('%Y-%m-%d %H:%M') if closed_at else '',
             images_count,
             report.get('created_by_name', '')
@@ -10350,7 +10627,7 @@ async def export_reports_pdf(
     if license_status == 'status_fixed':
         query["status"] = "تم الإصلاح"
     elif license_status == 'status_asphalt':
-        query["status"] = "تم الإصلاح-ومتبقي الأسفلت"
+        query["status"] = {"$in": [_ASPHALT_CANONICAL, "بانتظار الأسفلت"]}
     elif license_status == 'status_in_progress':
         query["wfm_closed"] = {"$ne": True}
     elif license_status == 'status_wfm_closed':
@@ -15198,6 +15475,8 @@ async def shutdown_db_client():
 async def get_safety_reports(
     project: Optional[str] = None,
     governorate: Optional[str] = None,
+    count_only: Optional[bool] = False,
+    status_filter: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
     user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
@@ -15247,7 +15526,18 @@ async def get_safety_reports(
                 
     if and_clauses:
         query["$and"] = and_clauses
-    records = await db.safety_reports.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    
+    if status_filter:
+        if status_filter == 'قيد المراجعة':
+            query['$or'] = [{'status': 'قيد المراجعة'}, {'status': {'$exists': False}}, {'status': None}]
+        else:
+            query['status'] = status_filter
+            
+    if count_only:
+        c = await db.safety_reports.count_documents(query)
+        return {"count": c}
+        
+    records = await db.safety_reports.find(query, {"_id": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -15291,7 +15581,7 @@ async def update_safety_report(report_id: str, request: Request, current_user: U
     if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تقارير السلامة")
     body = await request.json()
-    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "image", "images"]}
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "consultant_note", "consultant_reply", "image", "images", "report_note_processed", "status"]}
     
     if "status" in body:
         new_status = body.get("status")
@@ -15353,6 +15643,8 @@ async def delete_safety_report(report_id: str, current_user: User = Depends(get_
 async def get_quality_reports(
     project: Optional[str] = None,
     governorate: Optional[str] = None,
+    count_only: Optional[bool] = False,
+    status_filter: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
     user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
@@ -15402,7 +15694,18 @@ async def get_quality_reports(
                 
     if and_clauses:
         query["$and"] = and_clauses
-    records = await db.quality_reports.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    
+    if status_filter:
+        if status_filter == 'قيد المراجعة':
+            query['$or'] = [{'status': 'قيد المراجعة'}, {'status': {'$exists': False}}, {'status': None}]
+        else:
+            query['status'] = status_filter
+            
+    if count_only:
+        c = await db.quality_reports.count_documents(query)
+        return {"count": c}
+        
+    records = await db.quality_reports.find(query, {"_id": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -15527,7 +15830,9 @@ async def delete_quality_report(report_id: str, current_user: User = Depends(get
 
 # ========== Warehouse Visits API ==========
 @api_router.get("/warehouse-visits")
-async def get_warehouse_visits(current_user: User = Depends(get_current_user)):
+async def get_warehouse_visits(count_only: Optional[bool] = False,
+    status_filter: Optional[str] = None,
+    current_user: User = Depends(get_current_user)):
     user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
     user_perms = set(user_doc.get("permissions", []))
     pp = user_doc.get("project_permissions", {})
@@ -15545,7 +15850,7 @@ async def get_warehouse_visits(current_user: User = Depends(get_current_user)):
             if proj_query:
                 query.update(proj_query)
                 
-    records = await db.warehouse_visits.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    records = await db.warehouse_visits.find(query, {"_id": 0}).sort("date", -1).to_list(100)
     return records
 
 @api_router.post("/warehouse-visits")
@@ -15646,6 +15951,8 @@ async def get_business_reports(
     governorate: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    count_only: Optional[bool] = False,
+    status_filter: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
     user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
@@ -15707,7 +16014,7 @@ async def get_business_reports(
     if date_to:
         query["date_to"] = {"$lte": date_to}
         
-    records = await db.business_reports.find(query, {"_id": 0}).sort("date_from", -1).to_list(500)
+    records = await db.business_reports.find(query, {"_id": 0}).sort("date_from", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -15838,6 +16145,249 @@ async def permanent_safety_reports_trash(report_id: str, current_user: User = De
         raise HTTPException(status_code=403, detail="Forbidden")
     await db.safety_reports.delete_one({"id": report_id, "is_deleted": True})
     return {"message": "Deleted"}
+
+
+# ========== Work Permits API ==========
+@api_router.get("/work-permits")
+async def get_work_permits(
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
+        return []
+    query = {"is_deleted": {"$ne": True}}
+    and_clauses = []
+    if user_doc.get("role") != "admin":
+        user_govs = user_doc.get("governorates", [])
+        user_projs = user_doc.get("projects", [])
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                and_clauses.append(gov_query)
+        elif user_govs:
+            gov_query = get_flexible_in_query(user_govs, "governorate")
+            if gov_query:
+                and_clauses.append(gov_query)
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                and_clauses.append(proj_query)
+        elif user_projs:
+            proj_query = get_loose_in_query(user_projs, "project")
+            if proj_query:
+                and_clauses.append(proj_query)
+    else:
+        if project:
+            proj_query = get_flexible_in_query([project], "project")
+            if proj_query:
+                and_clauses.append(proj_query)
+        if governorate:
+            gov_query = get_flexible_in_query([governorate], "governorate")
+            if gov_query:
+                and_clauses.append(gov_query)
+    if and_clauses:
+        query["$and"] = and_clauses
+    records = await db.work_permits.find(query, {"_id": 0, "image": 0}).sort("date", -1).to_list(100)
+    for r in records:
+        if not r.get("status"):
+            r["status"] = "قيد المراجعة"
+    return records
+
+
+@api_router.get("/work-permits/{permit_id}")
+async def get_work_permit(permit_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    record = await db.work_permits.find_one({"id": permit_id, "is_deleted": {"$ne": True}}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not record.get("status"):
+        record["status"] = "قيد المراجعة"
+    return record
+
+
+@api_router.post("/work-permits")
+async def create_work_permit(request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية إضافة تصاريح العمل")
+    body = await request.json()
+    record = {
+        "id": str(uuid.uuid4()),
+        "date": body.get("date", ""),
+        "project": body.get("project", ""),
+        "governorate": body.get("governorate", ""),
+        "notes": body.get("notes", ""),
+        "image": body.get("image", ""),
+        "images": body.get("images", []),
+        "status": "قيد المراجعة",
+        "created_by": user_doc.get("username", ""),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.work_permits.insert_one(record)
+    record.pop("_id", None)
+    return record
+
+
+@api_router.put("/work-permits/{permit_id}")
+async def update_work_permit(permit_id: str, request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تصاريح العمل")
+    body = await request.json()
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "image", "status"]}
+    update_data["updated_at"] = datetime.utcnow().isoformat()
+    await db.work_permits.update_one({"id": permit_id}, {"$set": update_data})
+    return {"message": "تم التحديث بنجاح"}
+
+
+@api_router.delete("/work-permits/{permit_id}")
+async def delete_work_permit(permit_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية حذف تصاريح العمل")
+    result = await db.work_permits.update_one(
+        {"id": permit_id},
+        {"$set": {
+            "is_deleted": True,
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": user_doc.get("username", "")
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="غير موجود")
+    return {"message": "تم الحذف بنجاح"}
+
+
+# ============= نقاط نهاية المخالفات =============
+
+@api_router.get("/violations")
+async def get_violations(
+    type: Optional[str] = "safety",
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    # صلاحية الوصول: safety_reports أو business_reports
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms and "business_reports" not in user_perms:
+        return []
+    query = {"is_deleted": {"$ne": True}}
+    if type == "safety":
+        query["type"] = {"$in": ["safety", None, ""]}
+    else:
+        query["type"] = type
+    and_clauses = []
+    if user_doc.get("role") != "admin":
+        user_govs = user_doc.get("governorates", [])
+        user_projs = user_doc.get("projects", [])
+        if governorate:
+            gq = get_flexible_in_query([governorate], "governorate")
+            if gq: and_clauses.append(gq)
+        elif user_govs:
+            gq = get_flexible_in_query(user_govs, "governorate")
+            if gq: and_clauses.append(gq)
+        if project:
+            pq = get_flexible_in_query([project], "project")
+            if pq: and_clauses.append(pq)
+        elif user_projs:
+            pq = get_loose_in_query(user_projs, "project")
+            if pq: and_clauses.append(pq)
+    else:
+        if project:
+            pq = get_flexible_in_query([project], "project")
+            if pq: and_clauses.append(pq)
+        if governorate:
+            gq = get_flexible_in_query([governorate], "governorate")
+            if gq: and_clauses.append(gq)
+    if and_clauses:
+        query["$and"] = and_clauses
+    records = await db.violations.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    return records
+
+
+@api_router.post("/violations")
+async def create_violation(request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms and "business_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية إضافة مخالفات")
+    body = await request.json()
+    record = {
+        "id": str(uuid.uuid4()),
+        "date": body.get("date", ""),
+        "project": body.get("project", ""),
+        "governorate": body.get("governorate", ""),
+        "violation_type": body.get("violation_type", ""),
+        "type": body.get("type", "safety"),
+        "notes": body.get("notes", ""),
+        "images": body.get("images", []),
+        "created_by": user_doc.get("username", ""),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.violations.insert_one(record)
+    record.pop("_id", None)
+    return record
+
+
+@api_router.put("/violations/{violation_id}")
+async def update_violation(violation_id: str, request: Request, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports_edit" not in user_perms and "business_reports_edit" not in user_perms:
+        raise HTTPException(status_code=403, detail="غير مصرح بالتعديل")
+    body = await request.json()
+    update_data = {k: v for k, v in body.items() if k not in ["id", "_id", "created_by", "created_at"]}
+    await db.violations.update_one({"id": violation_id}, {"$set": update_data})
+    updated = await db.violations.find_one({"id": violation_id}, {"_id": 0})
+    return updated or {}
+
+
+@api_router.delete("/violations/{violation_id}")
+async def delete_violation(violation_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions") or {}
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports_delete" not in user_perms and "business_reports_delete" not in user_perms:
+        raise HTTPException(status_code=403, detail="غير مصرح بالحذف")
+    await db.violations.delete_one({"id": violation_id})
+    return {"message": "تم الحذف"}
+
 
 @api_router.get("/quality-reports-trash")
 async def get_quality_reports_trash(
@@ -16028,6 +16578,77 @@ async def update_consultant_note(report_id: str, payload: ConsultantNoteUpdate, 
 
 # ============= CHAT ENDPOINTS =============
 
+
+
+@api_router.put("/chat/v2/groups/{group_id}")
+async def update_chat_group(group_id: str, payload: dict, current_user: User = Depends(get_current_user)):
+    group = await db.chat_groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+        
+    # Only creator can update
+    if group.get("created_by") != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to edit this group")
+        
+    update_data = {}
+    if payload.get("name"):
+        update_data["name"] = payload.get("name")
+    if payload.get("members") is not None:
+        members = payload.get("members")
+        if current_user.id not in members:
+            members.append(current_user.id)
+        update_data["members"] = members
+    if payload.get("avatar"):
+        update_data["avatar"] = payload.get("avatar")
+        
+    if update_data:
+        await db.chat_groups.update_one({"id": group_id}, {"$set": update_data})
+        
+    return {"message": "Group updated"}
+
+
+@api_router.delete("/chat/v2/groups/{group_id}")
+async def delete_chat_group(group_id: str, current_user: User = Depends(get_current_user)):
+    group = await db.chat_groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+        
+    # Only creator can delete
+    if group.get("created_by") != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this group")
+        
+    # Delete the group
+    await db.chat_groups.delete_one({"id": group_id})
+    
+    # Optionally delete all messages in this group
+    await db.chat_messages.delete_many({"receiver_id": group_id})
+        
+    return {"message": "Group deleted successfully"}
+
+@api_router.post("/chat/v2/groups")
+async def create_chat_group(payload: dict, current_user: User = Depends(get_current_user)):
+    if not payload.get("name") or not payload.get("members"):
+        raise HTTPException(status_code=400, detail="Name and members are required")
+    
+    group_id = f"group_{str(uuid.uuid4())[:8]}"
+    members = payload.get("members")
+    if current_user.id not in members:
+        members.append(current_user.id)
+        
+    new_group = {
+        "id": group_id,
+        "name": payload.get("name"),
+        "created_by": current_user.id,
+        "members": members,
+        "created_at": datetime.utcnow(),
+        "is_group": True,
+        "avatar": payload.get("avatar")
+    }
+    await db.chat_groups.insert_one(new_group)
+    new_group["_id"] = str(new_group["_id"])
+    new_group["created_at"] = new_group["created_at"].isoformat()
+    return {"message": "Group created", "group": new_group}
+
 @api_router.get("/chat/v2/contacts")
 async def get_chat_contacts(current_user: User = Depends(get_current_user)):
     contacts = []
@@ -16075,6 +16696,23 @@ async def get_chat_contacts(current_user: User = Depends(get_current_user)):
                 else:
                     contacts.append(manager)
             
+    # إضافة الاستثناءات (صلاحيات الدردشة الخاصة الممنوحة من الأدمن)
+    # 1. المستخدمون الذين أضافهم هذا المستخدم في قائمته المسموحة
+    my_allowed_ids = getattr(current_user, 'allowed_chat_users', []) or []
+    if my_allowed_ids:
+        explicit_users = await db.users.find(
+            {"id": {"$in": my_allowed_ids}},
+            {"id": 1, "username": 1, "full_name": 1, "profile_picture": 1, "role": 1, "can_create_subusers": 1}
+        ).to_list(100)
+        contacts.extend(explicit_users)
+        
+    # 2. المستخدمون الذين لديهم هذا المستخدم في قائمتهم المسموحة (تبادل الظهور)
+    users_who_allow_me = await db.users.find(
+        {"allowed_chat_users": current_user.id},
+        {"id": 1, "username": 1, "full_name": 1, "profile_picture": 1, "role": 1, "can_create_subusers": 1}
+    ).to_list(100)
+    contacts.extend(users_who_allow_me)
+
     seen = set()
     unique_contacts = []
     for c in contacts:
@@ -16107,16 +16745,164 @@ async def get_chat_contacts(current_user: User = Depends(get_current_user)):
             
             unique_contacts.append(c)
             
+
+    # Fetch groups
+    groups = await db.chat_groups.find({"members": current_user.id}).to_list(100)
+    for g in groups:
+        g["unread_count"] = 0 # simplified for groups
+        g["full_name"] = g.get("name")
+        g["is_group"] = True
+        
+        last_msg = await db.chat_messages.find_one({
+            "receiver_id": g["id"],
+            "is_deleted": False
+        }, sort=[("created_at", -1)])
+        
+        if last_msg:
+            sender = await db.users.find_one({"id": last_msg["sender_id"]}, {"full_name": 1, "username": 1})
+            sender_name = sender.get("full_name") or sender.get("username") if sender else "Unknown"
+            g["last_message"] = f"{sender_name}: {last_msg.get('text', 'مرفق')}"
+            g["last_message_time"] = last_msg.get("created_at")
+        else:
+            g["last_message"] = "بدأت المجموعة"
+            g["last_message_time"] = g.get("created_at")
+                
+        unique_contacts.append(g)
+
     unique_contacts.sort(key=lambda x: x.get("last_message_time") or datetime.min, reverse=True)
             
     return [{
         "id": c["id"],
         "name": c.get("full_name") or c.get("username"),
-        "avatar": c.get("profile_picture"),
+        "avatar": c.get("avatar") or c.get("profile_picture"),
         "last_message": c.get("last_message"),
         "last_message_time": c.get("last_message_time").isoformat() if isinstance(c.get("last_message_time"), datetime) else c.get("last_message_time"),
-        "unread_count": c.get("unread_count", 0)
+        "unread_count": c.get("unread_count", 0),
+        "is_group": c.get("is_group", False),
+        "members": c.get("members", []),
+        "created_by": c.get("created_by")
     } for c in unique_contacts]
+class LinkUsersRequest(BaseModel):
+    user_ids: List[str]
+
+@api_router.post("/chat/v2/link-users")
+async def link_chat_users(req: LinkUsersRequest, current_user: User = Depends(get_current_user)):
+    """ربط شخصين ببعضهما لتبادل الظهور في الدردشة"""
+    if len(req.user_ids) != 2:
+        raise HTTPException(status_code=400, detail="يجب تحديد مستخدمين اثنين للربط")
+    
+    is_admin = current_user.role == "admin"
+    is_level2 = getattr(current_user, "can_create_subusers", False)
+    
+    if not (is_admin or is_level2):
+        raise HTTPException(status_code=403, detail="غير مصرح لك")
+        
+    u1_id, u2_id = req.user_ids
+    
+    u1 = await db.users.find_one({"id": u1_id})
+    u2 = await db.users.find_one({"id": u2_id})
+    
+    if not u1 or not u2:
+        raise HTTPException(status_code=404, detail="أحد المستخدمين غير موجود")
+        
+    if not is_admin:
+        def can_manage(u):
+            return u["id"] == current_user.id or u.get("created_by") == current_user.id
+            
+        if not (can_manage(u1) and can_manage(u2)):
+            raise HTTPException(status_code=403, detail="يمكنك فقط ربط المستخدمين التابعين لفريقك")
+            
+    if u2_id in u1.get("allowed_chat_users", []):
+        raise HTTPException(status_code=400, detail="المستخدمان مربوطان مسبقاً")
+            
+    await db.users.update_one(
+        {"id": u1_id},
+        {"$addToSet": {"allowed_chat_users": u2_id}}
+    )
+    await db.users.update_one(
+        {"id": u2_id},
+        {"$addToSet": {"allowed_chat_users": u1_id}}
+    )
+    
+    return {"message": "تم ربط المستخدمين بنجاح للدردشة المباشرة"}
+
+@api_router.post("/chat/v2/unlink-users")
+async def unlink_chat_users(req: LinkUsersRequest, current_user: User = Depends(get_current_user)):
+    """إلغاء ربط شخصين في الدردشة"""
+    if len(req.user_ids) != 2:
+        raise HTTPException(status_code=400, detail="يجب تحديد مستخدمين اثنين لإلغاء الربط")
+    
+    is_admin = current_user.role == "admin"
+    is_level2 = getattr(current_user, "can_create_subusers", False)
+    
+    if not (is_admin or is_level2):
+        raise HTTPException(status_code=403, detail="غير مصرح لك")
+        
+    u1_id, u2_id = req.user_ids
+    
+    u1 = await db.users.find_one({"id": u1_id})
+    u2 = await db.users.find_one({"id": u2_id})
+    
+    if not u1 or not u2:
+        raise HTTPException(status_code=404, detail="أحد المستخدمين غير موجود")
+        
+    if not is_admin:
+        def can_manage(u):
+            return u["id"] == current_user.id or u.get("created_by") == current_user.id
+            
+        if not (can_manage(u1) and can_manage(u2)):
+            raise HTTPException(status_code=403, detail="يمكنك فقط إلغاء ربط المستخدمين التابعين لفريقك")
+            
+    if u2_id not in u1.get("allowed_chat_users", []):
+        raise HTTPException(status_code=400, detail="المستخدمان غير مربوطين مسبقاً")
+        
+    await db.users.update_one(
+        {"id": u1_id},
+        {"$pull": {"allowed_chat_users": u2_id}}
+    )
+    await db.users.update_one(
+        {"id": u2_id},
+        {"$pull": {"allowed_chat_users": u1_id}}
+    )
+    
+    return {"message": "تم إلغاء ربط المستخدمين بنجاح"}
+
+@api_router.get("/chat/v2/links")
+async def get_chat_links(current_user: User = Depends(get_current_user)):
+    """جلب قائمة الارتباطات الحالية للمستخدمين (لمديري الفرق والأدمن)"""
+    is_admin = current_user.role == "admin"
+    is_level2 = getattr(current_user, "can_create_subusers", False)
+    
+    if not (is_admin or is_level2):
+        return []
+        
+    users_with_links = await db.users.find(
+        {"allowed_chat_users": {"$exists": True, "$not": {"$size": 0}}}
+    ).to_list(1000)
+    
+    links = []
+    seen_pairs = set()
+    
+    for u in users_with_links:
+        if not is_admin:
+            if u["id"] != current_user.id and u.get("created_by") != current_user.id:
+                continue
+                
+        for linked_id in u.get("allowed_chat_users", []):
+            pair_key = tuple(sorted([u["id"], linked_id]))
+            if pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                
+                linked_user = await db.users.find_one({"id": linked_id})
+                if linked_user:
+                    links.append({
+                        "user1_id": u["id"],
+                        "user1_name": u.get("full_name") or u.get("username"),
+                        "user2_id": linked_id,
+                        "user2_name": linked_user.get("full_name") or linked_user.get("username")
+                    })
+                    
+    return links
 
 @api_router.get("/chat/v2/unread-count")
 async def get_chat_unread_count(current_user: User = Depends(get_current_user)):
@@ -16135,16 +16921,25 @@ async def get_chat_messages(contact_id: str, current_user: User = Depends(get_cu
         {"$set": {"is_read": True}}
     )
     
-    messages = await db.chat_messages.find(
-        {
-            "$or": [
-                {"sender_id": current_user.id, "receiver_id": contact_id},
-                {"sender_id": contact_id, "receiver_id": current_user.id}
-            ],
-            "is_deleted": False,
-            "cleared_by": {"$ne": current_user.id}
-        }
-    ).sort("created_at", 1).to_list(500)
+    if contact_id.startswith("group_"):
+        messages = await db.chat_messages.find(
+            {
+                "receiver_id": contact_id,
+                "is_deleted": False,
+                "cleared_by": {"$ne": current_user.id}
+            }
+        ).sort("created_at", 1).to_list(500)
+    else:
+        messages = await db.chat_messages.find(
+            {
+                "$or": [
+                    {"sender_id": current_user.id, "receiver_id": contact_id},
+                    {"sender_id": contact_id, "receiver_id": current_user.id}
+                ],
+                "is_deleted": False,
+                "cleared_by": {"$ne": current_user.id}
+            }
+        ).sort("created_at", 1).to_list(500)
     
     for msg in messages:
         msg["_id"] = str(msg["_id"])
@@ -16254,5 +17049,74 @@ async def delete_chat_conversation(contact_id: str, current_user: User = Depends
         {"$addToSet": {"cleared_by": current_user.id}}
     )
     return {"message": "Conversation cleared for user successfully", "deleted_count": result.modified_count}
+@api_router.get("/dashboard/badges")
+async def get_dashboard_badges(current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    role = getattr(current_user, "role", user_doc.get("role"))
+    
+    user_govs = user_doc.get("governorates", [])
+    user_projs = user_doc.get("projects", [])
+    
+    common_and = []
+    if role != "admin":
+        if user_govs:
+            gov_q = get_flexible_in_query(user_govs, "governorate")
+            if gov_q: common_and.append(gov_q)
+        if user_projs:
+            proj_q = get_loose_in_query(user_projs, "project")
+            if proj_q: common_and.append(proj_q)
+            
+    def get_query(extra_filter):
+        q = {"is_deleted": {"$ne": True}}
+        if extra_filter: q.update(extra_filter)
+        if common_and: q["$and"] = common_and.copy()
+        return q
+
+    badges = {
+        "safety": 0, "quality": 0, "warehouse": 0, "business": 0, "consultant": 0, "report_notes": 0
+    }
+    
+    import asyncio
+    tasks = []
+    keys = []
+    
+    if role == "admin" or "safety_reports" in user_perms:
+        tasks.append(db.safety_reports.count_documents(get_query({'$or': [{'status': 'قيد المراجعة'}, {'status': {'$exists': False}}, {'status': None}]})))
+        keys.append("safety")
+        
+    if role == "admin" or "quality_reports" in user_perms:
+        tasks.append(db.quality_reports.count_documents(get_query({"status": "قيد المراجعة"})))
+        keys.append("quality")
+        
+        tasks.append(db.warehouse_visits.count_documents(get_query({"status": "قيد المراجعة"})))
+        keys.append("warehouse")
+        
+    if role == "admin" or "business_reports" in user_perms:
+        tasks.append(db.business_reports.count_documents(get_query({"status": "قيد المراجعة"})))
+        keys.append("business")
+        
+    if role == "admin" or "consultant_notes" in user_perms:
+        tasks.append(db.reports.count_documents(get_query({
+            "consultant_note": {"$ne": "", "$exists": True},
+            "consultant_note_processed": False
+        })))
+        keys.append("consultant")
+        
+    if role == "admin" or "report_notes" in user_perms:
+        tasks.append(db.reports.count_documents(get_query({
+            "notes": {"$ne": "", "$exists": True, "$type": "string"},
+            "report_note_processed": {"$ne": True}
+        })))
+        keys.append("report_notes")
+        
+    results = await asyncio.gather(*tasks) if tasks else []
+    for k, v in zip(keys, results):
+        badges[k] = v
+        
+    return badges
 
 app.include_router(api_router)
