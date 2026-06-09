@@ -15721,11 +15721,27 @@ async def get_quality_reports(
         c = await db.quality_reports.count_documents(query)
         return {"count": c}
         
-    records = await db.quality_reports.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.quality_reports.find(query, {"_id": 0, "image": 0, "images": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
     return records
+
+@api_router.get("/quality-reports/{report_id}")
+async def get_quality_report(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    record = await db.quality_reports.find_one({"id": report_id, "is_deleted": {"$ne": True}}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not record.get("status"):
+        record["status"] = "قيد المراجعة"
+    return record
 
 
 @api_router.post("/quality-reports")
@@ -16030,11 +16046,27 @@ async def get_business_reports(
     if date_to:
         query["date_to"] = {"$lte": date_to}
         
-    records = await db.business_reports.find(query, {"_id": 0}).sort("date_from", -1).to_list(100)
+    records = await db.business_reports.find(query, {"_id": 0, "files": 0, "file_url": 0}).sort("date_from", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
     return records
+
+@api_router.get("/business-reports/{report_id}")
+async def get_business_report(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "business_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    record = await db.business_reports.find_one({"id": report_id, "is_deleted": {"$ne": True}}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not record.get("status"):
+        record["status"] = "قيد المراجعة"
+    return record
 
 
 @api_router.post("/business-reports")
@@ -16345,8 +16377,22 @@ async def get_violations(
             if gq: and_clauses.append(gq)
     if and_clauses:
         query["$and"] = and_clauses
-    records = await db.violations.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.violations.find(query, {"_id": 0, "images": 0}).sort("date", -1).to_list(100)
     return records
+
+@api_router.get("/violations/{violation_id}")
+async def get_violation(violation_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms and "business_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    record = await db.violations.find_one({"id": violation_id, "is_deleted": {"$ne": True}}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Not found")
+    return record
 
 
 @api_router.post("/violations")
