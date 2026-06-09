@@ -3180,7 +3180,7 @@ async def get_reports(
     skip = (page - 1) * limit
     
     # جلب البلاغات مع الترقيم (بدون الصور لتسريع الاستجابة)
-    projection = {"_id": 0}  # استبعاد الصور
+    projection = {"_id": 0, "images": 0}  # استبعاد الصور
     reports = await db.reports.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     # ⚡ تحسين: جلب أسماء المستخدمين مرة واحدة
@@ -4226,7 +4226,7 @@ async def get_reports_last_72_hours_list(
 
     # جلب البيانات بناءً على الفئة
     all_reports = []
-    projection = {"_id": 0}
+    projection = {"_id": 0, "images": 0}
 
     if category in ['reports', 'all', None]:
         reports_list = await db.reports.find(query, projection).sort("created_at", -1).to_list(10000)
@@ -8953,7 +8953,7 @@ async def export_72h_reports_excel(
     if skip_query:
         reports = []
     else:
-        reports = await db.reports.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+        reports = await db.reports.find(query, {"_id": 0, "images": 0}).sort("created_at", -1).to_list(1000)
     
     # إنشاء ملف Excel
     wb = Workbook()
@@ -11612,7 +11612,7 @@ async def get_water_connections(
     
     # Apply pagination - استبعاد الصور لتسريع الاستجابة
     skip = (page - 1) * limit
-    projection = {"_id": 0}  # استبعاد الصور من القائمة
+    projection = {"_id": 0, "images": 0}  # استبعاد الصور من القائمة
     connections = await db.water_connections.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     # إضافة عدد الصور لكل توصيلة (بدلاً من الصور نفسها)
@@ -12063,7 +12063,7 @@ async def get_sewage_connections(
     
     # Apply pagination - استبعاد الصور لتسريع الاستجابة
     skip = (page - 1) * limit
-    projection = {"_id": 0}  # استبعاد الصور من القائمة
+    projection = {"_id": 0, "images": 0}  # استبعاد الصور من القائمة
     connections = await db.sewage_connections.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     # إضافة عدد الصور لكل توصيلة (بدلاً من الصور نفسها)
@@ -15534,7 +15534,7 @@ async def get_safety_reports(
         c = await db.safety_reports.count_documents(query)
         return {"count": c}
         
-    records = await db.safety_reports.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.safety_reports.find(query, {"_id": 0, "image": 0, "images": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -15718,7 +15718,7 @@ async def get_quality_reports(
         c = await db.quality_reports.count_documents(query)
         return {"count": c}
         
-    records = await db.quality_reports.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.quality_reports.find(query, {"_id": 0, "image": 0, "images": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -16043,7 +16043,7 @@ async def get_business_reports(
     if date_to:
         query["date_to"] = {"$lte": date_to}
         
-    records = await db.business_reports.find(query, {"_id": 0}).sort("date_from", -1).to_list(100)
+    records = await db.business_reports.find(query, {"_id": 0, "files": 0, "file_url": 0}).sort("date_from", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -16238,7 +16238,7 @@ async def get_work_permits(
                 and_clauses.append(gov_query)
     if and_clauses:
         query["$and"] = and_clauses
-    records = await db.work_permits.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.work_permits.find(query, {"_id": 0, "image": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -16374,7 +16374,7 @@ async def get_violations(
             if gq: and_clauses.append(gq)
     if and_clauses:
         query["$and"] = and_clauses
-    records = await db.violations.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.violations.find(query, {"_id": 0, "images": 0}).sort("date", -1).to_list(100)
     return records
 
 @api_router.get("/violations/{violation_id}")
@@ -17205,5 +17205,5 @@ async def compress_pdf(data: dict, current_user: User = Depends(get_current_user
         print("PDF compression error:", str(e))
         return {"pdf": pdf_base64}
 
-app.include_router(api_router)
 
+app.include_router(api_router)
