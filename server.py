@@ -15537,11 +15537,27 @@ async def get_safety_reports(
         c = await db.safety_reports.count_documents(query)
         return {"count": c}
         
-    records = await db.safety_reports.find(query, {"_id": 0}).sort("date", -1).to_list(100)
+    records = await db.safety_reports.find(query, {"_id": 0, "image": 0, "images": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
     return records
+
+@api_router.get("/safety-reports/{report_id}")
+async def get_safety_report(report_id: str, current_user: User = Depends(get_current_user)):
+    user_doc = current_user if isinstance(current_user, dict) else current_user.dict()
+    user_perms = set(user_doc.get("permissions", []))
+    pp = user_doc.get("project_permissions", {})
+    for plist in pp.values():
+        user_perms.update(plist or [])
+    if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    record = await db.safety_reports.find_one({"id": report_id, "is_deleted": {"$ne": True}}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not record.get("status"):
+        record["status"] = "قيد المراجعة"
+    return record
 
 
 @api_router.post("/safety-reports")
