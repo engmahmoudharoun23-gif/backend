@@ -1331,9 +1331,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     if user_doc is None:
         raise HTTPException(status_code=401, detail="User not found")
         
-    if user_doc.get("current_session_token") and user_doc.get("current_session_token") != token:
-        raise HTTPException(status_code=401, detail="session_expired_logged_in_elsewhere")
-
     
     if isinstance(user_doc.get('created_at'), str):
         user_doc['created_at'] = datetime.fromisoformat(user_doc['created_at'])
