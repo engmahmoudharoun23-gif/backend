@@ -15500,8 +15500,7 @@ async def get_safety_reports(
     
     is_admin = user_doc.get("role") == "admin"
     is_manager = user_doc.get("can_create_subusers", False)
-    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
-    if not is_admin and not is_manager and not can_view_all:
+    if not is_admin and not is_manager:
         query["created_by"] = user_doc.get("username", "")
         
     and_clauses = []
@@ -15690,8 +15689,7 @@ async def get_quality_reports(
     
     is_admin = user_doc.get("role") == "admin"
     is_manager = user_doc.get("can_create_subusers", False)
-    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
-    if not is_admin and not is_manager and not can_view_all:
+    if not is_admin and not is_manager:
         query["created_by"] = user_doc.get("username", "")
         
     and_clauses = []
@@ -16020,8 +16018,7 @@ async def get_business_reports(
     
     is_admin = user_doc.get("role") == "admin"
     is_manager = user_doc.get("can_create_subusers", False)
-    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
-    if not is_admin and not is_manager and not can_view_all:
+    if not is_admin and not is_manager:
         query["created_by"] = user_doc.get("username", "")
         
     and_clauses = []
@@ -16241,8 +16238,7 @@ async def get_work_permits(
     
     is_admin = user_doc.get("role") == "admin"
     is_manager = user_doc.get("can_create_subusers", False)
-    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
-    if not is_admin and not is_manager and not can_view_all:
+    if not is_admin and not is_manager:
         query["created_by"] = user_doc.get("username", "")
         
     and_clauses = []
@@ -16390,8 +16386,7 @@ async def get_violations(
         
     is_admin = user_doc.get("role") == "admin"
     is_manager = user_doc.get("can_create_subusers", False)
-    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
-    if not is_admin and not is_manager and not can_view_all:
+    if not is_admin and not is_manager:
         query["created_by"] = user_doc.get("username", "")
 
     and_clauses = []
