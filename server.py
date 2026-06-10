@@ -2888,7 +2888,7 @@ async def get_reports(
     # FORCE my_reports for non-admin and non-managers to ensure they only see their own
     is_admin = current_user.role == "admin"
     is_manager = getattr(current_user, "can_create_subusers", False)
-    if not is_admin and not is_manager:
+    if not is_admin and not is_manager and not has_project_permission(current_user, project, "view_governorate_data"):
         my_reports = True
     
     # ========== منطق صلاحيات المشروعات والمحافظات ==========
