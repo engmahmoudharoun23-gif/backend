@@ -532,6 +532,7 @@ ALL_PERMISSIONS = [
     {"key": "work_permits", "label": "تصاريح العمل", "group": "التقارير"},
     {"key": "work_permits_edit", "label": "تعديل تصاريح العمل", "group": "التقارير"},
     {"key": "work_permits_delete", "label": "حذف تصاريح العمل", "group": "التقارير"},
+    {"key": "view_governorate_data", "label": "رؤية إجمالي بيانات المحافظة (تجاوز منشئ البلاغ)", "group": "النظام"},
 ]
 
 
@@ -1167,6 +1168,7 @@ class ReportResponse(BaseModel):
     longitude: Optional[str]
     asphalt_license_issued: bool
     wfm_closed: bool = False
+    wfm_closed_by: Optional[str] = None
     notes: Optional[str] = None
     consultant_note: Optional[str] = None
     consultant_note_reply: Optional[str] = None
@@ -1416,23 +1418,20 @@ async def get_hierarchy_filter(current_user: User) -> dict:
         gov_filter = {'governorate': {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}}
         
     # المستوى الثاني (مدير منطقة/محافظة) يرى جميع بلاغات المحافظات والمشاريع المسندة إليه
-    if getattr(current_user, 'can_create_subusers', False):
+    # وكذلك المستخدمين الاستثنائيين الذين لديهم صلاحية رؤية إجمالي المحافظة
+    can_view_all = has_project_permission(current_user, None, "view_governorate_data")
+    if getattr(current_user, 'can_create_subusers', False) or can_view_all:
         return gov_filter
         
-    # المستوى الثالث: إذا كان يمتلك صلاحية عرض البلاغات، يرى جميع البلاغات في محافظته
-    # نفحص الصلاحيات العامة وكذلك صلاحيات المشاريع (project_permissions)
-    permissions = getattr(current_user, 'permissions', []) or []
-    has_reports_view = "reports_view" in permissions or user_has_any_project_permission(current_user, "reports_view")
-    if has_reports_view:
-        return gov_filter
-        
-    # المستوى الثالث العادي يرى بلاغاته فقط، نجلب معرفاته
+    # المستوى الثالث: يرى بلاغاته فقط، نجلب معرفاته
     all_subordinate_ids = await get_all_subordinate_user_ids(current_user.id, include_self=True)
     
     # تجميع كل المعرفات الممكنة (IDs و Usernames) للتوافق مع طرق التخزين المختلفة
     all_identifiers = set(all_subordinate_ids)
-    all_identifiers.add(current_user.username)
-    all_identifiers.add(current_user.id)
+    if hasattr(current_user, 'username') and current_user.username:
+        all_identifiers.add(current_user.username)
+    if hasattr(current_user, 'id') and current_user.id:
+        all_identifiers.add(current_user.id)
     
     # جلب أسماء المستخدمين (usernames) لجميع التابعين لضمان الشمولية في حقل created_by
     if all_subordinate_ids:
@@ -1441,29 +1440,11 @@ async def get_hierarchy_filter(current_user: User) -> dict:
             if u.get("username"):
                 all_identifiers.add(u["username"])
                 
-    # جلب معرفات الإدارة العليا (الأدمن والمديرين) لإضافتها إلى القائمة
-    # حتى تظهر البلاغات التي يرفعها الأدمن أو المدير (مستوى 2) للمستخدمين (مستوى 3) المسؤولين عن نفس المشروع/المحافظة
-    admins_cursor = db.users.find(
-        {
-            "$or": [
-                {"role": "admin"},
-                {"can_create_subusers": True},
-                {"$expr": {"$gte": [{"$size": {"$ifNull": ["$governorates", []]}}, 8]}}
-            ]
-        }, 
-        {"id": 1, "username": 1, "full_name": 1}
-    )
-    async for admin in admins_cursor:
-        if admin.get("id"):
-            all_identifiers.add(admin["id"])
-        if admin.get("username"):
-            all_identifiers.add(admin["username"])
-        if admin.get("full_name"):
-            all_identifiers.add(admin["full_name"])
-    # إضافة "مكتب بيت الخبرة للاستشارات الهندسية" صراحة كونه حساب الأدمن الرئيسي
-    all_identifiers.add("مكتب بيت الخبرة للاستشارات الهندسية")
+    hierarchy_filter = {"created_by": {"$in": list(all_identifiers)}}
     
-    return {"created_by": {"$in": list(all_identifiers)}}
+    if gov_filter:
+        return {"$and": [gov_filter, hierarchy_filter]}
+    return hierarchy_filter
 
 
 # ============= نقاط نهاية رفع وعرض الصور (Object Storage) =============
@@ -2511,7 +2492,7 @@ async def update_user_permissions(
         # التحقق فقط من الصلاحيات الجديدة المُضافة (يُسمح بالحفاظ على/إلغاء القديمة ولو منحها الأدمن)
         new_global_perms = set(data.permissions) - existing_perms
         for perm in new_global_perms:
-            if perm not in my_all_perms:
+            if perm not in my_all_perms and perm != "view_governorate_data":
                 raise HTTPException(status_code=403, detail=f"لا يمكنك إعطاء صلاحية {perm} لأنها غير متاحة لك")
         
         # التحقق من الصلاحيات الجديدة لكل مشروع
@@ -2904,8 +2885,11 @@ async def get_reports(
     # print debug
     query = {"is_deleted": {"$ne": True}}
     
-    # قائمة المستخدمين الذين يرون بلاغاتهم فقط تلقائياً (بدون تفعيل "بلاغاتي")
-    restricted_users = ["Mohamed Esmat", "ElShazly"]
+    # FORCE my_reports for non-admin and non-managers to ensure they only see their own
+    is_admin = current_user.role == "admin"
+    is_manager = getattr(current_user, "can_create_subusers", False)
+    if not is_admin and not is_manager:
+        my_reports = True
     
     # ========== منطق صلاحيات المشروعات والمحافظات ==========
     if current_user.role == "admin":
@@ -9072,8 +9056,22 @@ async def export_reports_excel(
         if len(current_user.governorates) > 0:
             query["governorate"] = {"$in": current_user.governorates}
         
-        # ملاحظة: تم إلغاء قيود "restricted_users" على التصدير — أي مستخدم يستطيع تصدير
-        # جميع البلاغات في مشاريعه ومحافظاته بغض النظر عن المُنشئ.
+        # كل يوزر لا يرى إلا بلاغاته التي أضافها بنفسه
+        is_manager = getattr(current_user, "can_create_subusers", False)
+        can_view_all = has_project_permission(current_user, project, "view_governorate_data")
+        if not is_manager and not can_view_all:
+            query["created_by"] = current_user.username
+    
+    # --- DEBUG LOGGING ---
+    try:
+        with open("d:\\sery17-main\\sery17-main\\query_debug.log", "a", encoding="utf-8") as f:
+            f.write(f"USER: {current_user.full_name} | ROLE: {current_user.role} | GOVS: {current_user.governorates} | PROJS: {current_user.projects} | PERMS: {current_user.permissions}\n")
+            f.write(f"can_view_all: {can_view_all} | is_manager: {is_manager}\n")
+            f.write(f"FINAL QUERY: {query}\n")
+            f.write("-" * 50 + "\n")
+    except Exception:
+        pass
+    # ---------------------
     
     if search:
         query["$or"] = [
@@ -9138,34 +9136,44 @@ async def export_reports_excel(
         from datetime import datetime as dt, timedelta
         
         try:
+            # offset السعودية +3 ساعات عن UTC
+            SAUDI_OFFSET = timedelta(hours=3)
+            
             if date_from and date_to:
-                # كلا التاريخين موجودان
                 date_from_obj = dt.fromisoformat(date_from)
                 date_to_obj = dt.fromisoformat(date_to)
+                # نهاية اليوم = بداية اليوم التالي (23:59:59 + 1 ثانية)
                 next_day = date_to_obj + timedelta(days=1)
                 
-                # فلتر يدعم string و datetime
+                # تحويل للـ UTC لمطابقة datetime objects المحفوظة
+                from_utc = date_from_obj - SAUDI_OFFSET
+                next_utc = next_day - SAUDI_OFFSET
+                
                 date_filter = {
                     "$or": [
+                        # مطابقة string-based created_at
                         {"created_at": {"$gte": f"{date_from}T00:00:00", "$lt": next_day.strftime("%Y-%m-%dT00:00:00")}},
-                        {"created_at": {"$gte": date_from_obj, "$lt": next_day}}
+                        # مطابقة datetime-based created_at (UTC)
+                        {"created_at": {"$gte": from_utc, "$lt": next_utc}}
                     ]
                 }
             elif date_from:
                 date_from_obj = dt.fromisoformat(date_from)
+                from_utc = date_from_obj - SAUDI_OFFSET
                 date_filter = {
                     "$or": [
                         {"created_at": {"$gte": f"{date_from}T00:00:00"}},
-                        {"created_at": {"$gte": date_from_obj}}
+                        {"created_at": {"$gte": from_utc}}
                     ]
                 }
             elif date_to:
                 date_to_obj = dt.fromisoformat(date_to)
                 next_day = date_to_obj + timedelta(days=1)
+                next_utc = next_day - SAUDI_OFFSET
                 date_filter = {
                     "$or": [
                         {"created_at": {"$lt": next_day.strftime("%Y-%m-%dT00:00:00")}},
-                        {"created_at": {"$lt": next_day}}
+                        {"created_at": {"$lt": next_utc}}
                     ]
                 }
             
@@ -15367,6 +15375,11 @@ async def toggle_report_wfm(report_id: str, current_user: User = Depends(get_cur
             "wfm_closed": new_status, 
             "updated_at": datetime.now(timezone.utc)
         }
+        if new_status:
+            closer_name = getattr(current_user, 'full_name', None) or getattr(current_user, 'username', '')
+            update_fields["wfm_closed_by"] = closer_name
+        else:
+            update_fields["wfm_closed_by"] = None
         
         result = await db.reports.update_one(
             {"id": report_id}, 
@@ -15485,6 +15498,12 @@ async def get_safety_reports(
         return []
     query = {"is_deleted": {"$ne": True}}
     
+    is_admin = user_doc.get("role") == "admin"
+    is_manager = user_doc.get("can_create_subusers", False)
+    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
+    if not is_admin and not is_manager and not can_view_all:
+        query["created_by"] = user_doc.get("username", "")
+        
     and_clauses = []
     
     if user_doc.get("role") != "admin":
@@ -15669,6 +15688,12 @@ async def get_quality_reports(
         return []
     query = {"is_deleted": {"$ne": True}}
     
+    is_admin = user_doc.get("role") == "admin"
+    is_manager = user_doc.get("can_create_subusers", False)
+    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
+    if not is_admin and not is_manager and not can_view_all:
+        query["created_by"] = user_doc.get("username", "")
+        
     and_clauses = []
     
     if user_doc.get("role") != "admin":
@@ -15993,6 +16018,12 @@ async def get_business_reports(
         raise HTTPException(status_code=403, detail="Forbidden")
     query = {"is_deleted": {"$ne": True}}
     
+    is_admin = user_doc.get("role") == "admin"
+    is_manager = user_doc.get("can_create_subusers", False)
+    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
+    if not is_admin and not is_manager and not can_view_all:
+        query["created_by"] = user_doc.get("username", "")
+        
     and_clauses = []
     
     if user_doc.get("role") != "admin":
@@ -16207,6 +16238,13 @@ async def get_work_permits(
     if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
         return []
     query = {"is_deleted": {"$ne": True}}
+    
+    is_admin = user_doc.get("role") == "admin"
+    is_manager = user_doc.get("can_create_subusers", False)
+    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
+    if not is_admin and not is_manager and not can_view_all:
+        query["created_by"] = user_doc.get("username", "")
+        
     and_clauses = []
     if user_doc.get("role") != "admin":
         user_govs = user_doc.get("governorates", [])
@@ -16349,6 +16387,13 @@ async def get_violations(
         query["type"] = {"$in": ["safety", None, ""]}
     else:
         query["type"] = type
+        
+    is_admin = user_doc.get("role") == "admin"
+    is_manager = user_doc.get("can_create_subusers", False)
+    can_view_all = has_project_permission(user_doc, project, "view_governorate_data")
+    if not is_admin and not is_manager and not can_view_all:
+        query["created_by"] = user_doc.get("username", "")
+
     and_clauses = []
     if user_doc.get("role") != "admin":
         user_govs = user_doc.get("governorates", [])
