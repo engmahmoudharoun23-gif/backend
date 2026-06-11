@@ -2885,11 +2885,8 @@ async def get_reports(
     # print debug
     query = {"is_deleted": {"$ne": True}}
     
-    # FORCE my_reports for non-admin and non-managers to ensure they only see their own
-    is_admin = current_user.role == "admin"
-    is_manager = getattr(current_user, "can_create_subusers", False)
-    if not is_admin and not is_manager and not has_project_permission(current_user, project, "view_governorate_data"):
-        my_reports = True
+    # قائمة المستخدمين الذين يرون بلاغاتهم فقط تلقائياً (بدون تفعيل "بلاغاتي")
+    restricted_users = ["Mohamed Esmat", "ElShazly"]
     
     # ========== منطق صلاحيات المشروعات والمحافظات ==========
     if current_user.role == "admin":
@@ -4460,8 +4457,9 @@ async def get_level3_users(
         user_permissions = current_user.permissions or []
         has_view_all = "view_all_invoices" in user_permissions or user_has_any_project_permission(current_user, "view_all_invoices")
         has_reviewer_role = user_has_any_project_permission(current_user, "reports_review") or "reports_review" in user_permissions
+        has_view_gov = "view_governorate_data" in user_permissions or user_has_any_project_permission(current_user, "view_governorate_data")
         
-        if not (is_admin or is_level_2 or has_view_all or has_reviewer_role):
+        if not (is_admin or is_level_2 or has_view_all or has_reviewer_role or has_view_gov):
             return {"users": []}
         
         my_projects = list(current_user.projects or [])
@@ -4475,10 +4473,12 @@ async def get_level3_users(
         if governorate and not is_admin and my_governorates and governorate not in my_governorates:
             return {"users": []}
         
-        # القاعدة: جميع المستخدمين النشطين (ما عدا الأدمن)
+        # القاعدة: جميع المستخدمين النشطين (ما عدا الأدمن) ولديهم محافظات محددة (المراقبين الميدانيين)
         query = {
             "is_active": True,
-            "role": {"$ne": "admin"}
+            "role": {"$ne": "admin"},
+            "can_create_subusers": {"$ne": True},
+            "governorates": {"$exists": True, "$ne": [], "$not": {"$size": 0}}
         }
         
         # فلترة حسب المشروع
@@ -4500,16 +4500,15 @@ async def get_level3_users(
             filtered = []
             for u in all_users:
                 user_govs = u.get("governorates") or []
-                if not user_govs or governorate in user_govs:
+                if governorate in user_govs:
                     filtered.append(u)
             all_users = filtered
         elif not is_admin and my_governorates:
-            # لم تُحدَّد محافظة: قيِّد بمحافظات المستخدم الحالي (إن كان لديه حدود)
+            # لم تُحدَّد محافظة: قيِّد بمحافظات المستخدم الحالي
             filtered = []
             for u in all_users:
                 user_govs = u.get("governorates") or []
-                # إدراج من ليس لديه محافظات (شامل) أو لديه تقاطع مع محافظاتي
-                if not user_govs or any(g in my_governorates for g in user_govs):
+                if any(g in my_governorates for g in user_govs):
                     filtered.append(u)
             all_users = filtered
         
@@ -5791,6 +5790,10 @@ async def update_report_review_status(
     new_status = "تمت المراجعة" if is_pending else "قيد المراجعة"
     reviewed_by_name = (current_user.full_name or current_user.username) if new_status == "تمت المراجعة" else None
     
+    # تحديث حالة المعالجة اوتوماتيكيا
+    wfm_closed = True if new_status == "تمت المراجعة" else False
+    wfm_closed_by = reviewed_by_name if wfm_closed else None
+    
     await db.reports.update_one(
         {"id": report_id},
         {
@@ -5798,7 +5801,10 @@ async def update_report_review_status(
                 "review_status": new_status,
                 "reviewed_by": current_user.id if new_status == "تمت المراجعة" else None,
                 "reviewed_by_name": reviewed_by_name,
-                "reviewed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None
+                "reviewed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None,
+                "wfm_closed": wfm_closed,
+                "wfm_closed_by": wfm_closed_by,
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }
         }
     )
@@ -5807,7 +5813,9 @@ async def update_report_review_status(
     return {
         "message": msg, 
         "review_status": new_status,
-        "reviewed_by_name": reviewed_by_name
+        "reviewed_by_name": reviewed_by_name,
+        "wfm_closed": wfm_closed,
+        "wfm_closed_by": wfm_closed_by
     }
 
 
@@ -15612,7 +15620,7 @@ async def update_safety_report(report_id: str, request: Request, current_user: U
     if user_doc.get("role") != "admin" and "safety_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تقارير السلامة")
     body = await request.json()
-    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "consultant_note", "consultant_reply", "image", "images", "report_note_processed", "status"]}
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "consultant_note", "consultant_reply", "image", "images", "report_note_processed", "consultant_note_processed", "status"]}
     
     if "status" in body:
         new_status = body.get("status")
@@ -15822,7 +15830,7 @@ async def update_quality_report(report_id: str, request: Request, current_user: 
     if user_doc.get("role") != "admin" and "quality_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تقارير الجودة")
     body = await request.json()
-    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "image", "images"]}
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "consultant_note", "consultant_reply", "report_note_processed", "consultant_note_processed", "image", "images"]}
     
     if "status" in body:
         new_status = body.get("status")
@@ -16333,7 +16341,7 @@ async def update_work_permit(permit_id: str, request: Request, current_user: Use
     if user_doc.get("role") != "admin" and "work_permits" not in user_perms and "safety_reports" not in user_perms:
         raise HTTPException(status_code=403, detail="لا تملك صلاحية تعديل تصاريح العمل")
     body = await request.json()
-    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "image", "status"]}
+    update_data = {k: v for k, v in body.items() if k in ["date", "project", "governorate", "notes", "consultant_note", "consultant_reply", "report_note_processed", "consultant_note_processed", "image", "images", "status"]}
     update_data["updated_at"] = datetime.utcnow().isoformat()
     await db.work_permits.update_one({"id": permit_id}, {"$set": update_data})
     return {"message": "تم التحديث بنجاح"}
@@ -16848,7 +16856,13 @@ async def get_chat_contacts(current_user: User = Depends(get_current_user)):
     # Fetch groups
     groups = await db.chat_groups.find({"members": current_user.id}).to_list(100)
     for g in groups:
-        g["unread_count"] = 0 # simplified for groups
+        unread_count = await db.chat_messages.count_documents({
+            "receiver_id": g["id"],
+            "sender_id": {"$ne": current_user.id},
+            "read_by": {"$ne": current_user.id},
+            "is_deleted": False
+        })
+        g["unread_count"] = unread_count
         g["full_name"] = g.get("name")
         g["is_group"] = True
         
@@ -17010,6 +17024,19 @@ async def get_chat_unread_count(current_user: User = Depends(get_current_user)):
         "is_read": False,
         "is_deleted": False
     })
+    
+    # حساب إشعارات المجموعات غير المقروءة
+    groups = await db.chat_groups.find({"members": current_user.id}).to_list(100)
+    group_ids = [g["id"] for g in groups]
+    if group_ids:
+        group_count = await db.chat_messages.count_documents({
+            "receiver_id": {"$in": group_ids},
+            "sender_id": {"$ne": current_user.id},
+            "read_by": {"$ne": current_user.id},
+            "is_deleted": False
+        })
+        count += group_count
+        
     return {"unread_count": count}
 
 @api_router.get("/chat/v2/messages/{contact_id}")
@@ -17021,6 +17048,10 @@ async def get_chat_messages(contact_id: str, current_user: User = Depends(get_cu
     )
     
     if contact_id.startswith("group_"):
+        await db.chat_messages.update_many(
+            {"receiver_id": contact_id, "sender_id": {"$ne": current_user.id}},
+            {"$addToSet": {"read_by": current_user.id}}
+        )
         messages = await db.chat_messages.find(
             {
                 "receiver_id": contact_id,
@@ -17062,6 +17093,7 @@ async def send_chat_message(msg_in: dict, current_user: User = Depends(get_curre
         "created_at": datetime.utcnow(),
         "is_deleted": False,
         "is_read": False,
+        "read_by": [],
         "is_edited": False
     }
     await db.chat_messages.insert_one(new_msg)
@@ -17176,20 +17208,36 @@ async def get_dashboard_badges(current_user: User = Depends(get_current_user)):
         return q
 
     badges = {
-        "safety": 0, "quality": 0, "warehouse": 0, "business": 0, "consultant": 0, "report_notes": 0
+        "safety": 0, "quality": 0, "warehouse": 0, "business": 0,
+        "safety_notes": 0, "quality_notes": 0, "work_permits_notes": 0, "violations_notes": 0,
+        "work_permits": 0, "violations": 0
     }
     
     import asyncio
     tasks = []
     keys = []
     
+    is_level_3 = role != "admin" and not user_doc.get("can_create_subusers", False)
+    
+    def get_note_query():
+        if is_level_3:
+            return {"consultant_note": {"$ne": "", "$exists": True}, "report_note_processed": {"$ne": True}}
+        else:
+            return {"consultant_reply": {"$ne": "", "$exists": True}, "consultant_note_processed": {"$ne": True}}
+            
+    note_q = get_note_query()
+
     if role == "admin" or "safety_reports" in user_perms:
         tasks.append(db.safety_reports.count_documents(get_query({'$or': [{'status': 'قيد المراجعة'}, {'status': {'$exists': False}}, {'status': None}]})))
         keys.append("safety")
+        tasks.append(db.safety_reports.count_documents(get_query(note_q)))
+        keys.append("safety_notes")
         
     if role == "admin" or "quality_reports" in user_perms:
         tasks.append(db.quality_reports.count_documents(get_query({"status": "قيد المراجعة"})))
         keys.append("quality")
+        tasks.append(db.quality_reports.count_documents(get_query(note_q)))
+        keys.append("quality_notes")
         
         tasks.append(db.warehouse_visits.count_documents(get_query({"status": "قيد المراجعة"})))
         keys.append("warehouse")
@@ -17198,19 +17246,17 @@ async def get_dashboard_badges(current_user: User = Depends(get_current_user)):
         tasks.append(db.business_reports.count_documents(get_query({"status": "قيد المراجعة"})))
         keys.append("business")
         
-    if role == "admin" or "consultant_notes" in user_perms:
-        tasks.append(db.reports.count_documents(get_query({
-            "consultant_note": {"$ne": "", "$exists": True},
-            "consultant_note_processed": False
-        })))
-        keys.append("consultant")
+    if role == "admin" or "work_permits" in user_perms:
+        tasks.append(db.work_permits.count_documents(get_query({"status": "قيد المراجعة"})))
+        keys.append("work_permits")
+        tasks.append(db.work_permits.count_documents(get_query(note_q)))
+        keys.append("work_permits_notes")
         
-    if role == "admin" or "report_notes" in user_perms:
-        tasks.append(db.reports.count_documents(get_query({
-            "notes": {"$ne": "", "$exists": True, "$type": "string"},
-            "report_note_processed": {"$ne": True}
-        })))
-        keys.append("report_notes")
+    if role == "admin" or "violations" in user_perms:
+        tasks.append(db.violations.count_documents(get_query({"status": "قيد المعالجة"})))
+        keys.append("violations")
+        tasks.append(db.violations.count_documents(get_query(note_q)))
+        keys.append("violations_notes")
         
     results = await asyncio.gather(*tasks) if tasks else []
     for k, v in zip(keys, results):
