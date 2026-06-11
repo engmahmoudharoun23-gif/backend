@@ -5790,10 +5790,6 @@ async def update_report_review_status(
     new_status = "تمت المراجعة" if is_pending else "قيد المراجعة"
     reviewed_by_name = (current_user.full_name or current_user.username) if new_status == "تمت المراجعة" else None
     
-    # تحديث حالة المعالجة اوتوماتيكيا
-    wfm_closed = True if new_status == "تمت المراجعة" else False
-    wfm_closed_by = reviewed_by_name if wfm_closed else None
-    
     await db.reports.update_one(
         {"id": report_id},
         {
@@ -5802,9 +5798,10 @@ async def update_report_review_status(
                 "reviewed_by": current_user.id if new_status == "تمت المراجعة" else None,
                 "reviewed_by_name": reviewed_by_name,
                 "reviewed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None,
-                "wfm_closed": wfm_closed,
-                "wfm_closed_by": wfm_closed_by,
-                "updated_at": datetime.now(timezone.utc).isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "wfm_closed": True if new_status == "تمت المراجعة" else False,
+                "wfm_closed_by": "م/ مدحت حسين محمد" if new_status == "تمت المراجعة" else None,
+                "wfm_closed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None
             }
         }
     )
@@ -5814,8 +5811,8 @@ async def update_report_review_status(
         "message": msg, 
         "review_status": new_status,
         "reviewed_by_name": reviewed_by_name,
-        "wfm_closed": wfm_closed,
-        "wfm_closed_by": wfm_closed_by
+        "wfm_closed": True if new_status == "تمت المراجعة" else False,
+        "wfm_closed_by": "م/ مدحت حسين محمد" if new_status == "تمت المراجعة" else None
     }
 
 
