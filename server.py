@@ -3061,6 +3061,11 @@ async def get_reports(
     
     # فلترة بتاريخ استلام البلاغ (created_at) - يدعم string و datetime
     if date_from or date_to:
+        if date_from and not date_to:
+            date_to = date_from
+        elif date_to and not date_from:
+            date_from = date_to
+            
         from datetime import datetime as dt, timedelta
         
         try:
@@ -3077,23 +3082,7 @@ async def get_reports(
                         {"created_at": {"$gte": date_from_obj, "$lt": next_day}}
                     ]
                 }
-            elif date_from:
-                date_from_obj = dt.fromisoformat(date_from)
-                date_filter = {
-                    "$or": [
-                        {"created_at": {"$gte": f"{date_from}T00:00:00"}},
-                        {"created_at": {"$gte": date_from_obj}}
-                    ]
-                }
-            elif date_to:
-                date_to_obj = dt.fromisoformat(date_to)
-                next_day = date_to_obj + timedelta(days=1)
-                date_filter = {
-                    "$or": [
-                        {"created_at": {"$lt": next_day.strftime("%Y-%m-%dT00:00:00")}},
-                        {"created_at": {"$lt": next_day}}
-                    ]
-                }
+
             
             # إضافة فلتر التاريخ للـ query
             if "$and" in query:
@@ -3110,6 +3099,11 @@ async def get_reports(
     
     # فلترة بتاريخ مباشرة البلاغ (start_date)
     if start_date_from or start_date_to:
+        if start_date_from and not start_date_to:
+            start_date_to = start_date_from
+        elif start_date_to and not start_date_from:
+            start_date_from = start_date_to
+            
         from datetime import datetime as dt, timedelta
         try:
             if start_date_from and start_date_to:
@@ -3122,23 +3116,7 @@ async def get_reports(
                         {"start_date": {"$gte": s_from, "$lt": s_next}}
                     ]
                 }
-            elif start_date_from:
-                s_from = dt.fromisoformat(start_date_from)
-                sdate_filter = {
-                    "$or": [
-                        {"start_date": {"$gte": f"{start_date_from}T00:00:00"}},
-                        {"start_date": {"$gte": s_from}}
-                    ]
-                }
-            else:
-                s_to = dt.fromisoformat(start_date_to)
-                s_next = s_to + timedelta(days=1)
-                sdate_filter = {
-                    "$or": [
-                        {"start_date": {"$lt": s_next.strftime("%Y-%m-%dT00:00:00")}},
-                        {"start_date": {"$lt": s_next}}
-                    ]
-                }
+
             
             if "$and" in query:
                 query["$and"].append(sdate_filter)
@@ -4046,11 +4024,6 @@ async def get_governorate_48h_counts(
                 pass
         
         # أولوية 2: created_at
-        if base_date:
-            if report_date and start_time and end_time and start_time <= report_date <= end_time:
-                key = (governorate, project_val)
-                group_counts[key] = group_counts.get(key, 0) + 1
-            continue
         if not report_date and isinstance(created_at, datetime):
             report_date = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
         elif not report_date and isinstance(created_at, str):
@@ -4062,6 +4035,12 @@ async def get_governorate_48h_counts(
         
         if not report_date and isinstance(added_at, datetime):
             report_date = added_at.replace(tzinfo=None) if added_at.tzinfo else added_at
+            
+        if base_date:
+            if report_date and start_time and end_time and start_time <= report_date <= end_time:
+                key = (governorate, project_val)
+                group_counts[key] = group_counts.get(key, 0) + 1
+            continue
         
         # التحقق من أن التاريخ ضمن 72 ساعة
         if report_date and report_date >= seventy_two_hours_ago:
@@ -4259,10 +4238,6 @@ async def get_reports_last_72_hours_list(
                 pass
         
         # أولوية 2: created_at fallback
-        if base_date:
-            if report_date and start_time and end_time and start_time <= report_date <= end_time:
-                reports.append(report)
-            continue
         if not report_date and isinstance(created_at, datetime):
             report_date = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
         elif not report_date and isinstance(created_at, str):
@@ -4274,6 +4249,11 @@ async def get_reports_last_72_hours_list(
         
         if not report_date and isinstance(added_at, datetime):
             report_date = added_at.replace(tzinfo=None) if added_at.tzinfo else added_at
+            
+        if base_date:
+            if report_date and start_time and end_time and start_time <= report_date <= end_time:
+                reports.append(report)
+            continue
         
         if report_date and report_date >= seventy_two_hours_ago:
             reports.append(report)
@@ -8858,91 +8838,25 @@ async def export_selected_reports_pdf(
 async def export_72h_reports_excel(
     project: Optional[str] = Query(None),
     governorate: Optional[str] = Query(None),
+    category: Optional[str] = Query("reports"),
+    base_date: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user)
 ):
     """تصدير بلاغات آخر 24 ساعة إلى Excel"""
-    from datetime import timedelta, timezone
+    from datetime import datetime
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     import io
     
-    # حساب الوقت قبل 24 ساعة
-    seventy_two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
-    
-    # بناء الاستعلام الأساسي (باستخدام قاعدة بيانات Mongo للفلترة الزمنية مباشرة)
-    query = {
-        "is_deleted": {"$ne": True},
-        "$or": [
-            {"created_at": {"$gte": seventy_two_hours_ago.isoformat()}},
-            {"added_at": {"$gte": seventy_two_hours_ago}}
-        ]
-    }
-    
-    # إضافة فلاتر المشروع والمحافظة بالبحث المرن
-    if project:
-        query["project"] = get_flexible_project_query(project)
-    if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
-        query["governorate"] = {'$regex': f"({normalize_arabic_regex(governorate)})", '$options': 'i'}
-    
-    # التصفية الهرمية حسب الصلاحيات (نفس منطق العرض)
-    skip_query = False
-    if current_user.role != "admin":
-        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
-        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
-        
-        # فلترة المشاريع
-        if current_user.projects:
-            has_permission = False
-            for up in current_user.projects:
-                up_keywords = [k for k in up.replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
-                proj_keywords = [k for k in (project or "").replace('-', ' ').split() if len(k) > 2 and k not in ['مشروع', 'أعمال', 'إصلاح']]
-                if project and (any(k in project for k in up_keywords) or any(k in up for k in proj_keywords)):
-                    has_permission = True
-                    break
-            if project and not has_permission:
-                skip_query = True
-            elif not project:
-                query.update(get_flexible_in_query(current_user.projects, "project"))
-
-        # فلترة المستخدمين والمحافظات
-        permissions = getattr(current_user, 'permissions', [])
-        has_reports_review = "reports_review" in permissions or len(get_projects_with_permission(current_user, "reports_review")) > 0
-        has_reports_view = "reports_view" in permissions or len(get_projects_with_permission(current_user, "reports_view")) > 0
-        
-        if not getattr(current_user, 'can_create_subusers', False) and not has_reports_view and not has_reports_review:
-            # مستوى ثالث
-            admin_ids = [current_user.id, current_user.username]
-            admins_cursor = db.users.find({"$or": [{"role": "admin"}, {"can_create_subusers": True}]}, {"id": 1, "username": 1})
-            async for adm in admins_cursor:
-                if adm.get("id"): admin_ids.append(adm["id"])
-                if adm.get("username"): admin_ids.append(adm["username"])
-            admin_ids.append("مكتب بيت الخبرة للاستشارات الهندسية")
-            query['created_by'] = {'$in': list(set(admin_ids))}
-            
-            if not has_all_govs and user_governorates:
-                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
-                    norm_req = normalize_arabic(governorate)
-                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
-                        skip_query = True
-                else:
-                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
-        else:
-            # مستوى ثاني وما فوق
-            if not has_all_govs and user_governorates:
-                if governorate and governorate not in ["الكل", "جميع المحافظات", "كل المحافظات"]:
-                    norm_req = normalize_arabic(governorate)
-                    if not any(normalize_arabic(g) == norm_req for g in user_governorates):
-                        skip_query = True
-                else:
-                    gov_patterns = [normalize_arabic_regex(g) for g in user_governorates]
-                    query['governorate'] = {'$regex': f"({'|'.join(gov_patterns)})", '$options': 'i'}
-    
-    # جلب البلاغات النهائية
-    if skip_query:
-        reports = []
-    else:
-        reports = await db.reports.find(query, {"_id": 0, "images": 0}).sort("created_at", -1).to_list(1000)
+    # جلب البيانات باستخدام نفس منطق العرض لضمان تطابق الفلاتر
+    reports_data = await get_reports_last_72_hours_list(
+        project=project,
+        governorate=governorate,
+        category=category,
+        base_date=base_date,
+        current_user=current_user
+    )
+    reports = reports_data.get("reports", [])
     
     # إنشاء ملف Excel
     wb = Workbook()
@@ -8957,7 +8871,7 @@ async def export_72h_reports_excel(
     ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
     
     # رؤوس الأعمدة
-    headers = ["#", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الاستلام"]
+    headers = ["#", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة المعالجة", "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الاستلام", "تاريخ المباشرة"]
     header_row = 3
     
     # تنسيق رؤوس الأعمدة
@@ -8976,11 +8890,21 @@ async def export_72h_reports_excel(
         
         created_at = report.get('created_at', '')
         if isinstance(created_at, datetime):
-            created_at = created_at.strftime('%Y-%m-%d %H:%M')
+            created_at = created_at.strftime('%d-%m-%Y %H:%M')
         elif isinstance(created_at, str):
             try:
                 dt_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                created_at = dt_obj.strftime('%Y-%m-%d %H:%M')
+                created_at = dt_obj.strftime('%d-%m-%Y %H:%M')
+            except:
+                pass
+                
+        start_date = report.get('start_date', '')
+        if isinstance(start_date, datetime):
+            start_date = start_date.strftime('%d-%m-%Y')
+        elif isinstance(start_date, str):
+            try:
+                dt_obj = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                start_date = dt_obj.strftime('%d-%m-%Y')
             except:
                 pass
         
@@ -9008,10 +8932,11 @@ async def export_72h_reports_excel(
         ws.cell(row=row, column=10, value=report.get('diameter_mm', ''))
         ws.cell(row=row, column=11, value=report.get('contractor', ''))
         ws.cell(row=row, column=12, value=created_at)
+        ws.cell(row=row, column=13, value=start_date)
     
     # ضبط عرض الأعمدة
     from openpyxl.utils import get_column_letter
-    column_widths = [5, 15, 30, 20, 20, 20, 15, 15, 10, 10, 20, 20]
+    column_widths = [5, 15, 30, 20, 20, 20, 15, 15, 10, 10, 20, 20, 15]
     for col, width in enumerate(column_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
     
@@ -9066,6 +8991,26 @@ async def export_reports_excel(
         can_view_all = has_project_permission(current_user, project, "view_governorate_data")
         if not is_manager and not can_view_all:
             query["created_by"] = current_user.username
+            
+        # تطبيق الفلترة الهرمية للمستخدمين غير المديرين (مطابق لمنطق get_reports)
+        hierarchy_filter = await get_hierarchy_filter(current_user)
+        
+        user_governorates = current_user.governorates if hasattr(current_user, 'governorates') and current_user.governorates else []
+        has_all_govs = any(g in ["الكل", "جميع المحافظات", "كل المحافظات"] for g in user_governorates)
+        
+        if has_all_govs:
+            query.update(hierarchy_filter)
+            if "created_by" in query:
+                del query["created_by"] # السماح برؤية البلاغات الهرمية
+        else:
+            if len(user_governorates) > 0:
+                query.update(hierarchy_filter)
+                if "created_by" in query:
+                    del query["created_by"]
+            else:
+                query.update(hierarchy_filter)
+                if "created_by" in query:
+                    del query["created_by"]
     
     # --- DEBUG LOGGING ---
     try:
@@ -9384,9 +9329,9 @@ async def export_reports_excel(
             report.get('longitude', ''),
             'نعم' if report.get('asphalt_license_issued') else 'لا',
             report.get('notes', ''),  # الملاحظات
-            created_at.strftime('%Y-%m-%d %H:%M') if created_at else '',
-            start_date.strftime('%Y-%m-%d') if start_date else '',
-            closed_at.strftime('%Y-%m-%d %H:%M') if closed_at else '',
+            created_at.strftime('%d-%m-%Y %H:%M') if created_at else '',
+            start_date.strftime('%d-%m-%Y') if start_date else '',
+            closed_at.strftime('%d-%m-%Y %H:%M') if closed_at else '',
             images_count,
             report.get('created_by_name', '')
         ]
