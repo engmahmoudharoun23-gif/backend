@@ -492,6 +492,7 @@ ALL_PERMISSIONS = [
     {"key": "reports_notifications", "label": "إشعارات البلاغات الجديدة", "group": "البلاغات"},
     {"key": "consultant_notes", "label": "ملاحظات الاستشاري", "group": "البلاغات"},
     {"key": "report_notes", "label": "ملاحظات البلاغات", "group": "البلاغات"},
+    {"key": "owner_notes", "label": "ملاحظات المالك", "group": "البلاغات"},
     {"key": "water_connections", "label": "توصيلات المياه", "group": "التوصيلات"},
     {"key": "water_connections_import", "label": "استيراد توصيلات المياه من Excel", "group": "التوصيلات"},
     {"key": "sewage_connections", "label": "توصيلات الصرف الصحي", "group": "التوصيلات"},
@@ -539,7 +540,7 @@ ALL_PERMISSIONS = [
 # الصلاحيات المرتبطة بمشروع (يمكن منحها لكل مشروع على حدة)
 PROJECT_SCOPED_PERMISSIONS = {
     "reports_view", "reports_add", "reports_edit", "reports_delete",
-    "reports_review", "reports_import", "reports_notifications", "consultant_notes", "report_notes",
+    "reports_review", "reports_import", "reports_notifications", "consultant_notes", "report_notes", "owner_notes",
     "water_connections", "water_connections_import",
     "sewage_connections", "sewage_connections_import",
     "invoices", "review_invoices", "review_invoices_3", "view_all_invoices",
@@ -5331,11 +5332,17 @@ async def toggle_consultant_note_processed(report_id: str, current_user: User = 
     new_status = not current_status
     
     from datetime import datetime, timezone
-    update_data = {"consultant_note_processed": new_status}
+    update_data = {
+        "consultant_note_processed": new_status,
+        "report_note_processed": new_status
+    }
     if new_status:
-        update_data["consultant_note_processed_date"] = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        update_data["consultant_note_processed_date"] = now_iso
+        update_data["report_note_processed_date"] = now_iso
     else:
         update_data["consultant_note_processed_date"] = ""
+        update_data["report_note_processed_date"] = ""
         
     await db.reports.update_one({"id": report_id}, {"$set": update_data})
     return {"success": True, "consultant_note_processed": new_status, "consultant_note_processed_date": update_data.get("consultant_note_processed_date", "")}
@@ -5419,7 +5426,7 @@ async def get_report_notes(
     
     reports = await db.reports.find(
         query, 
-        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "notes": 1, "report_note_processed": 1, "report_note_processed_date": 1, "created_at": 1, "status": 1}
+        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "notes": 1, "report_note_reply": 1, "report_note_replied_by": 1, "report_note_replies": 1, "report_note_processed": 1, "report_note_processed_date": 1, "created_at": 1, "status": 1}
     ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     return {"reports": reports, "total": total, "page": page, "limit": limit}
@@ -5435,10 +5442,17 @@ async def edit_report_note(report_id: str, payload: ReportNoteUpdate, current_us
     user_role = getattr(current_user, "role", current_user.get("role") if isinstance(current_user, dict) else None)
     can_create = getattr(current_user, "can_create_subusers", current_user.get("can_create_subusers") if isinstance(current_user, dict) else False)
     
-    if user_role != "admin" and not can_create:
-        raise HTTPException(status_code=403, detail="Only Level 1 and Level 2 can edit report notes")
+    user_doc = current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user
+    has_owner_perm = has_project_permission(user_doc, report.get("project"), "owner_notes")
+    has_note_perm = has_project_permission(user_doc, report.get("project"), "report_notes")
+    
+    if user_role != "admin" and not can_create and not has_owner_perm and not has_note_perm:
+        raise HTTPException(status_code=403, detail="Not authorized to edit report notes")
         
-    await db.reports.update_one({"id": report_id}, {"$set": {"notes": payload.notes}})
+    update_data = {"notes": payload.notes}
+    if payload.notes:
+        update_data["report_note_processed"] = False
+    await db.reports.update_one({"id": report_id}, {"$set": update_data})
     return {"success": True, "notes": payload.notes}
 
 @api_router.delete("/reports/{report_id}/report-note")
@@ -5456,6 +5470,74 @@ async def delete_report_note(report_id: str, current_user: User = Depends(get_cu
     await db.reports.update_one({"id": report_id}, {"$set": {"notes": ""}})
     return {"success": True}
 
+@api_router.put("/reports/{report_id}/report_note_processed")
+async def toggle_report_note_processed(report_id: str, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    user_role = getattr(current_user, "role", current_user.get("role") if isinstance(current_user, dict) else None)
+    can_create = getattr(current_user, "can_create_subusers", current_user.get("can_create_subusers") if isinstance(current_user, dict) else False)
+    
+    if user_role != "admin" and not can_create:
+        raise HTTPException(status_code=403, detail="Only Level 1 and Level 2 can process report notes")
+    
+    current_status = report.get("report_note_processed", False)
+    new_status = not current_status
+    
+    from datetime import datetime, timezone
+    update_data = {
+        "report_note_processed": new_status,
+        "consultant_note_processed": new_status
+    }
+    if new_status:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        update_data["report_note_processed_date"] = now_iso
+        update_data["consultant_note_processed_date"] = now_iso
+    else:
+        update_data["report_note_processed_date"] = ""
+        update_data["consultant_note_processed_date"] = ""
+        
+    await db.reports.update_one({"id": report_id}, {"$set": update_data})
+    return {"success": True, "report_note_processed": new_status, "report_note_processed_date": update_data.get("report_note_processed_date", "")}
+
+class ReportNoteReply(BaseModel):
+    reply: str
+
+@api_router.put("/reports/{report_id}/report_note_reply")
+async def update_report_note_reply(report_id: str, payload: ReportNoteReply, current_user: User = Depends(get_current_user)):
+    report = await db.reports.find_one({"id": report_id})
+    if not report: raise HTTPException(status_code=404, detail="Report not found")
+    
+    user_doc = current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user
+    if not has_project_permission(user_doc, report.get("project"), "consultant_notes") and user_doc.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only consultant can reply to this note")
+        
+    replier_name = current_user.full_name if getattr(current_user, 'full_name', None) else current_user.username
+    from datetime import datetime, timezone
+    import uuid
+    
+    if not payload.reply.strip():
+        # Clear replies
+        await db.reports.update_one({"id": report_id}, {"$set": {"report_note_replies": [], "report_note_processed": False}})
+        return {"success": True, "report_note_replies": []}
+    
+    new_reply = {
+        "id": str(uuid.uuid4()),
+        "reply": payload.reply,
+        "replied_by": replier_name,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.reports.update_one(
+        {"id": report_id}, 
+        {"$push": {"report_note_replies": new_reply}, "$set": {"report_note_processed": False}}
+    )
+    
+    # fetch updated document to return full array
+    updated_report = await db.reports.find_one({"id": report_id})
+    return {"success": True, "report_note_replies": updated_report.get("report_note_replies", [])}
+
+
 class ConsultantNoteReply(BaseModel):
     reply: str
 
@@ -5464,8 +5546,10 @@ async def update_consultant_note_reply(report_id: str, payload: ConsultantNoteRe
     report = await db.reports.find_one({"id": report_id})
     if not report: raise HTTPException(status_code=404, detail="Report not found")
     
-    if not has_project_permission(current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user, report.get("project"), "consultant_notes"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+    if not has_project_permission(current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user, report.get("project"), "consultant_notes") and \
+       not has_project_permission(current_user.model_dump() if hasattr(current_user, 'model_dump') else current_user, report.get("project"), "owner_notes") and \
+       not getattr(current_user, 'role', '') == 'admin':
+        raise HTTPException(status_code=403, detail="Not authorized to reply")
         
     replier_name = current_user.full_name if getattr(current_user, 'full_name', None) else current_user.username
     update_data = {
@@ -5473,10 +5557,8 @@ async def update_consultant_note_reply(report_id: str, payload: ConsultantNoteRe
         "consultant_note_replied_by": replier_name if payload.reply else ""
     }
     
-    # Do not auto-change consultant_note_processed when adding a reply
-    # The user will manually click the button to mark it as processed
-    if not payload.reply:
-        # Only reset it if they delete the reply entirely
+    if payload.reply:
+        # Reset processed status so admin/consultant sees the new reply
         update_data["consultant_note_processed"] = False
         
     await db.reports.update_one({"id": report_id}, {"$set": update_data})
@@ -8438,8 +8520,6 @@ async def export_selected_reports_pdf(
             "بلاغات محافظة": "Reports of Governorate", "لشهر": "for Month", "تقرير البلاغات": "Reports Report",
             "تنفيذ م-محمود محمد هارون مدير النظام وتحليل البيانات": "Implemented by Eng. Mahmoud Haroon - System & Data Manager",
             "شركة المياه الوطنية": "National Water Company", "مكتب بيت الخبرة للاستشارات الهندسية": "Bayt Al Khibra Eng. Consultancy",
-            "الاسم: ........................": "Name: ........................",
-            "التوقيع: ........................": "Signature: ........................",
             "قيد المعالجة": "In Progress", "مغلقة بواسطة الاستشاري": "Closed by Consultant",
             "لم يتم إصدار رخصة": "License Not Issued",
             "ايصال": "Esal", "ايصال الرياض": "Esal Riyadh",
@@ -8785,10 +8865,20 @@ async def export_selected_reports_pdf(
     
     # ========== إضافة قسم التوقيعات مباشرة تحت الجدول ==========
     # بيانات التوقيع مع اسم المراقب
-    company_name = branding.get("company_name", "مكتب بيت الخبرة للاستشارات الهندسية")
+    platform_settings = await db.platform_settings.find_one({"key": "platform_name"}, {"_id": 0}) or {}
+    platform_name = platform_settings.get("value", "مكتب بيت الخبرة للاستشارات الهندسية")
+    
+    company_name = branding.get("company_name")
+    if not company_name:
+        company_name = platform_name
+        
+    partner_company = branding.get("partner_company_name")
+    if not partner_company:
+        partner_company = "شركة المياه الوطنية"
+        
     sig_data = [
         [
-            arabic_text("شركة المياه الوطنية"),
+            arabic_text(partner_company),
             "",
             "",
             arabic_text(company_name)
@@ -11058,10 +11148,20 @@ async def export_reports_pdf(
         return get_display(reshape(text))
     
     # بيانات التوقيع مع اسم المراقب
-    company_name = branding.get("company_name", "مكتب بيت الخبرة للاستشارات الهندسية")
+    platform_settings = await db.platform_settings.find_one({"key": "platform_name"}, {"_id": 0}) or {}
+    platform_name = platform_settings.get("value", "مكتب بيت الخبرة للاستشارات الهندسية")
+
+    company_name = branding.get("company_name")
+    if not company_name:
+        company_name = platform_name
+        
+    partner_company = branding.get("partner_company_name")
+    if not partner_company:
+        partner_company = "شركة المياه الوطنية"
+        
     sig_data = [
         [
-            sig_arabic("شركة المياه الوطنية"),
+            sig_arabic(partner_company),
             "",
             "",
             sig_arabic(company_name)
@@ -12493,14 +12593,21 @@ async def export_water_connections_excel(data: ExportRequest, current_user: User
     
     last_col = get_column_letter(len(headers))
     
+    branding = await db.platform_settings.find_one({"key": "branding"}, {"_id": 0}) or {}
+    platform_settings = await db.platform_settings.find_one({"key": "platform_name"}, {"_id": 0}) or {}
+    platform_name = platform_settings.get("value", "مكتب بيت الخبرة للاستشارات الهندسية")
+    
+    partner_company = branding.get("partner_company_name") or "شركة المياه الوطنية"
+    company_name = branding.get("company_name") or platform_name
+
     # Title rows with company info
     ws.merge_cells(f'A1:{last_col}1')
-    ws['A1'] = "شركة المياه الوطنية"
+    ws['A1'] = partner_company
     ws['A1'].font = Font(bold=True, size=18, color="0066CC")
     ws['A1'].alignment = Alignment(horizontal='center')
     
     ws.merge_cells(f'A2:{last_col}2')
-    ws['A2'] = "مكتب بيت الخبرة للاستشارات الهندسية"
+    ws['A2'] = company_name
     ws['A2'].font = Font(bold=True, size=14, color="006600")
     ws['A2'].alignment = Alignment(horizontal='center')
     
@@ -12655,12 +12762,19 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     normal_style = ParagraphStyle('ArabicNormal', parent=styles['Normal'], fontName='Arabic', fontSize=10, alignment=TA_CENTER)
     signature_style = ParagraphStyle('Signature', parent=styles['Normal'], fontName='Arabic', fontSize=9, alignment=TA_RIGHT, textColor=colors.HexColor('#333333'))
     
+    branding = await db.platform_settings.find_one({"key": "branding"}, {"_id": 0}) or {}
+    platform_settings = await db.platform_settings.find_one({"key": "platform_name"}, {"_id": 0}) or {}
+    platform_name = platform_settings.get("value", "مكتب بيت الخبرة للاستشارات الهندسية")
+    
+    partner_company = branding.get("partner_company_name") or "شركة المياه الوطنية"
+    company_name = branding.get("company_name") or platform_name
+
     # Header with company names
-    elements.append(Paragraph(arabic_text("شركة المياه الوطنية"), title_style))
+    elements.append(Paragraph(arabic_text(partner_company), title_style))
     elements.append(Spacer(1, 5))
-    elements.append(Paragraph(arabic_text("National Water Company"), normal_style))
+    elements.append(Paragraph(arabic_text("National Water Company" if partner_company == "شركة المياه الوطنية" else ""), normal_style))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph(arabic_text("مكتب بيت الخبرة للاستشارات الهندسية"), subtitle_style))
+    elements.append(Paragraph(arabic_text(company_name), subtitle_style))
     elements.append(Spacer(1, 15))
     elements.append(Paragraph(arabic_text(f"تقرير توصيلات المياه - {data.project_name}"), title_style))
     elements.append(Spacer(1, 5))
@@ -12713,8 +12827,8 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     # Electronic signature section - تحسين التوقيع الإلكتروني
     # على اليسار: بيت الخبرة | على اليمين: شركة المياه الوطنية
     signature_table_data = [
-        [arabic_text("شركة المياه الوطنية"), '', arabic_text("مكتب بيت الخبرة للاستشارات الهندسية")],
-        [arabic_text("National Water Company"), '', arabic_text("Bayt Al-Khibra Engineering")],
+        [arabic_text(partner_company), '', arabic_text(company_name)],
+        [arabic_text("National Water Company" if partner_company == "شركة المياه الوطنية" else ""), '', arabic_text("Bayt Al-Khibra Engineering" if company_name == "مكتب بيت الخبرة للاستشارات الهندسية" else "")],
         ['', '', ''],
         [arabic_text("اسم المعتمد: ________________"), '', arabic_text(f"اسم المسؤول: {current_user.full_name}")],
         [arabic_text("التوقيع: ________________"), '', arabic_text("التوقيع: ________________")],
@@ -12738,7 +12852,7 @@ async def export_water_connections_pdf(data: ExportRequest, current_user: User =
     elements.append(Spacer(1, 15))
     
     # Footer
-    elements.append(Paragraph(arabic_text("شركة المياه الوطنية - مكتب بيت الخبرة للاستشارات الهندسية"), signature_style))
+    elements.append(Paragraph(arabic_text(f"{partner_company} - {company_name}"), signature_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -12782,14 +12896,21 @@ async def export_sewage_connections_excel(data: ExportRequest, current_user: Use
     
     last_col = get_column_letter(len(headers))
     
+    branding = await db.platform_settings.find_one({"key": "branding"}, {"_id": 0}) or {}
+    platform_settings = await db.platform_settings.find_one({"key": "platform_name"}, {"_id": 0}) or {}
+    platform_name = platform_settings.get("value", "مكتب بيت الخبرة للاستشارات الهندسية")
+    
+    partner_company = branding.get("partner_company_name") or "شركة المياه الوطنية"
+    company_name = branding.get("company_name") or platform_name
+
     # Title rows with company info
     ws.merge_cells(f'A1:{last_col}1')
-    ws['A1'] = "شركة المياه الوطنية"
+    ws['A1'] = partner_company
     ws['A1'].font = Font(bold=True, size=18, color="228B22")
     ws['A1'].alignment = Alignment(horizontal='center')
     
     ws.merge_cells(f'A2:{last_col}2')
-    ws['A2'] = "مكتب بيت الخبرة للاستشارات الهندسية"
+    ws['A2'] = company_name
     ws['A2'].font = Font(bold=True, size=14, color="006600")
     ws['A2'].alignment = Alignment(horizontal='center')
     
@@ -12943,12 +13064,19 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     normal_style = ParagraphStyle('ArabicNormal', parent=styles['Normal'], fontName='Arabic', fontSize=10, alignment=TA_CENTER)
     signature_style = ParagraphStyle('Signature', parent=styles['Normal'], fontName='Arabic', fontSize=9, alignment=TA_RIGHT, textColor=colors.HexColor('#333333'))
     
+    branding = await db.platform_settings.find_one({"key": "branding"}, {"_id": 0}) or {}
+    platform_settings = await db.platform_settings.find_one({"key": "platform_name"}, {"_id": 0}) or {}
+    platform_name = platform_settings.get("value", "مكتب بيت الخبرة للاستشارات الهندسية")
+    
+    partner_company = branding.get("partner_company_name") or "شركة المياه الوطنية"
+    company_name = branding.get("company_name") or platform_name
+
     # Header with company names
-    elements.append(Paragraph(arabic_text("شركة المياه الوطنية"), title_style))
+    elements.append(Paragraph(arabic_text(partner_company), title_style))
     elements.append(Spacer(1, 5))
-    elements.append(Paragraph(arabic_text("National Water Company"), normal_style))
+    elements.append(Paragraph(arabic_text("National Water Company" if partner_company == "شركة المياه الوطنية" else ""), normal_style))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph(arabic_text("مكتب بيت الخبرة للاستشارات الهندسية"), subtitle_style))
+    elements.append(Paragraph(arabic_text(company_name), subtitle_style))
     elements.append(Spacer(1, 15))
     elements.append(Paragraph(arabic_text(f"تقرير توصيلات الصرف الصحي - {data.project_name}"), title_style))
     elements.append(Spacer(1, 5))
@@ -13001,8 +13129,8 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     # Electronic signature section - تحسين التوقيع الإلكتروني
     # على اليسار: بيت الخبرة | على اليمين: شركة المياه الوطنية
     signature_table_data = [
-        [arabic_text("شركة المياه الوطنية"), '', arabic_text("مكتب بيت الخبرة للاستشارات الهندسية")],
-        [arabic_text("National Water Company"), '', arabic_text("Bayt Al-Khibra Engineering")],
+        [arabic_text(partner_company), '', arabic_text(company_name)],
+        [arabic_text("National Water Company" if partner_company == "شركة المياه الوطنية" else ""), '', arabic_text("Bayt Al-Khibra Engineering" if company_name == "مكتب بيت الخبرة للاستشارات الهندسية" else "")],
         ['', '', ''],
         [arabic_text("اسم المعتمد: ________________"), '', arabic_text(f"اسم المسؤول: {current_user.full_name}")],
         [arabic_text("التوقيع: ________________"), '', arabic_text("التوقيع: ________________")],
@@ -13026,7 +13154,7 @@ async def export_sewage_connections_pdf(data: ExportRequest, current_user: User 
     elements.append(Spacer(1, 15))
     
     # Footer
-    elements.append(Paragraph(arabic_text("شركة المياه الوطنية - مكتب بيت الخبرة للاستشارات الهندسية"), signature_style))
+    elements.append(Paragraph(arabic_text(f"{partner_company} - {company_name}"), signature_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -14409,6 +14537,14 @@ async def upload_file(
     ext = file.filename.split(".")[-1].lower() if "." in file.filename else "bin"
     content_type = file.content_type or "application/octet-stream"
     
+    if ext == "bin" or ext == "":
+        if "pdf" in content_type.lower():
+            ext = "pdf"
+        elif "jpeg" in content_type.lower() or "jpg" in content_type.lower():
+            ext = "jpg"
+        elif "png" in content_type.lower():
+            ext = "png"
+    
     # ضغط الصور إذا كانت أكبر من 30 كيلوبايت
     if ext in ("jpg", "jpeg", "png", "webp") and len(data) > 30000:
         try:
@@ -14485,43 +14621,16 @@ async def upload_file(
     # ضغط ملفات PDF
     if ext == "pdf" and len(data) > 50000:
         try:
-            from pypdf import PdfReader, PdfWriter
-            from PIL import Image
-            import io
+            import fitz  # PyMuPDF
             
-            def try_compress_pdf(data_bytes, img_quality=60, max_dim=1200):
-                reader = PdfReader(io.BytesIO(data_bytes))
-                writer = PdfWriter()
+            def try_compress_pdf(data_bytes):
+                doc = fitz.open("pdf", data_bytes)
+                # compress with PyMuPDF
+                new_bytes = doc.write(garbage=4, deflate=True, clean=True)
+                doc.close()
+                return new_bytes
                 
-                for page in reader.pages:
-                    if page.images:
-                        for img_file in page.images:
-                            try:
-                                img = Image.open(io.BytesIO(img_file.data))
-                                if max(img.size) > max_dim:
-                                    img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-                                img_file.replace(img)
-                            except Exception as img_err:
-                                logging.warning(f"Error compressing PDF image: {img_err}")
-                    writer.add_page(page)
-                    
-                for page in writer.pages:
-                    try:
-                        page.compress_content_keys()
-                    except Exception as comp_err:
-                        logging.warning(f"Error compressing page content keys: {comp_err}")
-                        
-                out_buf = io.BytesIO()
-                writer.write(out_buf)
-                return out_buf.getvalue()
-                
-            # First attempt: quality 60, max_dim 1200
-            compressed_data = try_compress_pdf(data, img_quality=60, max_dim=1200)
-            
-            # If still > 2MB, try more aggressive: quality 40, max_dim 800
-            if len(compressed_data) > 2097152:
-                compressed_data = try_compress_pdf(data, img_quality=40, max_dim=800)
-                
+            compressed_data = try_compress_pdf(data)
             if len(compressed_data) < len(data):
                 data = compressed_data
         except Exception as e:
@@ -15448,10 +15557,7 @@ async def get_safety_reports(
         return []
     query = {"is_deleted": {"$ne": True}}
     
-    is_admin = user_doc.get("role") == "admin"
-    is_manager = user_doc.get("can_create_subusers", False)
-    if not is_admin and not is_manager:
-        query["created_by"] = user_doc.get("username", "")
+
         
     and_clauses = []
     
@@ -15637,10 +15743,7 @@ async def get_quality_reports(
         return []
     query = {"is_deleted": {"$ne": True}}
     
-    is_admin = user_doc.get("role") == "admin"
-    is_manager = user_doc.get("can_create_subusers", False)
-    if not is_admin and not is_manager:
-        query["created_by"] = user_doc.get("username", "")
+
         
     and_clauses = []
     
@@ -15966,10 +16069,7 @@ async def get_business_reports(
         raise HTTPException(status_code=403, detail="Forbidden")
     query = {"is_deleted": {"$ne": True}}
     
-    is_admin = user_doc.get("role") == "admin"
-    is_manager = user_doc.get("can_create_subusers", False)
-    if not is_admin and not is_manager:
-        query["created_by"] = user_doc.get("username", "")
+
         
     and_clauses = []
     
@@ -16186,10 +16286,7 @@ async def get_work_permits(
         return []
     query = {"is_deleted": {"$ne": True}}
     
-    is_admin = user_doc.get("role") == "admin"
-    is_manager = user_doc.get("can_create_subusers", False)
-    if not is_admin and not is_manager:
-        query["created_by"] = user_doc.get("username", "")
+
         
     and_clauses = []
     if user_doc.get("role") != "admin":
@@ -16334,10 +16431,7 @@ async def get_violations(
     else:
         query["type"] = type
         
-    is_admin = user_doc.get("role") == "admin"
-    is_manager = user_doc.get("can_create_subusers", False)
-    if not is_admin and not is_manager:
-        query["created_by"] = user_doc.get("username", "")
+
 
     and_clauses = []
     if user_doc.get("role") != "admin":
@@ -17152,7 +17246,7 @@ async def get_dashboard_badges(current_user: User = Depends(get_current_user)):
     badges = {
         "safety": 0, "quality": 0, "warehouse": 0, "business": 0,
         "safety_notes": 0, "quality_notes": 0, "work_permits_notes": 0, "violations_notes": 0,
-        "work_permits": 0, "violations": 0
+        "work_permits": 0, "violations": 0, "report_notes": 0, "consultant": 0
     }
     
     import asyncio
@@ -17199,6 +17293,14 @@ async def get_dashboard_badges(current_user: User = Depends(get_current_user)):
         keys.append("violations")
         tasks.append(db.violations.count_documents(get_query(note_q)))
         keys.append("violations_notes")
+        
+    if role == "admin" or "report_notes" in user_perms:
+        tasks.append(db.reports.count_documents(get_query({"notes": {"$ne": "", "$exists": True}, "report_note_processed": {"$ne": True}})))
+        keys.append("report_notes")
+        
+    if role == "admin" or "consultant_notes" in user_perms or "owner_notes" in user_perms:
+        tasks.append(db.reports.count_documents(get_query({"consultant_note": {"$ne": "", "$exists": True}, "consultant_note_processed": {"$ne": True}})))
+        keys.append("consultant")
         
     results = await asyncio.gather(*tasks) if tasks else []
     for k, v in zip(keys, results):
