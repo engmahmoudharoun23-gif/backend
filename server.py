@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Query, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, Body, Header, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -184,6 +185,9 @@ app = FastAPI(
     # ⚡ تحسينات الأداء
     openapi_url=None,  # تعطيل OpenAPI في الإنتاج للسرعة
 )
+
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 print("SERVER RELOADING - WFM TOGGLE ACTIVE")
 
@@ -388,10 +392,13 @@ def get_flexible_project_query(project_name):
             else: pattern += re.escape(char)
         regex_parts.append(pattern)
     
-    # الربط بين الكلمات بـ [\s\-_]* للسماح بمسافات أو شرطات فقط بينها (أكثر دقة من .*)
-    # مع تدعيم البداية والنهاية لضمان عدم خلط المشاريع (مثل إيصال وإيصال الرياض)
-    # السماح بكلمة "مشروع" اختيارياً في البداية
-    full_regex = r"^(مشروع\s+)?" + r"[\s\-_]*".join(regex_parts) + r".*$"
+    # الربط بين الكلمات بـ .* بدلاً من [\s\-_]* لضمان عدم فشل البحث إذا حذفت كلمة مثل "إصلاح" وكانت موجودة في النص الأصلي
+    # وإضافة التطابق الحرفي الدقيق كخيار أول في الـ Regex
+    exact_pattern = re.escape(project_name)
+    norm_pattern = re.escape(normalize_arabic(project_name))
+    flexible_pattern = r"(مشروع\s+)?.*" + r".*".join(regex_parts) + r".*"
+    
+    full_regex = f"^({exact_pattern})$|^({norm_pattern})$|^({flexible_pattern})$"
     return {"$regex": full_regex, "$options": "i"}
 
 
@@ -412,9 +419,14 @@ def get_flexible_in_query(items: List[str], field_name: str = "project") -> dict
     for item in items:
         if not item or item in all_keywords:
             continue
-        q = get_flexible_project_query(item)
+        clean_item = str(item).strip()
+        norm_item = normalize_arabic(clean_item)
+        q = get_flexible_project_query(clean_item)
         clauses.append({field_name: q})
-    
+        clauses.append({field_name: clean_item})
+        if norm_item != clean_item:
+            clauses.append({field_name: norm_item})
+            
     if not clauses:
         return {}
     if len(clauses) == 1:
@@ -470,9 +482,14 @@ def get_loose_in_query(items: List[str], field_name: str = "project") -> dict:
     for item in items:
         if not item or item in all_keywords:
             continue
-        q = get_loose_project_query(item)
+        clean_item = str(item).strip()
+        norm_item = normalize_arabic(clean_item)
+        q = get_loose_project_query(clean_item)
         clauses.append({field_name: q})
-        
+        clauses.append({field_name: clean_item})
+        if norm_item != clean_item:
+            clauses.append({field_name: norm_item})
+            
     if not clauses:
         return {}
     if len(clauses) == 1:
@@ -534,6 +551,8 @@ ALL_PERMISSIONS = [
     {"key": "work_permits_edit", "label": "تعديل تصاريح العمل", "group": "التقارير"},
     {"key": "work_permits_delete", "label": "حذف تصاريح العمل", "group": "التقارير"},
     {"key": "view_governorate_data", "label": "رؤية إجمالي بيانات المحافظة (تجاوز منشئ البلاغ)", "group": "النظام"},
+    {"key": "meetings", "label": "الاجتماعات", "group": "الإدارة"},
+    {"key": "meetings_add", "label": "إضافة اجتماع", "group": "الإدارة"},
 ]
 
 
@@ -550,7 +569,7 @@ PROJECT_SCOPED_PERMISSIONS = {
     "cars", "cars_manage", "fleet_maintenance", "hr_management",
     "dashboard", "trash", "settings", "support_messages",
     "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close",
-    "violations", "work_permits", "work_permits_edit", "work_permits_delete"
+    "violations", "work_permits", "work_permits_edit", "work_permits_delete", "meetings", "meetings_add"
 }
 
 
@@ -2181,13 +2200,13 @@ async def delete_project(project_id: str, current_user: User = Depends(get_curre
         raise HTTPException(status_code=403, detail="غير مصرح")
     
     # الحصول على اسم المشروع قبل حذفه
-    project = await db.projects.find_one({"id": project_id})
+    project = await db.projects.find_one({"$or": [{"id": project_id}, {"name": project_id}]})
     if not project:
         raise HTTPException(status_code=404, detail="المشروع غير موجود")
     
     project_name = project.get("name")
     
-    result = await db.projects.delete_one({"id": project_id})
+    result = await db.projects.delete_one({"$or": [{"id": project_id}, {"name": project_id}]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="المشروع غير موجود")
     
@@ -8515,7 +8534,7 @@ async def export_selected_reports_pdf(
         trans = {
             "رقم": "No.", "المحافظة": "Governorate", "المشروع": "Project", 
             "رقم البلاغ": "Report No.", "رقم الرخصة": "License No.", "حالة الرخصة": "License Status",
-            "الحالة": "Status", "نوع البلاغ": "Type", "العمق": "Depth", "القطر": "Diameter",
+            "الحالة": "Status", "خط العرض": "Latitude", "خط الطول": "Longitude", "نوع البلاغ": "Type", "العمق": "Depth", "القطر": "Diameter",
             "المقاول": "Contractor", "تاريخ الإنشاء": "Created At",
             "بلاغات محافظة": "Reports of Governorate", "لشهر": "for Month", "تقرير البلاغات": "Reports Report",
             "تنفيذ م-محمود محمد هارون مدير النظام وتحليل البيانات": "Implemented by Eng. Mahmoud Haroon - System & Data Manager",
@@ -8722,8 +8741,8 @@ async def export_selected_reports_pdf(
     
     # الرأس - 11 عمود (مع العمق والقطر) - معكوسة من اليمين لليسار
     headers = [
-        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة الرخصة",
-        "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الإنشاء"
+        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", 
+        "الحالة", "خط العرض", "خط الطول", "نوع البلاغ", "المقاول", "تاريخ الإنشاء"
     ]
     
     # عكس ترتيب الأعمدة لتبدأ من اليمين (RTL)
@@ -8794,11 +8813,10 @@ async def export_selected_reports_pdf(
         row = [
             Paragraph(date_str, latin_cell_style),  # تاريخ الإنشاء - يمين
             Paragraph(arabic_text(report.get('contractor') or ''), cell_style),  # المقاول
-            Paragraph(diameter_str, latin_cell_style),  # القطر بالملليمتر
-            Paragraph(depth_str, latin_cell_style),  # العمق بالمتر
             Paragraph(arabic_text(report.get('report_type') or ''), cell_style),  # نوع البلاغ
+            Paragraph(str(lng) if lng else '-', latin_cell_style),  # خط الطول
+            Paragraph(str(lat) if lat else '-', latin_cell_style),  # خط العرض
             Paragraph(arabic_text(report.get('status') or ''), cell_style),  # الحالة
-            Paragraph(arabic_text("مغلقة بواسطة الاستشاري") if report.get('wfm_closed') else arabic_text("قيد المعالجة"), cell_style), # حالة الرخصة
             Paragraph(arabic_text(license_num), cell_style),  # رقم الرخصة
             Paragraph(report_num, latin_cell_style),  # رقم البلاغ مع CCP-
             Paragraph(arabic_text(shorten_project_name(report.get('project') or '')), cell_style),  # المشروع
@@ -8809,7 +8827,7 @@ async def export_selected_reports_pdf(
     
     # إنشاء الجدول - 12 عمود متوازن مع توسيع خانة رقم البلاغ والحالة
     # العروض: تاريخ(50), مقاول(70), قطر(35), عمق(35), نوع(50), حالة(125), حالة رخصة(85), رقم رخصة(50), رقم بلاغ(110), مشروع(120), محافظة(35), رقم(20)
-    col_widths = [50, 70, 35, 35, 50, 125, 85, 50, 110, 120, 35, 20]
+    col_widths = [50, 70, 50, 55, 55, 125, 95, 110, 140, 35, 20]
     table = Table(data, colWidths=col_widths, repeatRows=1)
     
     table.setStyle(TableStyle([
@@ -10959,8 +10977,8 @@ async def export_reports_pdf(
     
     # إعداد البيانات - 11 عمود (مع العمق والقطر)
     headers = [
-        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", "حالة الرخصة",
-        "الحالة", "نوع البلاغ", "العمق", "القطر", "المقاول", "تاريخ الإنشاء"
+        "رقم", "المحافظة", "المشروع", "رقم البلاغ", "رقم الرخصة", 
+        "الحالة", "خط العرض", "خط الطول", "نوع البلاغ", "المقاول", "تاريخ الإنشاء"
     ]
     
     # عكس ترتيب الأعمدة لتبدأ من اليمين (RTL)
@@ -11076,7 +11094,7 @@ async def export_reports_pdf(
     # المجموع: 65+75+50+50+65+85+75+85+105+60+28 = 743 points (ضمن 802)
     # إنشاء الجدول - 12 عمود متوازن مع توسيع خانة رقم البلاغ والحالة
     # العروض: تاريخ(50), مقاول(70), قطر(35), عمق(35), نوع(50), حالة(125), حالة رخصة(85), رقم رخصة(50), رقم بلاغ(110), مشروع(120), محافظة(35), رقم(20)
-    col_widths = [50, 70, 35, 35, 50, 125, 85, 50, 110, 120, 35, 20]
+    col_widths = [50, 70, 50, 55, 55, 125, 95, 110, 140, 35, 20]
     table = Table(data, colWidths=col_widths, repeatRows=1)
     # العمود 7 من اليسار (index 7) هو رقم البلاغ (CCB-)
     # والعمود 0 هو التاريخ (يحتاج خط لاتيني أيضاً)
@@ -17334,6 +17352,275 @@ async def compress_pdf(data: dict, current_user: User = Depends(get_current_user
     except Exception as e:
         print("PDF compression error:", str(e))
         return {"pdf": pdf_base64}
+
+
+
+
+# ============= MEETINGS MODULE =============
+import uuid
+import shutil
+import os
+from datetime import datetime
+
+UPLOADS_DIR = "uploads"
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+@api_router.get("/meetings")
+async def get_meetings(
+    skip: int = 0,
+    limit: int = 10,
+    date: Optional[str] = Query(None),
+    type: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    query = {}
+    if date:
+        query["date"] = date
+    if type and type != "الكل":
+        query["type"] = type
+    if search:
+        query["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"contractor": {"$regex": search, "$options": "i"}},
+            {"consultant": {"$regex": search, "$options": "i"}},
+            {"project": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}}
+        ]
+    if current_user.role != "admin":
+        has_meetings = user_has_any_project_permission(current_user, "meetings")
+        has_meetings_add = user_has_any_project_permission(current_user, "meetings_add")
+        if not has_meetings and not has_meetings_add:
+            raise HTTPException(status_code=403, detail="غير مصرح")
+            
+        allowed_projects = list(set(get_projects_with_permission(current_user, "meetings")) | set(get_projects_with_permission(current_user, "meetings_add")))
+        if allowed_projects:
+            proj_filter = get_flexible_in_query(allowed_projects, "project")
+            if proj_filter:
+                project_condition = {"$or": [
+                    proj_filter,
+                    {"project": {"$in": ["", None]}},
+                    {"project": {"$exists": False}}
+                ]}
+                
+                if "$or" in query:
+                    # If we already have $or (e.g. from search), we must use $and to combine them
+                    query = {"$and": [query, project_condition]}
+                else:
+                    query.update(project_condition)
+        
+    total = await db.meetings.count_documents(query)
+    meetings = await db.meetings.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    
+    # Remove _id from dicts
+    for m in meetings:
+        if "_id" in m:
+            del m["_id"]
+            
+    return {"total": total, "meetings": meetings}
+
+@api_router.post("/meetings")
+async def create_meeting(
+    title: str = Form(...),
+    type: str = Form(...),
+    date: str = Form(...),
+    contractor: str = Form(""),
+    consultant: str = Form(""),
+    project: str = Form(""),
+    governorate: str = Form(""),
+    description: str = Form(""),
+    pdfs: List[UploadFile] = File(default=[]),
+    images: List[UploadFile] = File(default=[]),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin" and not user_has_any_project_permission(current_user, "meetings_add"):
+        raise HTTPException(status_code=403, detail="غير مصرح")
+
+    meeting_id = str(uuid.uuid4())
+    pdf_paths = []
+    image_paths = []
+
+    # Process PDFs
+    for pdf in (pdfs or []):
+        if pdf and pdf.filename:
+            ext = os.path.splitext(pdf.filename)[1]
+            pdf_filename = f"meeting_pdf_{uuid.uuid4().hex[:8]}{ext}"
+            p_path = os.path.join(UPLOADS_DIR, pdf_filename)
+            
+            pdf_bytes = await pdf.read()
+            if len(pdf_bytes) > 150 * 1024:
+                try:
+                    import fitz
+                    doc = fitz.open("pdf", pdf_bytes)
+                    compressed_bytes = doc.tobytes(garbage=3, deflate=True)
+                    doc.close()
+                    with open(p_path, "wb") as buffer:
+                        buffer.write(compressed_bytes)
+                except Exception as e:
+                    print("PDF compression error:", e)
+                    with open(p_path, "wb") as buffer:
+                        buffer.write(pdf_bytes)
+            else:
+                with open(p_path, "wb") as buffer:
+                    buffer.write(pdf_bytes)
+                    
+            pdf_paths.append(f"/uploads/{pdf_filename}")
+
+    # Process Images
+    for img in (images or []):
+        if img and img.filename:
+            ext = os.path.splitext(img.filename)[1]
+            img_filename = f"meeting_img_{uuid.uuid4()}{ext}"
+            img_full_path = os.path.join(UPLOADS_DIR, img_filename)
+            with open(img_full_path, "wb") as buffer:
+                shutil.copyfileobj(img.file, buffer)
+            image_paths.append(f"/uploads/{img_filename}")
+
+    new_meeting = {
+        "id": meeting_id,
+        "title": title,
+        "type": type,
+        "date": date,
+        "contractor": contractor,
+        "consultant": consultant,
+        "project": project,
+        "governorate": governorate,
+        "description": description,
+        "pdf_paths": pdf_paths,
+        "images": image_paths,
+        "created_by": current_user.username,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    }
+
+    await db.meetings.insert_one(new_meeting.copy())
+    return {"message": "تم إضافة الاجتماع بنجاح", "meeting": new_meeting}
+
+@api_router.delete("/meetings/{meeting_id}")
+async def delete_meeting(meeting_id: str, current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin" and not user_has_any_project_permission(current_user, "meetings"):
+        raise HTTPException(status_code=403, detail="غير مصرح")
+        
+    meeting = await db.meetings.find_one({"id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="الاجتماع غير موجود")
+        
+    # Delete files
+    for pdf_path in meeting.get("pdf_paths", []):
+        try:
+            os.remove(os.path.join(UPLOADS_DIR, os.path.basename(pdf_path)))
+        except: pass
+        
+    for img_path in meeting.get("images", []):
+        try:
+            os.remove(os.path.join(UPLOADS_DIR, os.path.basename(img_path)))
+        except: pass
+
+    await db.meetings.delete_one({"id": meeting_id})
+    return {"message": "تم حذف الاجتماع بنجاح"}
+
+@api_router.put("/meetings/{meeting_id}")
+async def update_meeting(
+    meeting_id: str,
+    title: str = Form(...),
+    type: str = Form(...),
+    date: str = Form(...),
+    contractor: str = Form(""),
+    consultant: str = Form(""),
+    project: str = Form(""),
+    governorate: str = Form(""),
+    description: str = Form(""),
+    existing_images: str = Form("[]"),
+    existing_pdfs: str = Form("[]"),
+    pdfs: List[UploadFile] = File(default=[]),
+    images: List[UploadFile] = File(default=[]),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin" and not user_has_any_project_permission(current_user, "meetings"):
+        raise HTTPException(status_code=403, detail="غير مصرح")
+        
+    meeting = await db.meetings.find_one({"id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="الاجتماع غير موجود")
+
+    import json
+    try:
+        kept_images = json.loads(existing_images)
+    except:
+        kept_images = []
+        
+    try:
+        kept_pdfs = json.loads(existing_pdfs)
+    except:
+        kept_pdfs = []
+
+    # delete removed files
+    for old_pdf in meeting.get("pdf_paths", []):
+        if old_pdf not in kept_pdfs:
+            try: os.remove(os.path.join(UPLOADS_DIR, os.path.basename(old_pdf)))
+            except: pass
+        
+    for old_img in meeting.get("images", []):
+        if old_img not in kept_images:
+            try: os.remove(os.path.join(UPLOADS_DIR, os.path.basename(old_img)))
+            except: pass
+
+    final_pdfs = kept_pdfs
+    for pdf in (pdfs or []):
+        if pdf and pdf.filename:
+            ext = os.path.splitext(pdf.filename)[1]
+            pdf_filename = f"meeting_pdf_{uuid.uuid4().hex[:8]}{ext}"
+            full_path = os.path.join(UPLOADS_DIR, pdf_filename)
+            
+            pdf_bytes = await pdf.read()
+            if len(pdf_bytes) > 150 * 1024:
+                try:
+                    import fitz
+                    doc = fitz.open("pdf", pdf_bytes)
+                    compressed_bytes = doc.tobytes(garbage=3, deflate=True)
+                    doc.close()
+                    with open(full_path, "wb") as buffer:
+                        buffer.write(compressed_bytes)
+                except Exception as e:
+                    print("PDF compression error:", e)
+                    with open(full_path, "wb") as buffer:
+                        buffer.write(pdf_bytes)
+            else:
+                with open(full_path, "wb") as buffer:
+                    buffer.write(pdf_bytes)
+                    
+            final_pdfs.append(f"/uploads/{pdf_filename}")
+
+    final_images = kept_images
+    for img in (images or []):
+        if img and img.filename:
+            ext = os.path.splitext(img.filename)[1]
+            img_filename = f"meeting_img_{uuid.uuid4()}{ext}"
+            img_full_path = os.path.join(UPLOADS_DIR, img_filename)
+            with open(img_full_path, "wb") as buffer:
+                shutil.copyfileobj(img.file, buffer)
+            final_images.append(f"/uploads/{img_filename}")
+
+    update_data = {
+        "title": title,
+        "type": type,
+        "date": date,
+        "contractor": contractor,
+        "consultant": consultant,
+        "project": project,
+        "governorate": governorate,
+        "description": description,
+        "pdf_paths": final_pdfs,
+        "images": final_images,
+        "updated_at": datetime.utcnow().isoformat()
+    }
+
+    await db.meetings.update_one({"id": meeting_id}, {"$set": update_data})
+    
+    meeting.update(update_data)
+    if "_id" in meeting:
+        del meeting["_id"]
+    return {"message": "تم تعديل الاجتماع بنجاح", "meeting": meeting}
 
 
 app.include_router(api_router)
