@@ -17392,22 +17392,6 @@ async def get_meetings(
         has_meetings_add = user_has_any_project_permission(current_user, "meetings_add")
         if not has_meetings and not has_meetings_add:
             raise HTTPException(status_code=403, detail="غير مصرح")
-            
-        allowed_projects = list(set(get_projects_with_permission(current_user, "meetings")) | set(get_projects_with_permission(current_user, "meetings_add")))
-        if allowed_projects:
-            proj_filter = get_flexible_in_query(allowed_projects, "project")
-            if proj_filter:
-                project_condition = {"$or": [
-                    proj_filter,
-                    {"project": {"$in": ["", None]}},
-                    {"project": {"$exists": False}}
-                ]}
-                
-                if "$or" in query:
-                    # If we already have $or (e.g. from search), we must use $and to combine them
-                    query = {"$and": [query, project_condition]}
-                else:
-                    query.update(project_condition)
         
     total = await db.meetings.count_documents(query)
     meetings = await db.meetings.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
@@ -17443,38 +17427,32 @@ async def create_meeting(
     # Process PDFs
     for pdf in (pdfs or []):
         if pdf and pdf.filename:
-            ext = os.path.splitext(pdf.filename)[1]
-            pdf_filename = f"meeting_pdf_{uuid.uuid4().hex[:8]}{ext}"
-            p_path = os.path.join(UPLOADS_DIR, pdf_filename)
-            
-            pdf_bytes = await pdf.read()
-            if len(pdf_bytes) > 150 * 1024:
-                try:
-                    import fitz
-                    doc = fitz.open("pdf", pdf_bytes)
-                    compressed_bytes = doc.tobytes(garbage=3, deflate=True)
-                    doc.close()
-                    with open(p_path, "wb") as buffer:
-                        buffer.write(compressed_bytes)
-                except Exception as e:
-                    print("PDF compression error:", e)
-                    with open(p_path, "wb") as buffer:
-                        buffer.write(pdf_bytes)
-            else:
-                with open(p_path, "wb") as buffer:
-                    buffer.write(pdf_bytes)
-                    
-            pdf_paths.append(f"/uploads/{pdf_filename}")
+            try:
+                pdf_bytes = await pdf.read()
+                pdf_bytes_to_upload = pdf_bytes
+                if len(pdf_bytes) > 150 * 1024:
+                    try:
+                        import fitz
+                        doc = fitz.open("pdf", pdf_bytes)
+                        pdf_bytes_to_upload = doc.tobytes(garbage=3, deflate=True)
+                        doc.close()
+                    except Exception as e:
+                        print("PDF compression error:", e)
+                
+                secure_url = _upload_image(pdf_bytes_to_upload, category="meetings", ext="pdf", content_type="application/pdf")
+                pdf_paths.append(secure_url)
+            except Exception as e:
+                print("PDF upload error to Cloudinary:", e)
 
     # Process Images
     for img in (images or []):
         if img and img.filename:
-            ext = os.path.splitext(img.filename)[1]
-            img_filename = f"meeting_img_{uuid.uuid4()}{ext}"
-            img_full_path = os.path.join(UPLOADS_DIR, img_filename)
-            with open(img_full_path, "wb") as buffer:
-                shutil.copyfileobj(img.file, buffer)
-            image_paths.append(f"/uploads/{img_filename}")
+            try:
+                img_bytes = await img.read()
+                secure_url = _upload_image(img_bytes, category="meetings", ext="jpg", content_type="image/jpeg")
+                image_paths.append(secure_url)
+            except Exception as e:
+                print("Image upload error to Cloudinary:", e)
 
     new_meeting = {
         "id": meeting_id,
@@ -17568,38 +17546,32 @@ async def update_meeting(
     final_pdfs = kept_pdfs
     for pdf in (pdfs or []):
         if pdf and pdf.filename:
-            ext = os.path.splitext(pdf.filename)[1]
-            pdf_filename = f"meeting_pdf_{uuid.uuid4().hex[:8]}{ext}"
-            full_path = os.path.join(UPLOADS_DIR, pdf_filename)
-            
-            pdf_bytes = await pdf.read()
-            if len(pdf_bytes) > 150 * 1024:
-                try:
-                    import fitz
-                    doc = fitz.open("pdf", pdf_bytes)
-                    compressed_bytes = doc.tobytes(garbage=3, deflate=True)
-                    doc.close()
-                    with open(full_path, "wb") as buffer:
-                        buffer.write(compressed_bytes)
-                except Exception as e:
-                    print("PDF compression error:", e)
-                    with open(full_path, "wb") as buffer:
-                        buffer.write(pdf_bytes)
-            else:
-                with open(full_path, "wb") as buffer:
-                    buffer.write(pdf_bytes)
-                    
-            final_pdfs.append(f"/uploads/{pdf_filename}")
+            try:
+                pdf_bytes = await pdf.read()
+                pdf_bytes_to_upload = pdf_bytes
+                if len(pdf_bytes) > 150 * 1024:
+                    try:
+                        import fitz
+                        doc = fitz.open("pdf", pdf_bytes)
+                        pdf_bytes_to_upload = doc.tobytes(garbage=3, deflate=True)
+                        doc.close()
+                    except Exception as e:
+                        print("PDF compression error:", e)
+                
+                secure_url = _upload_image(pdf_bytes_to_upload, category="meetings", ext="pdf", content_type="application/pdf")
+                final_pdfs.append(secure_url)
+            except Exception as e:
+                print("PDF upload error to Cloudinary:", e)
 
     final_images = kept_images
     for img in (images or []):
         if img and img.filename:
-            ext = os.path.splitext(img.filename)[1]
-            img_filename = f"meeting_img_{uuid.uuid4()}{ext}"
-            img_full_path = os.path.join(UPLOADS_DIR, img_filename)
-            with open(img_full_path, "wb") as buffer:
-                shutil.copyfileobj(img.file, buffer)
-            final_images.append(f"/uploads/{img_filename}")
+            try:
+                img_bytes = await img.read()
+                secure_url = _upload_image(img_bytes, category="meetings", ext="jpg", content_type="image/jpeg")
+                final_images.append(secure_url)
+            except Exception as e:
+                print("Image upload error to Cloudinary:", e)
 
     update_data = {
         "title": title,
