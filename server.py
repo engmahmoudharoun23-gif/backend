@@ -268,6 +268,13 @@ class ConnectionManager:
             except Exception:
                 self.disconnect(user_id)
 
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections.values()):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                pass
+
 manager = ConnectionManager()
 
 # ============= OBJECT STORAGE =============
@@ -553,6 +560,8 @@ ALL_PERMISSIONS = [
     {"key": "view_governorate_data", "label": "رؤية إجمالي بيانات المحافظة (تجاوز منشئ البلاغ)", "group": "النظام"},
     {"key": "meetings", "label": "الاجتماعات", "group": "الإدارة"},
     {"key": "meetings_add", "label": "إضافة اجتماع", "group": "الإدارة"},
+    {"key": "wfm_matching", "label": "مطابقة بلاغات WFM", "group": "البلاغات"},
+    {"key": "update_reports", "label": "تحديث البلاغات", "group": "البلاغات"},
 ]
 
 
@@ -569,7 +578,7 @@ PROJECT_SCOPED_PERMISSIONS = {
     "cars", "cars_manage", "fleet_maintenance", "hr_management",
     "dashboard", "trash", "settings", "support_messages",
     "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close",
-    "violations", "work_permits", "work_permits_edit", "work_permits_delete", "meetings", "meetings_add"
+    "violations", "work_permits", "work_permits_edit", "work_permits_delete", "meetings", "meetings_add", "wfm_matching", "update_reports"
 }
 
 
@@ -2763,13 +2772,20 @@ async def create_report(
     # ⚡ فحص سريع وبسيط
     existing_report = await db.reports.find_one({
         "report_number": report_number
-    }, {"_id": 1})
+    }, {"_id": 1, "license_number": 1, "is_deleted": 1})
     
     if existing_report:
-        raise HTTPException(
-            status_code=400,
-            detail="هذا الرقم موجود مسبقاً"
-        )
+        if existing_report.get("is_deleted", False):
+            raise HTTPException(
+                status_code=400,
+                detail=f"DELETED_REPORT_CONFLICT:{report_number}"
+            )
+        else:
+            ext_license = existing_report.get("license_number", "غير معروف")
+            raise HTTPException(
+                status_code=400,
+                detail=f"رقم البلاغ مقرر وموجود مسبقاً مع الرخصة رقم {ext_license}"
+            )
     
     # التحقق من تكرار رقم الرخصة - فقط للأرقام الفعلية (ليست نصوص تعريفية مثل "لم يتم إصدار رخصة")
     def _is_actual_license(val: str) -> bool:
@@ -2791,9 +2807,10 @@ async def create_report(
             "license_number": license_number
         }, {"_id": 1, "report_number": 1})
         if existing_license:
+            ext_report = existing_license.get("report_number", "غير معروف")
             raise HTTPException(
                 status_code=400,
-                detail="هذا الرقم موجود مسبقاً"
+                detail=f"رقم الرخصة موجود مسبقاً مع البلاغ رقم {ext_report}"
             )
     
     # ⚡ معالجة الصور بشكل متوازي فائق السرعة
@@ -2897,6 +2914,7 @@ async def get_reports(
     start_date_from: Optional[str] = Query(None),
     start_date_to: Optional[str] = Query(None),
     my_reports: Optional[bool] = Query(False),
+    unseen_only: Optional[bool] = Query(False),
     created_by: Optional[str] = Query(None),
     page: Optional[int] = Query(1, ge=1),
     limit: Optional[int] = Query(20, ge=1, le=100),
@@ -2904,6 +2922,18 @@ async def get_reports(
 ):
     # print debug
     query = {"is_deleted": {"$ne": True}}
+    
+    if unseen_only:
+        query.setdefault("$and", []).extend([
+            {"$or": [
+                {"seen_by": {"$exists": False}},
+                {"seen_by": {"$ne": current_user.id}}
+            ]},
+            {"$or": [
+                {"deleted_notifications": {"$exists": False}},
+                {"deleted_notifications": {"$ne": current_user.id}}
+            ]}
+        ])
     
     # قائمة المستخدمين الذين يرون بلاغاتهم فقط تلقائياً (بدون تفعيل "بلاغاتي")
     restricted_users = ["Mohamed Esmat", "ElShazly"]
@@ -3207,6 +3237,7 @@ async def get_reports(
         report['created_by_name'] = users_map.get(report.get('created_by'), 'غير معروف')
     
     # إرجاع البيانات مع معلومات الترقيم
+    await manager.broadcast({"type": "REFRESH_NOTIFICATIONS"})
     return {
         "reports": [ReportResponse(**report).model_dump() for report in reports],
         "total_count": total_count,
@@ -5703,12 +5734,13 @@ async def update_report(
         existing_report = await db.reports.find_one({
             "report_number": report_number,
             "id": {"$ne": report_id}  # استثناء البلاغ الحالي
-        })
+        }, {"_id": 1, "license_number": 1})
         
         if existing_report:
+            ext_license = existing_report.get("license_number", "غير معروف")
             raise HTTPException(
                 status_code=400,
-                detail="هذا الرقم موجود مسبقاً"
+                detail=f"رقم البلاغ مقرر وموجود مسبقاً مع الرخصة رقم {ext_license}"
             )
     
     # التحقق من تكرار رقم الرخصة - فقط للأرقام الفعلية (ليست نصوص مثل "لم يتم إصدار رخصة")
@@ -5726,12 +5758,13 @@ async def update_report(
             existing_license = await db.reports.find_one({
                 "license_number": license_number,
                 "id": {"$ne": report_id}  # استثناء البلاغ الحالي
-            })
+            }, {"_id": 1, "report_number": 1})
             
             if existing_license:
+                ext_report = existing_license.get("report_number", "غير معروف")
                 raise HTTPException(
                     status_code=400,
-                    detail="هذا الرقم موجود مسبقاً"
+                    detail=f"رقم الرخصة موجود مسبقاً مع البلاغ رقم {ext_report}"
                 )
     
     update_data = {}
@@ -5888,6 +5921,7 @@ async def update_report_review_status(
     )
     
     msg = "تم مراجعة البلاغ بنجاح" if new_status == "تمت المراجعة" else "تم اعادة فتح حالة المراجعة"
+    await manager.broadcast({"type": "REFRESH_NOTIFICATIONS"})
     return {
         "message": msg, 
         "review_status": new_status,
@@ -6028,6 +6062,7 @@ async def delete_report(report_id: str, current_user: User = Depends(get_current
     global stats_cache
     stats_cache.clear()
     
+    await manager.broadcast({"type": "REFRESH_NOTIFICATIONS"})
     return {"message": "تم نقل البلاغ إلى سلة المحذوفات بنجاح"}
 
 
@@ -6572,6 +6607,7 @@ async def fix_reports_license_status(
         "updated_closed": closed_result.modified_count,
         "message": f"تم تحديث {license_result.modified_count} بلاغ برخصة، {no_license_result.modified_count} بلاغ بدون رخصة، {closed_result.modified_count} بلاغ مغلق"
     }
+
 
 
 @api_router.post("/reports/import-excel")
@@ -8333,6 +8369,21 @@ async def export_selected_reports_excel(
         "images": 0  # استثناء الصور الكاملة
     }
     reports = await db.reports.find(query, projection).sort("created_at", -1).to_list(5000)
+
+    # Custom sort by governorate then date
+    gov_order = ["شقراء", "مرات", "القصب", "ساجر", "المزاحمية", "ضرماء", "القويعية", "الدوادمي", "عفيف"]
+    def get_gov_idx(g):
+        if not g: return 999
+        for i, val in enumerate(gov_order):
+            if val in g: return i
+        return 999
+
+    def get_date_val(r):
+        dt = r.get("created_at", "")
+        if hasattr(dt, "isoformat"): return dt.isoformat()
+        return str(dt)
+
+    reports.sort(key=lambda r: (get_gov_idx(r.get("governorate", "")), get_date_val(r)))
     
     # جلب عدد الصور لكل بلاغ بشكل منفصل وسريع
     selected_report_ids = [r.get('id') for r in reports if r.get('id')]
@@ -9296,6 +9347,21 @@ async def export_reports_excel(
         "images": 0  # استثناء الصور الكاملة
     }
     reports = await db.reports.find(query, projection).sort("created_at", -1).to_list(None)
+
+    # Custom sort by governorate then date
+    gov_order = ["شقراء", "مرات", "القصب", "ساجر", "المزاحمية", "ضرماء", "القويعية", "الدوادمي", "عفيف"]
+    def get_gov_idx(g):
+        if not g: return 999
+        for i, val in enumerate(gov_order):
+            if val in g: return i
+        return 999
+
+    def get_date_val(r):
+        dt = r.get("created_at", "")
+        if hasattr(dt, "isoformat"): return dt.isoformat()
+        return str(dt)
+
+    reports.sort(key=lambda r: (get_gov_idx(r.get("governorate", "")), get_date_val(r)))
     
     # جلب عدد الصور لكل بلاغ بشكل منفصل وسريع
     report_ids = [r.get('id') for r in reports if r.get('id')]
@@ -11825,6 +11891,7 @@ async def update_water_connection(connection_id: str, data: dict, current_user: 
     
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.water_connections.update_one({"id": connection_id}, {"$set": data})
+    await manager.broadcast({"type": "REFRESH_NOTIFICATIONS"})
     return {"message": "تم تحديث التوصيلة بنجاح"}
 
 
@@ -12275,6 +12342,7 @@ async def update_sewage_connection(connection_id: str, data: dict, current_user:
     
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.sewage_connections.update_one({"id": connection_id}, {"$set": data})
+    await manager.broadcast({"type": "REFRESH_NOTIFICATIONS"})
     return {"message": "تم تحديث التوصيلة بنجاح"}
 
 
@@ -13446,6 +13514,29 @@ async def get_fleet_car_alerts(current_user: User = Depends(get_current_user)):
 
 
 # ============= CHAT WEBSOCKET & ENDPOINTS =============
+
+# WebSocket endpoint للإشعارات العامة
+@app.websocket("/api/ws/notifications/{user_id}")
+async def notifications_websocket_endpoint(websocket: WebSocket, user_id: str, token: str = None):
+    if not token:
+        await websocket.close(code=1008, reason="Missing token")
+        return
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") != user_id:
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+    except Exception:
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+    
+    await manager.connect(websocket, user_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+    except Exception:
+        manager.disconnect(user_id)
+
 
 # WebSocket endpoint للدردشة الفورية
 @app.websocket("/api/ws/chat/{user_id}")
@@ -17340,11 +17431,27 @@ async def compress_pdf(data: dict, current_user: User = Depends(get_current_user
         header, encoded = pdf_base64.split(",", 1)
         pdf_bytes = base64.b64decode(encoded)
         
-        # Compress using PyMuPDF
         doc = fitz.open("pdf", pdf_bytes)
         
-        # Basic optimization
-        new_bytes = doc.write(garbage=4, deflate=True, clean=True)
+        if len(pdf_bytes) <= 200 * 1024:
+            new_bytes = doc.write(garbage=4, deflate=True, clean=True)
+        else:
+            # Aggressive compression: Rasterize pages to compressed JPEG
+            new_doc = fitz.open()
+            for page in doc:
+                # matrix 1.0 = 72 DPI, sufficient for readable reports
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                img_bytes = pix.tobytes("jpeg")
+                
+                new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(page.rect, stream=img_bytes)
+                
+            new_bytes = new_doc.write(garbage=4, deflate=True)
+            new_doc.close()
+            
+            # If it's still somehow extremely large, we could lower matrix, 
+            # but 1.2 matrix with jpeg usually brings it down to ~100-200KB per page.
+            
         doc.close()
         
         new_base64 = header + "," + base64.b64encode(new_bytes).decode('utf-8')
@@ -17354,6 +17461,420 @@ async def compress_pdf(data: dict, current_user: User = Depends(get_current_user
         return {"pdf": pdf_base64}
 
 
+
+
+# ============= WFM MATCHING MODULE =============
+class WfmMatchingRequest(BaseModel):
+    project: str
+    report_numbers: List[str]
+
+@api_router.post("/wfm_matching/check")
+async def check_wfm_reports(req: WfmMatchingRequest, current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin" and not user_has_any_project_permission(current_user, "wfm_matching"):
+        raise HTTPException(status_code=403, detail="غير مصرح")
+        
+    wfm_normalized_set = set()
+    variations_map = {}
+    
+    for num in req.report_numbers:
+        clean_num = str(num).strip()
+        if not clean_num: continue
+        
+        num_no_prefix = clean_num
+        if clean_num.startswith("CCB-") or clean_num.startswith("CCP-"):
+            num_no_prefix = clean_num[4:]
+            
+        normalized = num_no_prefix.lstrip('0')
+        wfm_normalized_set.add(normalized)
+        
+        variations_map[normalized] = clean_num
+
+    query = {}
+    if req.project and req.project != "الكل":
+        query["project"] = req.project
+
+    project_reports = await db.reports.find(query, {"report_number": 1, "governorate": 1, "contractor": 1, "created_at": 1}).to_list(None)
+    
+    matched_originals = set()
+    platform_missing = []
+    
+    for doc in project_reports:
+        db_num = str(doc.get("report_number", "")).strip()
+        if not db_num: continue
+        
+        db_num_no_prefix = db_num
+        if db_num.startswith("CCB-") or db_num.startswith("CCP-"):
+            db_num_no_prefix = db_num[4:]
+            
+        db_normalized = db_num_no_prefix.lstrip('0')
+        
+        if db_normalized in wfm_normalized_set:
+            matched_originals.add(variations_map[db_normalized])
+        else:
+            platform_missing.append({
+                "report_number": db_num,
+                "governorate": doc.get("governorate", "غير محدد"),
+                "contractor": doc.get("contractor", "غير محدد"),
+                "created_at": doc.get("created_at", ""),
+                "reason": "البلاغ مسجل في المنصة ولكنه غير موجود في ملف WFM المرفوع"
+            })
+            
+    return {
+        "matched": list(matched_originals),
+        "platform_missing": platform_missing,
+        "platform_total": len(project_reports)
+    }
+
+
+@api_router.post("/wfm-matching/save")
+async def save_wfm_matching(
+    file: UploadFile = File(...),
+    project: str = Form(...),
+    stats: str = Form(...),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin" and not user_has_any_project_permission(current_user, "wfm_matching"):
+        raise HTTPException(status_code=403, detail="غير مصرح")
+        
+    os.makedirs("uploads", exist_ok=True)
+    import uuid
+    import json
+    import shutil
+    
+    file_id = str(uuid.uuid4())
+    filename = file.filename
+    ext = filename.split(".")[-1] if "." in filename else "xlsx"
+    safe_filename = f"wfm_match_{file_id}.{ext}"
+    file_path = os.path.join("uploads", safe_filename)
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    try:
+        stats_data = json.loads(stats)
+    except:
+        stats_data = {}
+        
+    doc = {
+        "id": file_id,
+        "filename": filename,
+        "project": project,
+        "stats": stats_data,
+        "url": f"/uploads/{safe_filename}",
+        "created_by": current_user.id,
+        "created_at": datetime.utcnow().isoformat() + "Z"
+    }
+    
+    await db.wfm_matching_history.insert_one(doc)
+    return {"message": "تم الحفظ بنجاح", "id": file_id}
+
+@api_router.post("/update-reports/process")
+async def process_update_reports(
+    project: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin" and not user_has_any_project_permission(current_user, "update_reports"):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    try:
+        query = {"project": project}
+        if current_user.role != "admin" and getattr(current_user, "governorates", None):
+            query["governorate"] = {"$in": current_user.governorates}
+
+        db_reports_cursor = db.reports.find(query)
+        db_reports = {str(r.get("report_number")).strip(): r async for r in db_reports_cursor if r.get("report_number")}
+
+        contents = await file.read()
+        import io
+        import openpyxl
+        from openpyxl.styles import PatternFill
+        from datetime import datetime
+
+        wb = openpyxl.load_workbook(filename=io.BytesIO(contents))
+        ws = wb.worksheets[0]
+
+        header_row_idx = 1
+        headers = {}
+        
+        ticket_keywords = ["رقم البلاغ", "ticket number", "complaint number", "ticket", "report number", "الرقم", "رقم الطلب", "complaint", "رقم_البلاغ"]
+        
+        for r in range(1, 15):
+            temp_headers = {}
+            for idx, cell in enumerate(ws[r], 1):
+                val = str(cell.value).strip().lower() if cell.value is not None else ""
+                if val:
+                    temp_headers[val] = idx
+            
+            # Check if any ticket keyword is in the header row
+            if any(any(kw in k for kw in ticket_keywords) for k in temp_headers.keys()):
+                headers = temp_headers
+                header_row_idx = r
+                break
+
+        report_num_col = next((headers[h] for h in headers if any(kw in h for kw in ticket_keywords)), None)
+        status_col = next((headers[h] for h in headers if any(kw in h for kw in ["حالة", "status", "الحالة"])), None)
+        gov_col = next((headers[h] for h in headers if any(kw in h for kw in ["محافظة", "gov", "city", "المدينة"])), None)
+        date_col = next((headers[h] for h in headers if any(kw in h for kw in ["تاريخ", "date"])), None)
+        serial_col = next((headers[h] for h in headers if h.strip() in ["م", "رقم", "#", "sn", "no"]), None)
+        depth_col = next((headers[h] for h in headers if any(kw in h for kw in ["عمق", "depth", "العمق"])), None)
+        diameter_col = next((headers[h] for h in headers if any(kw in h for kw in ["قطر", "diameter", "القطر"])), None)
+
+        if not report_num_col:
+            raise HTTPException(status_code=400, detail="لم يتم العثور على عمود 'رقم البلاغ' في الملف")
+
+        yellow_fill = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
+        green_fill = PatternFill(start_color="FF90EE90", end_color="FF90EE90", fill_type="solid")
+
+        updated_reports = []
+        new_reports_data = []
+        excel_report_numbers = set()
+
+        max_row = ws.max_row
+        all_rows_data = []
+        
+        gov_order_list = ["شقراء", "مرات", "القصب", "ساجر", "المزاحمية", "ضرماء", "القويعية", "الدوادمي", "عفيف"]
+        def get_gov_index(gov_name):
+            if not gov_name: return 999
+            for i, g in enumerate(gov_order_list):
+                if g in gov_name: return i
+            return 999
+
+        def format_dt(dt):
+            if not dt: return ""
+            if isinstance(dt, datetime):
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            return str(dt)
+
+        # Update existing rows and collect them
+        for row in range(header_row_idx + 1, max_row + 1):
+            cell = ws.cell(row=row, column=report_num_col)
+            rep_num = str(cell.value).strip() if cell.value is not None else None
+            
+            if rep_num and rep_num.endswith(".0"):
+                rep_num = rep_num[:-2]
+
+            if not rep_num:
+                continue
+
+            excel_report_numbers.add(rep_num)
+            
+            cell_values = [ws.cell(row=row, column=c).value for c in range(1, ws.max_column + 1)]
+            fills = [None] * ws.max_column
+            
+            gov_val = str(ws.cell(row=row, column=gov_col).value).strip() if gov_col and ws.cell(row=row, column=gov_col).value else ""
+            date_val = str(ws.cell(row=row, column=date_col).value).strip() if date_col and ws.cell(row=row, column=date_col).value else ""
+
+            if rep_num in db_reports:
+                db_rep = db_reports[rep_num]
+                changed = False
+                old_status = ""
+                new_status = ""
+
+                # Check Status (Strict Business Logic)
+                if status_col:
+                    excel_status = str(cell_values[status_col - 1]).strip() if cell_values[status_col - 1] else ""
+                    db_status = db_rep.get("status", "")
+                    report_type = db_rep.get("report_type", "")
+                    
+                    if "أسفلت" in report_type and "متبقي" in excel_status and db_status == "تم الإصلاح":
+                        old_status = excel_status
+                        new_status = db_status
+                        cell_values[status_col - 1] = db_status
+                        changed = True
+                        
+                        close_date_col = next((headers[h] for h in headers if "إغلاق" in h), None)
+                        if close_date_col:
+                            db_date = db_rep.get("closed_at", "")
+                            if db_date:
+                                cell_values[close_date_col - 1] = format_dt(db_date)
+
+                # Update Depth and Diameter if missing or different in Excel
+                if depth_col:
+                    db_depth = db_rep.get("depth_meters", "")
+                    if db_depth != "" and db_depth is not None and str(db_depth) != str(cell_values[depth_col - 1]).strip():
+                        cell_values[depth_col - 1] = db_depth
+
+                if diameter_col:
+                    db_diameter = db_rep.get("diameter_mm", "")
+                    if db_diameter != "" and db_diameter is not None and str(db_diameter) != str(cell_values[diameter_col - 1]).strip():
+                        cell_values[diameter_col - 1] = db_diameter
+
+                if changed:
+                    fills = [yellow_fill] * ws.max_column
+                    date_str = format_dt(db_rep.get("created_at", ""))
+                    
+                    updated_reports.append({
+                        "number": rep_num,
+                        "gov": db_rep.get("governorate", ""),
+                        "observer": db_rep.get("created_by_name", ""),
+                        "date": date_str,
+                        "old_status": old_status,
+                        "new_status": new_status
+                    })
+                    
+            all_rows_data.append({
+                "values": cell_values,
+                "fills": fills,
+                "gov": gov_val,
+                "date": date_val
+            })
+
+        # Find New reports
+        for rep_num, db_rep in db_reports.items():
+            if rep_num not in excel_report_numbers:
+                new_reports_data.append(db_rep)
+
+        formatted_new_reports = []
+
+        if new_reports_data:
+            for db_rep in new_reports_data:
+                new_row = [""] * ws.max_column
+                for header_name, idx in headers.items():
+                    val = ""
+                    if "رقم" in header_name and "البلاغ" not in header_name and "الرخصة" not in header_name:
+                        pass # handled later (serial)
+                    elif "المحافظة" in header_name:
+                        val = db_rep.get("governorate", "")
+                    elif "المشروع" in header_name:
+                        val = db_rep.get("project", "")
+                    elif "رقم البلاغ" in header_name:
+                        val = db_rep.get("report_number", "")
+                    elif "رقم الرخصة" in header_name:
+                        val = db_rep.get("license_number", "")
+                    elif "حالة المعالجة" in header_name:
+                        val = "مغلقة بواسطة الاستشاري" if db_rep.get("wfm_closed") else "قيد المعالجة"
+                    elif "حالة البلاغ" in header_name or "الحالة" in header_name:
+                        val = db_rep.get("status", "")
+                    elif "نوع البلاغ" in header_name:
+                        val = db_rep.get("report_type", "")
+                    elif "العمق" in header_name:
+                        val = db_rep.get("depth_meters", "")
+                    elif "القطر" in header_name:
+                        val = db_rep.get("diameter_mm", "")
+                    elif "المقاول" in header_name:
+                        val = db_rep.get("contractor", "")
+                    elif "خط الطول" in header_name:
+                        val = db_rep.get("longitude", "")
+                    elif "خط العرض" in header_name:
+                        val = db_rep.get("latitude", "")
+                    elif "رخصة أسفلت" in header_name:
+                        val = "نعم" if db_rep.get("asphalt_license_issued") else "لا"
+                    elif "تاريخ الاستلام" in header_name:
+                        val = format_dt(db_rep.get("created_at", ""))
+                    elif "تاريخ المباشرة" in header_name:
+                        val = format_dt(db_rep.get("start_date", ""))
+                    elif "تاريخ الإغلاق" in header_name or "تاريخ الاغلاق" in header_name:
+                        val = format_dt(db_rep.get("closed_at", ""))
+                    elif "عدد الصور" in header_name:
+                        val = len(db_rep.get("images", []))
+                    elif "مراقب الاستشاري" in header_name or "اسم المراقب" in header_name:
+                        val = db_rep.get("created_by_name", "")
+
+                    new_row[idx - 1] = val
+                
+                gov_val = db_rep.get("governorate", "")
+                date_val = format_dt(db_rep.get("created_at", ""))
+                
+                all_rows_data.append({
+                    "values": new_row,
+                    "fills": [green_fill] * ws.max_column,
+                    "gov": gov_val,
+                    "date": date_val
+                })
+
+                formatted_new_reports.append({
+                    "number": db_rep.get("report_number", ""),
+                    "gov": db_rep.get("governorate", ""),
+                    "observer": db_rep.get("created_by_name", ""),
+                    "date": date_val,
+                    "status": db_rep.get("status", "")
+                })
+
+        # Sort all rows by Governorate (custom order) then by date
+        all_rows_data.sort(key=lambda x: (get_gov_index(x["gov"]), x["date"]))
+
+        # Clear existing rows below header
+        ws.delete_rows(header_row_idx + 1, ws.max_row)
+
+        # Write sorted rows back
+        for i, row_data in enumerate(all_rows_data, 1):
+            # Assign sequential number if serial col exists
+            if serial_col:
+                row_data["values"][serial_col - 1] = i
+                
+            ws.append(row_data["values"])
+            current_row = ws.max_row
+            
+            for col_idx, fill in enumerate(row_data["fills"], 1):
+                if fill:
+                    try:
+                        from copy import copy
+                        ws.cell(row=current_row, column=col_idx).fill = copy(fill)
+                    except:
+                        pass
+
+        import time
+        from pathlib import Path
+        upload_dir = Path("uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"updated_reports_{int(time.time())}.xlsx"
+        filepath = upload_dir / filename
+        wb.save(filepath)
+
+        return {
+            "platform_total": len(db_reports),
+            "new_reports_count": len(new_reports_data),
+            "updated_reports_count": len(updated_reports),
+            "new_reports": formatted_new_reports,
+            "updated_reports": updated_reports,
+            "url": f"/uploads/{filename}"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء معالجة الملف: {str(e)}")
+
+@api_router.get("/wfm-matching/history")
+async def get_wfm_matching_history(
+    project: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    query = {}
+    if project:
+        query["project"] = project
+        
+    if current_user.role != "admin":
+        query["created_by"] = current_user.id
+        
+    history = await db.wfm_matching_history.find(query).sort("created_at", -1).to_list(100)
+    for h in history:
+        if "_id" in h:
+            del h["_id"]
+    return history
+
+@api_router.delete("/wfm-matching/{file_id}")
+async def delete_wfm_matching(
+    file_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    doc = await db.wfm_matching_history.find_one({"id": file_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="الملف غير موجود")
+        
+    if current_user.role != "admin" and doc.get("created_by") != current_user.id:
+        raise HTTPException(status_code=403, detail="غير مصرح لك بحذف هذا الملف")
+        
+    try:
+        file_path = doc.get("url", "").lstrip("/")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except: pass
+    
+    await db.wfm_matching_history.delete_one({"id": file_id})
+    return {"message": "تم الحذف بنجاح"}
 
 
 # ============= MEETINGS MODULE =============
@@ -17596,3 +18117,6 @@ async def update_meeting(
 
 
 app.include_router(api_router)
+
+
+
