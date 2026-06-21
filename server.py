@@ -8477,9 +8477,9 @@ async def export_selected_reports_excel(
             report.get('longitude', ''),
             'نعم' if report.get('asphalt_license_issued') else 'لا',
             report.get('notes', ''),
-            created_at.strftime('%Y-%m-%d %H:%M') if created_at else '',
-            start_date.strftime('%Y-%m-%d') if start_date else '',
-            closed_at.strftime('%Y-%m-%d %H:%M') if closed_at else '',
+            created_at.date() if created_at else '',
+            start_date.date() if start_date else '',
+            closed_at.date() if closed_at else '',
             images_count,
             report.get('created_by_name', '')
         ]
@@ -8493,6 +8493,8 @@ async def export_selected_reports_excel(
                 top=Side(style='thin', color='CCCCCC'),
                 bottom=Side(style='thin', color='CCCCCC')
             )
+            if col_idx in [16, 17, 18] and value:
+                cell.number_format = 'yyyy-mm-dd'
     
     output = BytesIO()
     wb.save(output)
@@ -9049,21 +9051,21 @@ async def export_72h_reports_excel(
         
         created_at = report.get('created_at', '')
         if isinstance(created_at, datetime):
-            created_at = created_at.strftime('%d-%m-%Y %H:%M')
+            created_at = created_at.date()
         elif isinstance(created_at, str):
             try:
                 dt_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                created_at = dt_obj.strftime('%d-%m-%Y %H:%M')
+                created_at = dt_obj.date()
             except:
                 pass
                 
         start_date = report.get('start_date', '')
         if isinstance(start_date, datetime):
-            start_date = start_date.strftime('%d-%m-%Y')
+            start_date = start_date.date()
         elif isinstance(start_date, str):
             try:
                 dt_obj = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                start_date = dt_obj.strftime('%d-%m-%Y')
+                start_date = dt_obj.date()
             except:
                 pass
         
@@ -9090,8 +9092,10 @@ async def export_72h_reports_excel(
         ws.cell(row=row, column=9, value=report.get('depth_meters', ''))
         ws.cell(row=row, column=10, value=report.get('diameter_mm', ''))
         ws.cell(row=row, column=11, value=report.get('contractor', ''))
-        ws.cell(row=row, column=12, value=created_at)
-        ws.cell(row=row, column=13, value=start_date)
+        cell_12 = ws.cell(row=row, column=12, value=created_at)
+        if created_at: cell_12.number_format = 'yyyy-mm-dd'
+        cell_13 = ws.cell(row=row, column=13, value=start_date)
+        if start_date: cell_13.number_format = 'yyyy-mm-dd'
     
     # ضبط عرض الأعمدة
     from openpyxl.utils import get_column_letter
@@ -9503,9 +9507,9 @@ async def export_reports_excel(
             report.get('longitude', ''),
             'نعم' if report.get('asphalt_license_issued') else 'لا',
             report.get('notes', ''),  # الملاحظات
-            created_at.strftime('%d-%m-%Y %H:%M') if created_at else '',
-            start_date.strftime('%d-%m-%Y') if start_date else '',
-            closed_at.strftime('%d-%m-%Y %H:%M') if closed_at else '',
+            created_at.date() if created_at else '',
+            start_date.date() if start_date else '',
+            closed_at.date() if closed_at else '',
             images_count,
             report.get('created_by_name', '')
         ]
@@ -9519,6 +9523,8 @@ async def export_reports_excel(
                 top=Side(style='thin', color='CCCCCC'),
                 bottom=Side(style='thin', color='CCCCCC')
             )
+            if col_idx in [16, 17, 18] and value:
+                cell.number_format = 'yyyy-mm-dd'
             
             # تلوين الصفوف بالتناوب
             if row_idx % 2 == 0:
@@ -14734,8 +14740,17 @@ async def upload_file(
             
             def try_compress_pdf(data_bytes):
                 doc = fitz.open("pdf", data_bytes)
-                # compress with PyMuPDF
-                new_bytes = doc.write(garbage=4, deflate=True, clean=True)
+                if len(data_bytes) <= 200 * 1024:
+                    new_bytes = doc.write(garbage=4, deflate=True, clean=True)
+                else:
+                    new_doc = fitz.open()
+                    for page in doc:
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                        img_bytes = pix.tobytes("jpeg")
+                        new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                        new_page.insert_image(page.rect, stream=img_bytes)
+                    new_bytes = new_doc.write(garbage=4, deflate=True)
+                    new_doc.close()
                 doc.close()
                 return new_bytes
                 
@@ -15693,6 +15708,19 @@ async def get_safety_reports(
             proj_query = get_loose_in_query(user_projs, "project")
             if proj_query:
                 and_clauses.append(proj_query)
+                
+        # Strict creator filtering
+        is_manager = getattr(current_user, 'can_create_subusers', False)
+        all_ids = set()
+        if hasattr(current_user, 'username') and current_user.username: all_ids.add(current_user.username)
+        if hasattr(current_user, 'id') and current_user.id: all_ids.add(current_user.id)
+        if is_manager:
+            subs = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+            all_ids.update(subs)
+            if subs:
+                async for u in db.users.find({"id": {"$in": subs}}, {"username": 1}):
+                    if u.get("username"): all_ids.add(u["username"])
+        query["created_by"] = {"$in": list(all_ids)}
     else:
         # Admin - no permission restrictions
         if project:
@@ -16417,6 +16445,19 @@ async def get_work_permits(
             proj_query = get_loose_in_query(user_projs, "project")
             if proj_query:
                 and_clauses.append(proj_query)
+                
+        # Strict creator filtering
+        is_manager = getattr(current_user, 'can_create_subusers', False)
+        all_ids = set()
+        if hasattr(current_user, 'username') and current_user.username: all_ids.add(current_user.username)
+        if hasattr(current_user, 'id') and current_user.id: all_ids.add(current_user.id)
+        if is_manager:
+            subs = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+            all_ids.update(subs)
+            if subs:
+                async for u in db.users.find({"id": {"$in": subs}}, {"username": 1}):
+                    if u.get("username"): all_ids.add(u["username"])
+        query["created_by"] = {"$in": list(all_ids)}
     else:
         if project:
             proj_query = get_flexible_in_query([project], "project")
@@ -16558,6 +16599,19 @@ async def get_violations(
         elif user_projs:
             pq = get_loose_in_query(user_projs, "project")
             if pq: and_clauses.append(pq)
+            
+        # Strict creator filtering
+        is_manager = getattr(current_user, 'can_create_subusers', False)
+        all_ids = set()
+        if hasattr(current_user, 'username') and current_user.username: all_ids.add(current_user.username)
+        if hasattr(current_user, 'id') and current_user.id: all_ids.add(current_user.id)
+        if is_manager:
+            subs = await get_all_subordinate_user_ids(current_user.id, include_self=True)
+            all_ids.update(subs)
+            if subs:
+                async for u in db.users.find({"id": {"$in": subs}}, {"username": 1}):
+                    if u.get("username"): all_ids.add(u["username"])
+        query["created_by"] = {"$in": list(all_ids)}
     else:
         if project:
             pq = get_flexible_in_query([project], "project")
@@ -17597,7 +17651,13 @@ async def process_update_reports(
         header_row_idx = 1
         headers = {}
         
-        ticket_keywords = ["رقم البلاغ", "ticket number", "complaint number", "ticket", "report number", "الرقم", "رقم الطلب", "complaint", "رقم_البلاغ"]
+        ticket_keywords = [
+            "رقم البلاغ", "ticket number", "complaint number", "ticket", "report number", 
+            "الرقم", "رقم الطلب", "complaint", "رقم_البلاغ",
+            "رقم الإشعار", "رقم الاشعار", "إشعار", "اشعار", "notification",
+            "رقم أمر العمل", "رقم امر العمل", "work order", "wo number", "order number", "order",
+            "رقم المهمة", "طلب", "رقم العملية"
+        ]
         
         for r in range(1, 15):
             temp_headers = {}
@@ -17612,16 +17672,43 @@ async def process_update_reports(
                 header_row_idx = r
                 break
 
+        # If no strict match found, just take the row with the most text columns as headers
+        if not headers:
+            for r in range(1, 5):
+                temp_headers = {str(cell.value).strip().lower(): idx for idx, cell in enumerate(ws[r], 1) if cell.value}
+                if len(temp_headers) >= 3:
+                    headers = temp_headers
+                    header_row_idx = r
+                    break
+
         report_num_col = next((headers[h] for h in headers if any(kw in h for kw in ticket_keywords)), None)
+        
+        if not report_num_col:
+            # Fallback: Find any column containing "رقم" but not personal details
+            for h, col_idx in headers.items():
+                if "رقم" in h and not any(x in h for x in ["هوية", "جوال", "تواصل", "هاتف", "تليفون", "تسلسل"]):
+                    report_num_col = col_idx
+                    break
+
         status_col = next((headers[h] for h in headers if any(kw in h for kw in ["حالة", "status", "الحالة"])), None)
         gov_col = next((headers[h] for h in headers if any(kw in h for kw in ["محافظة", "gov", "city", "المدينة"])), None)
         date_col = next((headers[h] for h in headers if any(kw in h for kw in ["تاريخ", "date"])), None)
-        serial_col = next((headers[h] for h in headers if h.strip() in ["م", "رقم", "#", "sn", "no"]), None)
+        serial_col = next((headers[h] for h in headers if h.strip() in ["م", "رقم", "#", "sn", "no"] and headers[h] != report_num_col), None)
         depth_col = next((headers[h] for h in headers if any(kw in h for kw in ["عمق", "depth", "العمق"])), None)
         diameter_col = next((headers[h] for h in headers if any(kw in h for kw in ["قطر", "diameter", "القطر"])), None)
+        receive_date_col = next((headers[h] for h in headers if "استلام" in h or "استلم" in h), None)
+        start_date_col = next((headers[h] for h in headers if "مباشرة" in h or "باشر" in h), None)
+        close_date_col = next((headers[h] for h in headers if "إغلاق" in h or "اغلاق" in h or "اغلق" in h), None)
+
+        # Collect all date columns reliably
+        date_cols_indices = set([idx for h, idx in headers.items() if "تاريخ" in str(h) or "date" in str(h).lower() or "وقت" in str(h)])
+        if receive_date_col: date_cols_indices.add(receive_date_col)
+        if start_date_col: date_cols_indices.add(start_date_col)
+        if close_date_col: date_cols_indices.add(close_date_col)
+        date_cols_indices = list(date_cols_indices)
 
         if not report_num_col:
-            raise HTTPException(status_code=400, detail="لم يتم العثور على عمود 'رقم البلاغ' في الملف")
+            raise HTTPException(status_code=400, detail="لم يتم العثور على عمود رقم البلاغ أو الإشعار في الملف. تأكد من أن الملف يحتوي على عناوين صحيحة.")
 
         yellow_fill = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
         green_fill = PatternFill(start_color="FF90EE90", end_color="FF90EE90", fill_type="solid")
@@ -17643,8 +17730,25 @@ async def process_update_reports(
         def format_dt(dt):
             if not dt: return ""
             if isinstance(dt, datetime):
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
-            return str(dt)
+                return dt.strftime("%Y-%m-%d")
+            return str(dt).split("T")[0].split(" ")[0]
+
+        def format_dt_obj(dt):
+            if not dt: return None
+            try:
+                if isinstance(dt, datetime):
+                    return dt.date()
+                if isinstance(dt, str):
+                    date_str = str(dt).split("T")[0].split(" ")[0]
+                    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+                        try:
+                            return datetime.strptime(date_str, fmt).date()
+                        except ValueError:
+                            pass
+                    return date_str
+            except:
+                pass
+            return str(dt).split("T")[0].split(" ")[0] if dt else None
 
         # Update existing rows and collect them
         for row in range(header_row_idx + 1, max_row + 1):
@@ -17660,6 +17764,12 @@ async def process_update_reports(
             excel_report_numbers.add(rep_num)
             
             cell_values = [ws.cell(row=row, column=c).value for c in range(1, ws.max_column + 1)]
+            
+            for d_col in date_cols_indices:
+                if d_col <= len(cell_values) and cell_values[d_col - 1] is not None:
+                    cell_values[d_col - 1] = format_dt_obj(cell_values[d_col - 1])
+                
+                
             fills = [None] * ws.max_column
             
             gov_val = str(ws.cell(row=row, column=gov_col).value).strip() if gov_col and ws.cell(row=row, column=gov_col).value else ""
@@ -17683,11 +17793,10 @@ async def process_update_reports(
                         cell_values[status_col - 1] = db_status
                         changed = True
                         
-                        close_date_col = next((headers[h] for h in headers if "إغلاق" in h), None)
                         if close_date_col:
                             db_date = db_rep.get("closed_at", "")
                             if db_date:
-                                cell_values[close_date_col - 1] = format_dt(db_date)
+                                cell_values[close_date_col - 1] = format_dt_obj(db_date)
 
                 # Update Depth and Diameter if missing or different in Excel
                 if depth_col:
@@ -17761,11 +17870,11 @@ async def process_update_reports(
                     elif "رخصة أسفلت" in header_name:
                         val = "نعم" if db_rep.get("asphalt_license_issued") else "لا"
                     elif "تاريخ الاستلام" in header_name:
-                        val = format_dt(db_rep.get("created_at", ""))
+                        val = format_dt_obj(db_rep.get("created_at", ""))
                     elif "تاريخ المباشرة" in header_name:
-                        val = format_dt(db_rep.get("start_date", ""))
+                        val = format_dt_obj(db_rep.get("start_date", ""))
                     elif "تاريخ الإغلاق" in header_name or "تاريخ الاغلاق" in header_name:
-                        val = format_dt(db_rep.get("closed_at", ""))
+                        val = format_dt_obj(db_rep.get("closed_at", ""))
                     elif "عدد الصور" in header_name:
                         val = len(db_rep.get("images", []))
                     elif "مراقب الاستشاري" in header_name or "اسم المراقب" in header_name:
@@ -17805,6 +17914,9 @@ async def process_update_reports(
                 
             ws.append(row_data["values"])
             current_row = ws.max_row
+            
+            for d_col in date_cols_indices:
+                ws.cell(row=current_row, column=d_col).number_format = 'yyyy-mm-dd'
             
             for col_idx, fill in enumerate(row_data["fills"], 1):
                 if fill:
