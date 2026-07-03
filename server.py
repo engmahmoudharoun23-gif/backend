@@ -66,7 +66,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import base64
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+# from emergentintegrations.llm.chat import LlmChat, UserMessage
 from PIL import Image
 from io import BytesIO
 import time
@@ -286,7 +286,10 @@ from storage import upload_image as _upload_image, get_object as _get_object, gu
 def put_object(path: str, data: bytes, content_type: str) -> dict:
     """رفع الملف إلى Cloudinary بدلاً من التخزين القديم"""
     try:
+        ext = path.split(".")[-1].lower() if "." in path else "bin"
         url = _upload_image(data, category="uploads", content_type=content_type)
+        if ext and not url.endswith(f".{ext}"):
+            url += f"#.{ext}"
         return {"path": url}
     except Exception as e:
         logging.error(f"Cloudinary put_object failed: {e}")
@@ -507,6 +510,7 @@ def get_loose_in_query(items: List[str], field_name: str = "project") -> dict:
 # قائمة جميع الصلاحيات المتاحة
 ALL_PERMISSIONS = [
     {"key": "dashboard", "label": "لوحة التحكم وتحليل البيانات", "group": "عام"},
+    {"key": "performance_indicators", "label": "مؤشرات الأداء وتحليل البيانات", "group": "عام"},
     {"key": "reports_view", "label": "عرض البلاغات", "group": "البلاغات"},
     {"key": "reports_add", "label": "إضافة بلاغ", "group": "البلاغات"},
     {"key": "reports_edit", "label": "تعديل بلاغ", "group": "البلاغات"},
@@ -514,6 +518,7 @@ ALL_PERMISSIONS = [
     {"key": "reports_review", "label": "مراجعة البلاغات", "group": "البلاغات"},
     {"key": "reports_import", "label": "استيراد بلاغات من Excel", "group": "البلاغات"},
     {"key": "reports_notifications", "label": "إشعارات البلاغات الجديدة", "group": "البلاغات"},
+    {"key": "ai_image_audit", "label": "تدقيق الصورة بالذكاء الاصطناعي", "group": "البلاغات"},
     {"key": "consultant_notes", "label": "ملاحظات الاستشاري", "group": "البلاغات"},
     {"key": "report_notes", "label": "ملاحظات البلاغات", "group": "البلاغات"},
     {"key": "owner_notes", "label": "ملاحظات المالك", "group": "البلاغات"},
@@ -562,6 +567,7 @@ ALL_PERMISSIONS = [
     {"key": "meetings_add", "label": "إضافة اجتماع", "group": "الإدارة"},
     {"key": "wfm_matching", "label": "مطابقة بلاغات WFM", "group": "البلاغات"},
     {"key": "update_reports", "label": "تحديث البلاغات", "group": "البلاغات"},
+    {"key": "audit_logs", "label": "سجل التعديلات", "group": "البلاغات"},
 ]
 
 
@@ -569,6 +575,7 @@ ALL_PERMISSIONS = [
 PROJECT_SCOPED_PERMISSIONS = {
     "reports_view", "reports_add", "reports_edit", "reports_delete",
     "reports_review", "reports_import", "reports_notifications", "consultant_notes", "report_notes", "owner_notes",
+    "ai_image_audit",
     "water_connections", "water_connections_import",
     "sewage_connections", "sewage_connections_import",
     "invoices", "review_invoices", "review_invoices_3", "view_all_invoices",
@@ -576,9 +583,9 @@ PROJECT_SCOPED_PERMISSIONS = {
     "employee_requests", "review_employee_requests", "view_all_employee_requests",
     "contractors", "projects", "users_manage", "team", "project_settings",
     "cars", "cars_manage", "fleet_maintenance", "hr_management",
-    "dashboard", "trash", "settings", "support_messages",
+    "dashboard", "trash", "settings", "support_messages", "performance_indicators",
     "safety_reports", "quality_reports", "business_reports", "safety_reports_edit", "safety_reports_delete", "quality_reports_edit", "quality_reports_delete", "business_reports_edit", "business_reports_delete", "business_reports_review", "consultant_close",
-    "violations", "work_permits", "work_permits_edit", "work_permits_delete", "meetings", "meetings_add", "wfm_matching", "update_reports"
+    "violations", "work_permits", "work_permits_edit", "work_permits_delete", "meetings", "meetings_add", "wfm_matching", "update_reports", "audit_logs"
 }
 
 
@@ -1022,7 +1029,8 @@ class Report(BaseModel):
     diameter_mm: float
     contractor: str
     latitude: Optional[str] = None  # خط العرض
-    longitude: Optional[str] = None  # خط الطول
+    longitude: Optional[str] = None
+    neighborhood: Optional[str] = None  # خط الطول
     asphalt_license_issued: bool = False  # هل تم إصدار رخصة الأسفلت
     notes: Optional[str] = None  # ملاحظات على البلاغ
     images: List[str] = []
@@ -1160,6 +1168,7 @@ class ReportCreate(BaseModel):
     contractor: str
     latitude: Optional[str] = None
     longitude: Optional[str] = None
+    neighborhood: Optional[str] = None
     asphalt_license_issued: bool = False
     wfm_closed: bool = False
     notes: Optional[str] = None
@@ -1195,6 +1204,7 @@ class ReportResponse(BaseModel):
     contractor: str
     latitude: Optional[str]
     longitude: Optional[str]
+    neighborhood: Optional[str] = None
     asphalt_license_issued: bool
     wfm_closed: bool = False
     wfm_closed_by: Optional[str] = None
@@ -2062,10 +2072,13 @@ async def dashboard_init_all(
                     date_to_obj = dt_local(int(year) + 1, 1, 1, 0, 0, 0)
                 else:
                     date_to_obj = dt_local(int(year), int(month_num) + 1, 1, 0, 0, 0)
-                start_str = f"{month}-01T00:00:00"
-                end_str = date_to_obj.strftime("%Y-%m-%dT00:00:00")
+                start_str_t = f"{month}-01T00:00:00"
+                end_str_t = date_to_obj.strftime("%Y-%m-%dT00:00:00")
+                start_str_s = f"{month}-01 00:00:00"
+                end_str_s = date_to_obj.strftime("%Y-%m-%d 00:00:00")
                 date_filter = {"$or": [
-                    {"created_at": {"$gte": start_str, "$lt": end_str}},
+                    {"created_at": {"$gte": start_str_t, "$lt": end_str_t}},
+                    {"created_at": {"$gte": start_str_s, "$lt": end_str_s}},
                     {"created_at": {"$gte": date_from_obj, "$lt": date_to_obj}}
                 ]}
                 if "$or" in q:
@@ -2754,6 +2767,7 @@ async def create_report(
     contractor: str = Form(...),
     latitude: Optional[str] = Form(None),
     longitude: Optional[str] = Form(None),
+    neighborhood: Optional[str] = Form(None),
     asphalt_license_issued: Optional[str] = Form("false"),
     wfm_closed: Optional[str] = Form("false"),
     notes: Optional[str] = Form(None),
@@ -2802,6 +2816,9 @@ async def create_report(
         # يجب أن يحتوي على رقم واحد على الأقل (وإلا نعتبره نصاً عاماً)
         return any(ch.isdigit() for ch in cleaned)
     
+    if license_number:
+        license_number = license_number.strip()
+
     if _is_actual_license(license_number):
         existing_license = await db.reports.find_one({
             "license_number": license_number
@@ -2857,7 +2874,7 @@ async def create_report(
     # ⚡ إنشاء الوثيقة مباشرة - أسرع!
     doc = {
         "id": str(uuid4()),
-        "report_number": report_number,
+        "report_number": report_number, "license_number": license_number,
         "report_date": None,
         "license_number": license_number,
         "report_type": report_type,
@@ -2869,6 +2886,7 @@ async def create_report(
         "contractor": contractor,
         "latitude": latitude,
         "longitude": longitude,
+        "neighborhood": neighborhood,
         "asphalt_license_issued": (asphalt_license_issued.lower() == "true" if asphalt_license_issued else False),
         "wfm_closed": (wfm_closed.lower() == "true" if wfm_closed else False),
         "notes": notes or '',
@@ -3190,7 +3208,12 @@ async def get_reports(
     
     # جلب البلاغات مع الترقيم (بدون الصور لتسريع الاستجابة)
     projection = {"_id": 0, "images": 0}  # استبعاد الصور
-    reports = await db.reports.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    
+    # ⚡ ذكاء الاصطناعي: ترتيب البلاغات 
+    # إذا كنا في صفحة قيد المراجعة، نرتب حسب تاريخ التحديث (updated_at) 
+    # لتظهر البلاغات التي تم تحديثها مؤخراً في الصفحة الأولى دائماً
+    sort_field = "updated_at" if license_status == 'review_pending' else "created_at"
+    reports = await db.reports.find(query, projection).sort(sort_field, -1).skip(skip).limit(limit).to_list(limit)
     
     # ⚡ تحسين: جلب أسماء المستخدمين مرة واحدة
     creator_ids = list(set(r.get('created_by') for r in reports if r.get('created_by')))
@@ -5684,13 +5707,124 @@ async def get_report(
         report_doc['latitude'] = None
     if 'longitude' not in report_doc:
         report_doc['longitude'] = None
+    if 'neighborhood' not in report_doc:
+        report_doc['neighborhood'] = None
     if 'asphalt_license_issued' not in report_doc:
         report_doc['asphalt_license_issued'] = False
     
     return ReportResponse(**report_doc)
 
+# ==========================================
+# 🛡️ نظام سجل التعديلات (Audit Logs)
+# ==========================================
+async def log_audit_change(report_id: str, report_number: str, project: str, gov: str, action: str, old_value: str, new_value: str, user_id: str, user_name: str, license_number: str = ""):
+    try:
+        from datetime import datetime, timezone
+        import uuid
+        log_doc = {
+            "id": str(uuid.uuid4()),
+            "report_id": report_id,
+            "report_number": report_number, "license_number": license_number,
+            "project": project,
+            "governorate": gov,
+            "action": action,
+            "old_value": str(old_value) if old_value is not None else "",
+            "new_value": str(new_value) if new_value is not None else "",
+            "modified_by": user_id,
+            "modified_by_name": user_name,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        await db.audit_logs.insert_one(log_doc)
+    except Exception as e:
+        print(f"Error saving audit log: {e}")
 
-    return ReportResponse(**report_doc)
+@api_router.get("/audit-logs/unread-count")
+async def get_audit_logs_unread_count(last_viewed: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin" and "audit_logs" not in (current_user.permissions or []) and not user_has_any_project_permission(current_user, "audit_logs"):
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية")
+        
+    query = {"hidden_by": {"$ne": current_user.id}}
+    if current_user.role != "admin":
+        if current_user.projects:
+            query["project"] = {"$in": current_user.projects}
+        if current_user.governorates:
+            query["governorate"] = {"$in": current_user.governorates}
+            
+    if not last_viewed:
+        # Default to 24 hours ago to show recent notifications for first-time users
+        last_viewed = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        
+    query["timestamp"] = {"$gt": last_viewed}
+        
+    count = await db.audit_logs.count_documents(query)
+    return {"count": count}
+
+@api_router.get("/audit-logs")
+async def get_audit_logs(
+    project: Optional[str] = None,
+    governorate: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    # الحماية: هل يمتلك الصلاحية؟
+    if current_user.role != "admin" and "audit_logs" not in (current_user.permissions or []) and not user_has_any_project_permission(current_user, "audit_logs"):
+        raise HTTPException(status_code=403, detail="لا تملك صلاحية عرض سجل التعديلات")
+        
+    query = {
+        "hidden_by": {"$ne": current_user.id}
+    }
+    if current_user.role != "admin":
+        if current_user.projects:
+            query["project"] = {"$in": current_user.projects}
+        if current_user.governorates:
+            query["governorate"] = {"$in": current_user.governorates}
+            
+    if project and project != "الكل":
+        query["project"] = project
+    if governorate and governorate != "الكل":
+        query["governorate"] = governorate
+        
+    cursor = db.audit_logs.find(query).sort("timestamp", -1).limit(300)
+    logs = await cursor.to_list(length=300)
+    
+    # Populate missing license numbers for old logs
+    for log in logs:
+        log.pop("_id", None)
+        if not log.get("license_number"):
+            report_doc = await db.reports.find_one({"id": log.get("report_id")}, {"license_number": 1})
+            if report_doc:
+                log["license_number"] = report_doc.get("license_number", "")
+                
+    return logs
+
+@api_router.delete("/audit-logs/{log_id}")
+async def delete_audit_log(
+    log_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    log_doc = await db.audit_logs.find_one({"id": log_id})
+    if not log_doc:
+        raise HTTPException(status_code=404, detail="السجل غير موجود")
+        
+    await db.audit_logs.update_one({"id": log_id}, {"$addToSet": {"hidden_by": current_user.id}})
+    return {"message": "تم الإخفاء بنجاح"}
+
+class BulkDeleteAuditLogsRequest(BaseModel):
+    ids: List[str]
+
+@api_router.post("/audit-logs/bulk-delete")
+async def bulk_delete_audit_logs(
+    request: BulkDeleteAuditLogsRequest,
+    current_user: User = Depends(get_current_user)
+):
+    if not request.ids:
+        return {"message": "لم يتم تحديد أي سجلات"}
+        
+    result = await db.audit_logs.update_many(
+        {"id": {"$in": request.ids}}, 
+        {"$addToSet": {"hidden_by": current_user.id}}
+    )
+        
+    return {"message": f"تم إخفاء {result.modified_count} سجل بنجاح"}
 
 
 @api_router.put("/reports/{report_id}", response_model=ReportResponse)
@@ -5707,6 +5841,7 @@ async def update_report(
     contractor: Optional[str] = Form(None),
     latitude: Optional[str] = Form(None),
     longitude: Optional[str] = Form(None),
+    neighborhood: Optional[str] = Form(None),
     wfm_closed: Optional[str] = Form(None),
     notes: Optional[str] = Form(None),
     created_at: Optional[str] = Form(None),
@@ -5723,7 +5858,9 @@ async def update_report(
         if len(current_user.projects) > 0:
             query["project"] = {"$in": current_user.projects}
         if len(current_user.governorates) > 0:
-            query["governorate"] = {"$in": current_user.governorates}
+            has_all_govs = any(g in ["الكل", "كل المحافظات", "جميع المحافظات"] for g in current_user.governorates)
+            if not has_all_govs:
+                query["governorate"] = {"$in": current_user.governorates}
     
     report_doc = await db.reports.find_one(query, {"_id": 0})
     if not report_doc:
@@ -5732,7 +5869,7 @@ async def update_report(
     # التحقق من تكرار رقم البلاغ (إذا تم تغييره)
     if report_number is not None and report_number != report_doc.get('report_number'):
         existing_report = await db.reports.find_one({
-            "report_number": report_number,
+            "report_number": report_number, "license_number": license_number,
             "id": {"$ne": report_id}  # استثناء البلاغ الحالي
         }, {"_id": 1, "license_number": 1})
         
@@ -5753,6 +5890,9 @@ async def update_report(
             return False
         return any(ch.isdigit() for ch in cleaned)
     
+    if license_number is not None:
+        license_number = license_number.strip()
+
     if license_number is not None and license_number != report_doc.get('license_number'):
         if _is_actual_license_edit(license_number):
             existing_license = await db.reports.find_one({
@@ -5790,6 +5930,8 @@ async def update_report(
         update_data["latitude"] = latitude
     if longitude is not None:
         update_data["longitude"] = longitude
+    if neighborhood is not None:
+        update_data["neighborhood"] = neighborhood
     if wfm_closed is not None:
         update_data["wfm_closed"] = (wfm_closed.lower() == "true" if wfm_closed else False)
     # تحديث الملاحظات دائماً (السماح بالحذف عند إرسال string فارغ)
@@ -5838,9 +5980,72 @@ async def update_report(
         # دمج الصور القديمة مع الجديدة
         update_data["images"] = existing_images + image_data
     
+    # --- رصد التعديلات في الخلفية (Audit Logs) ---
+    # نتحقق إذا كان البلاغ قد تم إنشاؤه للتو (خلال آخر 5 دقائق) لتجنب تسجيل أي تعديلات أو رفع صور كتعديل فعلي
+    added_at = report_doc.get("added_at")
+    is_new = False
+    if added_at:
+        try:
+            if isinstance(added_at, str):
+                added_at = datetime.fromisoformat(added_at.replace('Z', '+00:00'))
+            if getattr(added_at, 'tzinfo', None) is None:
+                added_at = added_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - added_at).total_seconds() < 300:
+                is_new = True
+        except Exception:
+            pass
+
+    if not is_new:
+        audit_fields = {
+            "report_number": "رقم البلاغ",
+            "license_number": "رقم الرخصة",
+            "report_type": "نوع البلاغ",
+            "status": "حالة البلاغ",
+            "governorate": "المحافظة",
+            "project": "المشروع",
+            "depth_meters": "العمق",
+            "diameter_mm": "القطر",
+            "contractor": "المقاول",
+            "notes": "الملاحظات"
+        }
+        for field, action_name in audit_fields.items():
+            if field in update_data:
+                old_val = report_doc.get(field, "")
+                new_val = update_data[field]
+                if str(old_val).strip() != str(new_val).strip():
+                    await log_audit_change(
+                        report_id=report_id,
+                        report_number=report_doc.get("report_number", ""),
+                        project=report_doc.get("project", ""),
+                        gov=report_doc.get("governorate", ""),
+                        action=f"تعديل {action_name}",
+                        old_value=old_val,
+                        new_value=new_val,
+                        user_id=current_user.id,
+                        user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
+                    )
+                    
+        if "images" in update_data and update_data["images"] != report_doc.get("images", []):
+            old_count = len(report_doc.get("images", []))
+            new_count = len(update_data["images"])
+            if new_count > old_count:
+                await log_audit_change(
+                    report_id=report_id,
+                    report_number=report_doc.get("report_number", ""),
+                    project=report_doc.get("project", ""),
+                    gov=report_doc.get("governorate", ""),
+                    action="إضافة صور جديدة",
+                    old_value=f"{old_count} صورة",
+                    new_value=f"{new_count} صورة",
+                    user_id=current_user.id,
+                    user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
+                )
+    # ---------------------------------------------
+
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     
     await db.reports.update_one({"id": report_id}, {"$set": update_data})
+
     
     updated_report = await db.reports.find_one({"id": report_id}, {"_id": 0})
     
@@ -5947,7 +6152,9 @@ async def delete_report_image(
     
     if current_user.role != "admin" or len(current_user.governorates) > 0:
         if len(current_user.governorates) > 0:
-            query["governorate"] = {"$in": current_user.governorates}
+            has_all_govs = any(g in ["الكل", "كل المحافظات", "جميع المحافظات"] for g in current_user.governorates)
+            if not has_all_govs:
+                query["governorate"] = {"$in": current_user.governorates}
     
     report_doc = await db.reports.find_one(query, {"_id": 0})
     if not report_doc:
@@ -5964,6 +6171,22 @@ async def delete_report_image(
         {"id": report_id},
         {"$set": {"images": images, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
+    
+    # --- رصد حذف الصورة في الخلفية ---
+    old_count = len(report_doc.get("images", []))
+    new_count = len(images)
+    await log_audit_change(
+        report_id=report_id,
+        report_number=report_doc.get("report_number", ""),
+        project=report_doc.get("project", ""),
+        gov=report_doc.get("governorate", ""),
+        action="حذف صورة",
+        old_value=f"{old_count} صورة",
+        new_value=f"{new_count} صورة",
+        user_id=current_user.id,
+        user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
+    )
+    # ------------------------------------
     
     return {"message": "تم حذف الصورة بنجاح"}
 
@@ -6007,6 +6230,37 @@ async def add_report_image(
             "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}
         }
     )
+    
+    # --- رصد إضافة الصورة في الخلفية ---
+    # نتحقق إذا كان البلاغ قد تم إنشاؤه للتو (خلال آخر 5 دقائق) لتجنب تسجيل رفع الصور الأولية كتعديل
+    added_at = report_doc.get("added_at")
+    is_new = False
+    if added_at:
+        try:
+            if isinstance(added_at, str):
+                added_at = datetime.fromisoformat(added_at.replace('Z', '+00:00'))
+            if getattr(added_at, 'tzinfo', None) is None:
+                added_at = added_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - added_at).total_seconds() < 300:
+                is_new = True
+        except Exception:
+            pass
+
+    if not is_new:
+        old_count = len(report_doc.get("images", []))
+        new_count = old_count + 1
+        await log_audit_change(
+            report_id=report_id,
+            report_number=report_doc.get("report_number", ""),
+            project=report_doc.get("project", ""),
+            gov=report_doc.get("governorate", ""),
+            action="إضافة صور جديدة",
+            old_value=f"{old_count} صورة",
+            new_value=f"{new_count} صورة",
+            user_id=current_user.id,
+            user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
+        )
+    # ------------------------------------
     
     return {"message": "تم إضافة الصورة بنجاح"}
 
@@ -6498,7 +6752,7 @@ async def check_duplicate_report(
 ):
     """فحص وجود بلاغ مكرر - يفحص رقم البلاغ + المشروع + رقم الرخصة + نوع البلاغ"""
     query = {
-        "report_number": report_number,
+        "report_number": report_number, "license_number": license_number,
         "is_deleted": {"$ne": True}
     }
     
@@ -6727,6 +6981,7 @@ async def import_reports_from_excel(
         
         imported = 0
         skipped = 0
+        updated = 0
         errors = []
         
         # الحصول على المشروع الافتراضي من صلاحيات المستخدم
@@ -6783,17 +7038,12 @@ async def import_reports_from_excel(
                 default_governorate = current_user.governorates[0] if current_user.governorates else ''
                 row_governorate = safe_str('governorate', '') or safe_str('المحافظة', '') or selected_governorate or default_governorate
                 
-                # التحقق من عدم وجود البلاغ في نفس المشروع فقط
+                # التحقق من عدم وجود البلاغ (مقارنة نصية لرقم البلاغ لضمان التطابق)
                 existing = await db.reports.find_one({
-                    "report_number": report_number, 
+                    "report_number": str(report_number), 
                     "project": row_project,
                     "is_deleted": {"$ne": True}
-                }, {"_id": 1})
-                
-                if existing:
-                    print(f"⏭️ تخطي صف {idx + 2}: البلاغ {report_number} موجود مسبقاً في المشروع {row_project}")
-                    skipped += 1
-                    continue
+                })
                 
                 def safe_float(col_name, default=0):
                     try:
@@ -6810,6 +7060,20 @@ async def import_reports_from_excel(
                 # التحقق إذا كانت الرخصة صادرة (ليست فارغة وليست "لم يتم إصدار رخصة")
                 has_license = bool(license_num and license_num not in ['لم يتم إصدار رخصة', 'لم يتم', '-', '0', 'nan', 'none', ''])
                 
+                # التحقق من أن رقم الرخصة غير مكرر مع بلاغ آخر
+                if has_license:
+                    license_existing = await db.reports.find_one({
+                        "license_number": license_num,
+                        "report_number": {"$ne": str(report_number)},
+                        "is_deleted": {"$ne": True}
+                    }, {"_id": 1, "report_number": 1})
+                    
+                    if license_existing:
+                        ext_rep = license_existing.get("report_number", "غير معروف")
+                        errors.append(f"تخطي البلاغ {report_number}: رقم الرخصة {license_num} موجود مسبقاً مع البلاغ {ext_rep}")
+                        skipped += 1
+                        continue
+                
                 # قراءة نوع البلاغ والحالة
                 report_type_val = safe_str('report_type', 'تسرب')
                 status_val = safe_str('status', 'جديد')
@@ -6823,7 +7087,7 @@ async def import_reports_from_excel(
                 now = datetime.now(timezone.utc)
                 report_data = {
                     "id": str(uuid.uuid4()),
-                    "report_number": report_number,
+                    "report_number": report_number, "license_number": license_number,
                     "license_number": license_num if has_license else 'لم يتم إصدار رخصة',
                     "report_type": report_type_val,
                     "status": status_val,
@@ -6836,7 +7100,7 @@ async def import_reports_from_excel(
                     "longitude": safe_str('longitude', ''),
                     "notes": safe_str('notes', ''),
                     "images": [],
-                    "is_deleted": {"$ne": True},
+                    "is_deleted": False,
                     "created_by": current_user.id,
                     "created_by_name": current_user.full_name or current_user.username,
                     "created_at": now,
@@ -6870,26 +7134,130 @@ async def import_reports_from_excel(
                         except:
                             pass
                 
-                await db.reports.insert_one(report_data)
-                imported += 1
-                print(f"✅ تم إضافة البلاغ: {report_number}")
+                if existing:
+                    has_changes = False
+                    compare_fields = ['status', 'license_number', 'governorate', 'report_type', 'contractor', 'notes', 'depth_meters', 'diameter_mm']
+                    
+                    for field in compare_fields:
+                        new_val = report_data.get(field)
+                        old_val = existing.get(field)
+                        if field in ['depth_meters', 'diameter_mm']:
+                            if float(new_val or 0) != float(old_val or 0):
+                                has_changes = True
+                                break
+                        else:
+                            if str(new_val or '').strip() != str(old_val or '').strip():
+                                has_changes = True
+                                break
+                                
+                    # If date changed in excel, mark as changed
+                    if report_data.get('report_date') and existing.get('report_date'):
+                        if report_data['report_date'].date() != existing['report_date'].date():
+                            has_changes = True
+                            
+                    if has_changes:
+                        update_data = {k: v for k, v in report_data.items() if k not in ['id', 'created_at', 'created_by', 'created_by_name', 'images', 'is_deleted', 'added_at']}
+                        update_data['is_updated_from_excel'] = True
+                        update_data['is_new_from_excel'] = False
+                        update_data['updated_at'] = now
+                        
+                        # --- رصد التعديلات في الخلفية (Audit Logs) ---
+                        audit_fields = {
+                            "report_number": "رقم البلاغ",
+                            "license_number": "رقم الرخصة",
+                            "report_type": "نوع البلاغ",
+                            "status": "حالة البلاغ",
+                            "governorate": "المحافظة",
+                            "project": "المشروع",
+                            "depth_meters": "العمق",
+                            "diameter_mm": "القطر",
+                            "contractor": "المقاول",
+                            "notes": "الملاحظات"
+                        }
+                        for field, action_name in audit_fields.items():
+                            if field in update_data:
+                                new_val = update_data[field]
+                                old_val = existing.get(field, "")
+                                if field in ['depth_meters', 'diameter_mm']:
+                                    if float(new_val or 0) != float(old_val or 0):
+                                        await log_audit_change(
+                                            report_id=existing.get("id", ""),
+                                            report_number=existing.get("report_number", ""),
+                                            project=existing.get("project", ""),
+                                            gov=existing.get("governorate", ""),
+                                            action=f"تعديل {action_name} (إكسيل)",
+                                            old_value=str(old_val),
+                                            new_value=str(new_val),
+                                            user_id=current_user.id,
+                                            user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
+                                        )
+                                else:
+                                    if str(old_val or '').strip() != str(new_val or '').strip():
+                                        await log_audit_change(
+                                            report_id=existing.get("id", ""),
+                                            report_number=existing.get("report_number", ""),
+                                            project=existing.get("project", ""),
+                                            gov=existing.get("governorate", ""),
+                                            action=f"تعديل {action_name} (إكسيل)",
+                                            old_value=str(old_val),
+                                            new_value=str(new_val),
+                                            user_id=current_user.id,
+                                            user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
+                                        )
+                        # ---------------------------------------------
+
+                        await db.reports.update_one(
+                            {"_id": existing["_id"]},
+                            {"$set": update_data}
+                        )
+                        updated += 1
+                        print(f"🔄 تم تحديث البلاغ: {report_number}")
+                    else:
+                        skipped += 1
+                        print(f"⏭️ تخطي (لا يوجد تغيير): البلاغ {report_number}")
+                else:
+                    report_data['is_new_from_excel'] = True
+                    report_data['is_updated_from_excel'] = False
+                    
+                    # استخدام update_one مع upsert كطبقة حماية إضافية من التكرار
+                    upsert_result = await db.reports.update_one(
+                        {
+                            "report_number": str(report_number),
+                            "project": row_project,
+                            "is_deleted": {"$ne": True}
+                        },
+                        {"$setOnInsert": report_data},
+                        upsert=True
+                    )
+                    if upsert_result.upserted_id:
+                        imported += 1
+                        print(f"✅ تم إضافة البلاغ: {report_number}")
+                    else:
+                        skipped += 1
+                        print(f"⏭️ تخطي (upsert): البلاغ {report_number} موجود مسبقاً")
                 
             except Exception as e:
                 # print error ❌ خطأ في صف {idx + 2}
                 errors.append(f"سطر {idx + 2}: {str(e)}")
         
-        print(f"📊 النتيجة: تم استيراد {imported}، تم تخطي {skipped}، أخطاء {len(errors)}")
+        # ⚡ مسح الـ cache لتحديث الإحصائيات
+        global stats_cache
+        if 'stats_cache' in globals():
+            stats_cache.clear()
+
+        print(f"📊 النتيجة: تم استيراد {imported}، تم تحديث {updated}، تم تخطي {skipped}، أخطاء {len(errors)}")
         
         # إعداد رسالة مفصلة
-        message = f"تم استيراد {imported} بلاغ بنجاح"
+        message = f"تم استيراد {imported} بلاغ جديد وتحديث {updated} بلاغ"
         if skipped > 0:
-            message += f"، تم تخطي {skipped} بلاغ موجود مسبقاً"
-        if imported == 0 and skipped == 0:
-            message = f"لم يتم استيراد أي بلاغ. الأعمدة الموجودة: {original_columns}"
+            message += f"، وتم تخطي {skipped} بلاغ لم يتغير"
+        if imported == 0 and updated == 0:
+            message = f"لم يتم استيراد أو تحديث أي بلاغ. الأعمدة الموجودة: {original_columns}"
         
         return {
             "success": True,
             "imported": imported,
+            "updated": updated,
             "skipped": skipped,
             "total": len(df),
             "errors": errors[:10] if errors else [],
@@ -11146,11 +11514,10 @@ async def export_reports_pdf(
         processed_row = [
             Paragraph(created_at.strftime('%Y-%m-%d') if created_at else '', latin_cell_style),
             Paragraph(arabic_text(report.get('contractor', '')), cell_style),
-            Paragraph(diameter_str, latin_cell_style),
-            Paragraph(depth_str, latin_cell_style),
             Paragraph(arabic_text(report.get('report_type', '')), cell_style),
+            Paragraph(str(lng) if lng else '-', latin_cell_style),
+            Paragraph(str(lat) if lat else '-', latin_cell_style),
             Paragraph(arabic_text(report.get('status', '')), cell_style),
-            Paragraph(arabic_text("مغلقة بواسطة الاستشاري") if report.get('wfm_closed') else arabic_text("قيد المعالجة"), cell_style),
             Paragraph(arabic_text(license_num), cell_style),
             Paragraph(report_num, latin_cell_style),
             Paragraph(arabic_text(shorten_project_name(report.get('project', ''))), cell_style),
@@ -14744,9 +15111,28 @@ async def upload_file(
                     new_bytes = doc.write(garbage=4, deflate=True, clean=True)
                 else:
                     new_doc = fitz.open()
+                    import io
+                    from PIL import Image
                     for page in doc:
-                        pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
-                        img_bytes = pix.tobytes("jpeg")
+                        # زيادة دقة الرندر للحفاظ على وضوح النص بشكل أفضل
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5))
+                        mode = "RGBA" if pix.alpha else "RGB"
+                        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                        if img.mode == 'RGBA':
+                            bg = Image.new('RGB', img.size, (255, 255, 255))
+                            bg.paste(img, mask=img.split()[3])
+                            img = bg
+                        
+                        # الحفاظ على أبعاد كبيرة نسبيا للحفاظ على الجودة
+                        max_dim = 2000
+                        if max(img.size) > max_dim:
+                            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                            
+                        # جودة عالية جداً (85%) بدلاً من 40%
+                        output = io.BytesIO()
+                        img.save(output, format='JPEG', quality=85, optimize=True)
+                        img_bytes = output.getvalue()
+                        
                         new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
                         new_page.insert_image(page.rect, stream=img_bytes)
                     new_bytes = new_doc.write(garbage=4, deflate=True)
@@ -14759,7 +15145,7 @@ async def upload_file(
                 data = compressed_data
         except Exception as e:
             logging.warning(f"PDF compression failed: {e}")
-    
+            
     path = f"sery17/uploads/{current_user.id}/{uuid.uuid4()}.{ext}"
     
     try:
@@ -15709,18 +16095,7 @@ async def get_safety_reports(
             if proj_query:
                 and_clauses.append(proj_query)
                 
-        # Strict creator filtering
-        is_manager = getattr(current_user, 'can_create_subusers', False)
-        all_ids = set()
-        if hasattr(current_user, 'username') and current_user.username: all_ids.add(current_user.username)
-        if hasattr(current_user, 'id') and current_user.id: all_ids.add(current_user.id)
-        if is_manager:
-            subs = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            all_ids.update(subs)
-            if subs:
-                async for u in db.users.find({"id": {"$in": subs}}, {"username": 1}):
-                    if u.get("username"): all_ids.add(u["username"])
-        query["created_by"] = {"$in": list(all_ids)}
+        # No strict creator filtering. Any user with safety_reports permission can see all reports in their governorates.
     else:
         # Admin - no permission restrictions
         if project:
@@ -16446,18 +16821,7 @@ async def get_work_permits(
             if proj_query:
                 and_clauses.append(proj_query)
                 
-        # Strict creator filtering
-        is_manager = getattr(current_user, 'can_create_subusers', False)
-        all_ids = set()
-        if hasattr(current_user, 'username') and current_user.username: all_ids.add(current_user.username)
-        if hasattr(current_user, 'id') and current_user.id: all_ids.add(current_user.id)
-        if is_manager:
-            subs = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            all_ids.update(subs)
-            if subs:
-                async for u in db.users.find({"id": {"$in": subs}}, {"username": 1}):
-                    if u.get("username"): all_ids.add(u["username"])
-        query["created_by"] = {"$in": list(all_ids)}
+        # No strict creator filtering.
     else:
         if project:
             proj_query = get_flexible_in_query([project], "project")
@@ -16469,7 +16833,7 @@ async def get_work_permits(
                 and_clauses.append(gov_query)
     if and_clauses:
         query["$and"] = and_clauses
-    records = await db.work_permits.find(query, {"_id": 0, "image": 0}).sort("date", -1).to_list(100)
+    records = await db.work_permits.find(query, {"_id": 0, "image": 0, "images": 0}).sort("date", -1).to_list(100)
     for r in records:
         if not r.get("status"):
             r["status"] = "قيد المراجعة"
@@ -16600,18 +16964,7 @@ async def get_violations(
             pq = get_loose_in_query(user_projs, "project")
             if pq: and_clauses.append(pq)
             
-        # Strict creator filtering
-        is_manager = getattr(current_user, 'can_create_subusers', False)
-        all_ids = set()
-        if hasattr(current_user, 'username') and current_user.username: all_ids.add(current_user.username)
-        if hasattr(current_user, 'id') and current_user.id: all_ids.add(current_user.id)
-        if is_manager:
-            subs = await get_all_subordinate_user_ids(current_user.id, include_self=True)
-            all_ids.update(subs)
-            if subs:
-                async for u in db.users.find({"id": {"$in": subs}}, {"username": 1}):
-                    if u.get("username"): all_ids.add(u["username"])
-        query["created_by"] = {"$in": list(all_ids)}
+        # No strict creator filtering.
     else:
         if project:
             pq = get_flexible_in_query([project], "project")
@@ -17632,12 +17985,37 @@ async def process_update_reports(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     try:
-        query = {"project": project}
-        if current_user.role != "admin" and getattr(current_user, "governorates", None):
-            query["governorate"] = {"$in": current_user.governorates}
+        def normalize_report_number(num):
+            if not num: return ""
+            clean_num = str(num).strip().upper()
+            import re
+            clean_num = re.sub(r'[\u200e\u200f\u202a-\u202e]', '', clean_num)
+            arabic_to_english = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+            clean_num = clean_num.translate(arabic_to_english)
+            if clean_num.endswith(".0"):
+                clean_num = clean_num[:-2]
+            for prefix in ["CCB-R-", "CCP-R-", "CCB-", "CCP-"]:
+                if clean_num.startswith(prefix):
+                    clean_num = clean_num.replace(prefix, "")
+            clean_num = clean_num.replace("R-", "")
+            clean_num = clean_num.lstrip("0")
+            clean_num = re.sub(r'[^a-zA-Z0-9]', '', clean_num)
+            return clean_num
 
-        db_reports_cursor = db.reports.find(query)
-        db_reports = {str(r.get("report_number")).strip(): r async for r in db_reports_cursor if r.get("report_number")}
+        def normalize_status(s):
+            if not s: return ""
+            s = str(s).strip()
+            s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+            s = s.replace("ة", "ه")
+            s = s.replace("  ", " ")
+            return s
+
+        def normalize_gov(gov):
+            if not gov: return ""
+            g = str(gov).strip()
+            g = g.replace("محافظة ", "").replace("محافظه ", "").replace("بلدية ", "").replace("بلديه ", "")
+            g = g.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه")
+            return g.strip()
 
         contents = await file.read()
         import io
@@ -17666,13 +18044,11 @@ async def process_update_reports(
                 if val:
                     temp_headers[val] = idx
             
-            # Check if any ticket keyword is in the header row
             if any(any(kw in k for kw in ticket_keywords) for k in temp_headers.keys()):
                 headers = temp_headers
                 header_row_idx = r
                 break
 
-        # If no strict match found, just take the row with the most text columns as headers
         if not headers:
             for r in range(1, 5):
                 temp_headers = {str(cell.value).strip().lower(): idx for idx, cell in enumerate(ws[r], 1) if cell.value}
@@ -17684,13 +18060,18 @@ async def process_update_reports(
         report_num_col = next((headers[h] for h in headers if any(kw in h for kw in ticket_keywords)), None)
         
         if not report_num_col:
-            # Fallback: Find any column containing "رقم" but not personal details
             for h, col_idx in headers.items():
                 if "رقم" in h and not any(x in h for x in ["هوية", "جوال", "تواصل", "هاتف", "تليفون", "تسلسل"]):
                     report_num_col = col_idx
                     break
 
-        status_col = next((headers[h] for h in headers if any(kw in h for kw in ["حالة", "status", "الحالة"])), None)
+        status_col = None
+        for h, idx in headers.items():
+            if h.strip() in ["الحالة", "حالة", "status"]:
+                status_col = idx
+                break
+        if not status_col:
+            status_col = next((headers[h] for h in headers if any(kw in h for kw in ["حالة", "status", "الحالة"])), None)
         gov_col = next((headers[h] for h in headers if any(kw in h for kw in ["محافظة", "gov", "city", "المدينة"])), None)
         date_col = next((headers[h] for h in headers if any(kw in h for kw in ["تاريخ", "date"])), None)
         serial_col = next((headers[h] for h in headers if h.strip() in ["م", "رقم", "#", "sn", "no"] and headers[h] != report_num_col), None)
@@ -17700,7 +18081,6 @@ async def process_update_reports(
         start_date_col = next((headers[h] for h in headers if "مباشرة" in h or "باشر" in h), None)
         close_date_col = next((headers[h] for h in headers if "إغلاق" in h or "اغلاق" in h or "اغلق" in h), None)
 
-        # Collect all date columns reliably
         date_cols_indices = set([idx for h, idx in headers.items() if "تاريخ" in str(h) or "date" in str(h).lower() or "وقت" in str(h)])
         if receive_date_col: date_cols_indices.add(receive_date_col)
         if start_date_col: date_cols_indices.add(start_date_col)
@@ -17710,221 +18090,287 @@ async def process_update_reports(
         if not report_num_col:
             raise HTTPException(status_code=400, detail="لم يتم العثور على عمود رقم البلاغ أو الإشعار في الملف. تأكد من أن الملف يحتوي على عناوين صحيحة.")
 
+        # 1. Read Excel reports
+        excel_report_numbers = set()
+        excel_rows_map = {}
+        uploaded_rows_count = 0
+        
+        max_row = ws.max_row
+        actual_max_row = header_row_idx
+        for row in range(header_row_idx + 1, max_row + 1):
+            cell = ws.cell(row=row, column=report_num_col)
+            rep_num = str(cell.value).strip() if cell.value is not None else None
+            if rep_num and rep_num.endswith(".0"):
+                rep_num = rep_num[:-2]
+            if not rep_num:
+                continue
+                
+            actual_max_row = max(actual_max_row, row)
+            uploaded_rows_count += 1
+            norm_rep_num = normalize_report_number(rep_num)
+            excel_report_numbers.add(norm_rep_num)
+            if norm_rep_num not in excel_rows_map:
+                excel_rows_map[norm_rep_num] = []
+            excel_rows_map[norm_rep_num].append(row)
+
+        # 2. Query ALL DB reports for this project to catch new ones (using projection for speed)
+        query = {"project": project}
+        if current_user.role != "admin" and getattr(current_user, "governorates", None):
+            query["governorate"] = {"$in": current_user.governorates}
+
+        projection = {
+            "report_number": 1, "status": 1, "closed_at": 1, "start_date": 1, 
+            "depth_meters": 1, "diameter_mm": 1, "governorate": 1, "created_at": 1, 
+            "created_by_name": 1, "project": 1, "license_number": 1, "report_type": 1,
+            "wfm_closed": 1, "asphalt_license_issued": 1, "contractor": 1, "longitude": 1,
+            "latitude": 1, "images": 1, "_id": 0
+        }
+        
+        db_reports_cursor = db.reports.find(query, projection)
+        db_reports = {}
+        original_db_reports = {}
+        async for r in db_reports_cursor:
+            num = str(r.get("report_number")).strip()
+            if num.endswith(".0"): num = num[:-2]
+            norm = normalize_report_number(num)
+            db_reports[norm] = r
+            original_db_reports[num] = r
+
         yellow_fill = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
         green_fill = PatternFill(start_color="FF90EE90", end_color="FF90EE90", fill_type="solid")
-
-        updated_reports = []
-        new_reports_data = []
-        excel_report_numbers = set()
-
-        max_row = ws.max_row
-        all_rows_data = []
         
-        gov_order_list = ["شقراء", "مرات", "القصب", "ساجر", "المزاحمية", "ضرماء", "القويعية", "الدوادمي", "عفيف"]
-        def get_gov_index(gov_name):
-            if not gov_name: return 999
-            for i, g in enumerate(gov_order_list):
-                if g in gov_name: return i
-            return 999
-
         def format_dt(dt):
             if not dt: return ""
-            if isinstance(dt, datetime):
-                return dt.strftime("%Y-%m-%d")
+            if isinstance(dt, datetime): return dt.strftime("%Y-%m-%d")
             return str(dt).split("T")[0].split(" ")[0]
 
         def format_dt_obj(dt):
             if not dt: return None
             try:
-                if isinstance(dt, datetime):
-                    return dt.date()
+                if type(dt).__name__ == "date": return dt
+                if isinstance(dt, datetime): return dt.date()
                 if isinstance(dt, str):
-                    date_str = str(dt).split("T")[0].split(" ")[0]
-                    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+                    date_str = str(dt).split("T")[0].split(" ")[0].strip()
+                    arabic_to_english = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+                    date_str = date_str.translate(arabic_to_english)
+                    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y", "%m/%d/%Y", "%m-%d-%Y"):
                         try:
                             return datetime.strptime(date_str, fmt).date()
                         except ValueError:
                             pass
                     return date_str
-            except:
-                pass
+            except: pass
             return str(dt).split("T")[0].split(" ")[0] if dt else None
 
-        # Update existing rows and collect them
-        for row in range(header_row_idx + 1, max_row + 1):
-            cell = ws.cell(row=row, column=report_num_col)
-            rep_num = str(cell.value).strip() if cell.value is not None else None
-            
-            if rep_num and rep_num.endswith(".0"):
-                rep_num = rep_num[:-2]
-
-            if not rep_num:
-                continue
-
-            excel_report_numbers.add(rep_num)
-            
-            cell_values = [ws.cell(row=row, column=c).value for c in range(1, ws.max_column + 1)]
-            
-            for d_col in date_cols_indices:
-                if d_col <= len(cell_values) and cell_values[d_col - 1] is not None:
-                    cell_values[d_col - 1] = format_dt_obj(cell_values[d_col - 1])
+        updated_reports = []
+        new_reports_data = []
+        
+        # 3. Process matches directly in worksheet
+        for norm_rep_num, row_indices in excel_rows_map.items():
+            if norm_rep_num in db_reports:
+                db_rep = db_reports[norm_rep_num]
+                db_status = str(db_rep.get("status", "") or "").strip()
+                db_status_norm = normalize_status(db_status)
                 
-                
-            fills = [None] * ws.max_column
-            
-            gov_val = str(ws.cell(row=row, column=gov_col).value).strip() if gov_col and ws.cell(row=row, column=gov_col).value else ""
-            date_val = str(ws.cell(row=row, column=date_col).value).strip() if date_col and ws.cell(row=row, column=date_col).value else ""
-
-            if rep_num in db_reports:
-                db_rep = db_reports[rep_num]
-                changed = False
-                old_status = ""
-                new_status = ""
-
-                # Check Status (Strict Business Logic)
-                if status_col:
-                    excel_status = str(cell_values[status_col - 1]).strip() if cell_values[status_col - 1] else ""
-                    db_status = db_rep.get("status", "")
-                    report_type = db_rep.get("report_type", "")
+                for row in row_indices:
+                    changed = False
+                    changed_fields = []
+                    old_status = ""
+                    new_status = ""
                     
-                    if "أسفلت" in report_type and "متبقي" in excel_status and db_status == "تم الإصلاح":
-                        old_status = excel_status
-                        new_status = db_status
-                        cell_values[status_col - 1] = db_status
-                        changed = True
+                    if status_col:
+                        excel_status_raw = ws.cell(row=row, column=status_col).value
+                        excel_status = str(excel_status_raw).strip() if excel_status_raw is not None and str(excel_status_raw).strip() not in ("None", "nan", "") else ""
+                        excel_status_norm = normalize_status(excel_status)
                         
-                        if close_date_col:
-                            db_date = db_rep.get("closed_at", "")
-                            if db_date:
-                                cell_values[close_date_col - 1] = format_dt_obj(db_date)
+                        if db_status_norm and excel_status_norm != db_status_norm:
+                            old_status = excel_status if excel_status else "(فارغة)"
+                            new_status = db_status
+                            ws.cell(row=row, column=status_col).value = db_status
+                            changed = True
+                            changed_fields.append({"field": "الحالة", "old": old_status, "new": new_status})
+                            
+                            if close_date_col:
+                                db_closed = db_rep.get("closed_at", "")
+                                if db_closed:
+                                    ws.cell(row=row, column=close_date_col).value = format_dt_obj(db_closed)
 
-                # Update Depth and Diameter if missing or different in Excel
-                if depth_col:
-                    db_depth = db_rep.get("depth_meters", "")
-                    if db_depth != "" and db_depth is not None and str(db_depth) != str(cell_values[depth_col - 1]).strip():
-                        cell_values[depth_col - 1] = db_depth
+                    if close_date_col:
+                        excel_close = ws.cell(row=row, column=close_date_col).value
+                        excel_close_str = str(excel_close).strip() if excel_close is not None and str(excel_close).strip() not in ("None", "nan", "") else ""
+                        db_closed = db_rep.get("closed_at", "")
+                        if db_closed and not excel_close_str:
+                            ws.cell(row=row, column=close_date_col).value = format_dt_obj(db_closed)
 
-                if diameter_col:
-                    db_diameter = db_rep.get("diameter_mm", "")
-                    if db_diameter != "" and db_diameter is not None and str(db_diameter) != str(cell_values[diameter_col - 1]).strip():
-                        cell_values[diameter_col - 1] = db_diameter
+                    if start_date_col:
+                        excel_start = ws.cell(row=row, column=start_date_col).value
+                        excel_start_str = str(excel_start).strip() if excel_start is not None and str(excel_start).strip() not in ("None", "nan", "") else ""
+                        db_start = db_rep.get("start_date", "")
+                        if db_start and not excel_start_str:
+                            ws.cell(row=row, column=start_date_col).value = format_dt_obj(db_start)
 
-                if changed:
-                    fills = [yellow_fill] * ws.max_column
-                    date_str = format_dt(db_rep.get("created_at", ""))
-                    
-                    updated_reports.append({
-                        "number": rep_num,
-                        "gov": db_rep.get("governorate", ""),
-                        "observer": db_rep.get("created_by_name", ""),
-                        "date": date_str,
-                        "old_status": old_status,
-                        "new_status": new_status
-                    })
-                    
-            all_rows_data.append({
-                "values": cell_values,
-                "fills": fills,
-                "gov": gov_val,
-                "date": date_val
-            })
+                    if depth_col:
+                        db_depth = db_rep.get("depth_meters", "")
+                        excel_depth_str = str(ws.cell(row=row, column=depth_col).value).strip() if ws.cell(row=row, column=depth_col).value is not None else ""
+                        if db_depth != "" and db_depth is not None and str(db_depth) != excel_depth_str:
+                            ws.cell(row=row, column=depth_col).value = db_depth
 
-        # Find New reports
-        for rep_num, db_rep in db_reports.items():
-            if rep_num not in excel_report_numbers:
+                    if diameter_col:
+                        db_diameter = db_rep.get("diameter_mm", "")
+                        excel_diameter_str = str(ws.cell(row=row, column=diameter_col).value).strip() if ws.cell(row=row, column=diameter_col).value is not None else ""
+                        if db_diameter != "" and db_diameter is not None and str(db_diameter) != excel_diameter_str:
+                            ws.cell(row=row, column=diameter_col).value = db_diameter
+
+                    if changed:
+                        for c in range(1, ws.max_column + 1):
+                            ws.cell(row=row, column=c).fill = yellow_fill
+                        
+                        date_str = format_dt(db_rep.get("created_at", ""))
+                        updated_reports.append({
+                            "number": db_rep.get("report_number", norm_rep_num),
+                            "gov": db_rep.get("governorate", ""),
+                            "observer": db_rep.get("created_by_name", ""),
+                            "date": date_str,
+                            "old_status": old_status,
+                            "new_status": new_status,
+                            "license": db_rep.get("license_number", ""),
+                            "changed_fields": changed_fields
+                        })
+
+        # 4. Find new reports in DB that aren't in Excel
+        for orig_rep_num, db_rep in original_db_reports.items():
+            norm_num = normalize_report_number(orig_rep_num)
+            if norm_num not in excel_report_numbers and norm_num not in excel_rows_map:
                 new_reports_data.append(db_rep)
 
+        def get_sort_date(x):
+            dt = x.get("created_at")
+            if isinstance(dt, datetime): return dt.strftime("%Y-%m-%d")
+            if isinstance(dt, str): return dt.split("T")[0].split(" ")[0]
+            return ""
+            
+        actual_max_col = min(ws.max_column, 60)
         formatted_new_reports = []
-
         if new_reports_data:
+            current_max_row = actual_max_row
             for db_rep in new_reports_data:
-                new_row = [""] * ws.max_column
+                current_max_row += 1
                 for header_name, idx in headers.items():
+                    if idx > actual_max_col: continue
                     val = ""
-                    if "رقم" in header_name and "البلاغ" not in header_name and "الرخصة" not in header_name:
-                        pass # handled later (serial)
-                    elif "المحافظة" in header_name:
-                        val = db_rep.get("governorate", "")
-                    elif "المشروع" in header_name:
-                        val = db_rep.get("project", "")
-                    elif "رقم البلاغ" in header_name:
-                        val = db_rep.get("report_number", "")
-                    elif "رقم الرخصة" in header_name:
-                        val = db_rep.get("license_number", "")
-                    elif "حالة المعالجة" in header_name:
-                        val = "مغلقة بواسطة الاستشاري" if db_rep.get("wfm_closed") else "قيد المعالجة"
-                    elif "حالة البلاغ" in header_name or "الحالة" in header_name:
-                        val = db_rep.get("status", "")
-                    elif "نوع البلاغ" in header_name:
-                        val = db_rep.get("report_type", "")
-                    elif "العمق" in header_name:
-                        val = db_rep.get("depth_meters", "")
-                    elif "القطر" in header_name:
-                        val = db_rep.get("diameter_mm", "")
-                    elif "المقاول" in header_name:
-                        val = db_rep.get("contractor", "")
-                    elif "خط الطول" in header_name:
-                        val = db_rep.get("longitude", "")
-                    elif "خط العرض" in header_name:
-                        val = db_rep.get("latitude", "")
-                    elif "رخصة أسفلت" in header_name:
-                        val = "نعم" if db_rep.get("asphalt_license_issued") else "لا"
-                    elif "تاريخ الاستلام" in header_name:
-                        val = format_dt_obj(db_rep.get("created_at", ""))
-                    elif "تاريخ المباشرة" in header_name:
-                        val = format_dt_obj(db_rep.get("start_date", ""))
-                    elif "تاريخ الإغلاق" in header_name or "تاريخ الاغلاق" in header_name:
-                        val = format_dt_obj(db_rep.get("closed_at", ""))
-                    elif "عدد الصور" in header_name:
-                        val = len(db_rep.get("images", []))
-                    elif "مراقب الاستشاري" in header_name or "اسم المراقب" in header_name:
-                        val = db_rep.get("created_by_name", "")
-
-                    new_row[idx - 1] = val
+                    if header_name in ["م", "رقم", "#", "sn", "no", "تسلسل"]:
+                        val = "" # Will be filled sequentially during sort
+                    elif "محافظة" in header_name or "city" in header_name: val = db_rep.get("governorate", "")
+                    elif "مشروع" in header_name or "project" in header_name: val = db_rep.get("project", "")
+                    elif "رقم البلاغ" in header_name or "اشعار" in header_name or "إشعار" in header_name or "طلب" in header_name: val = db_rep.get("report_number", "")
+                    elif "رقم الرخصة" in header_name or "رقم رخصة" in header_name or ("رخصة" in header_name and "اسفلت" not in header_name and "أسفلت" not in header_name): val = db_rep.get("license_number", "")
+                    elif "حالة المعالجة" in header_name: val = "مغلقة بواسطة الاستشاري" if db_rep.get("wfm_closed") else "قيد المعالجة"
+                    elif "حالة البلاغ" in header_name or header_name in ["الحالة", "حالة", "status"]: val = db_rep.get("status", "")
+                    elif "نوع البلاغ" in header_name or "نوع" in header_name: val = db_rep.get("report_type", "")
+                    elif "عمق" in header_name: val = db_rep.get("depth_meters", "")
+                    elif "قطر" in header_name: val = db_rep.get("diameter_mm", "")
+                    elif "مقاول" in header_name: val = db_rep.get("contractor", "")
+                    elif "خط الطول" in header_name or "طول" in header_name: val = db_rep.get("longitude", "")
+                    elif "خط العرض" in header_name or "عرض" in header_name: val = db_rep.get("latitude", "")
+                    elif "رخصة أسفلت" in header_name or "رخصة اسفلت" in header_name or ("اسفلت" in header_name and "حالة" in header_name): val = "نعم" if db_rep.get("asphalt_license_issued") else "لا"
+                    elif "استلام" in header_name or "انشاء" in header_name: val = format_dt_obj(db_rep.get("created_at", ""))
+                    elif "مباشرة" in header_name: val = format_dt_obj(db_rep.get("start_date", ""))
+                    elif "إغلاق" in header_name or "اغلاق" in header_name: val = format_dt_obj(db_rep.get("closed_at", ""))
+                    elif "صور" in header_name: val = len(db_rep.get("images", []))
+                    elif "مراقب" in header_name or "اسم" in header_name: val = db_rep.get("created_by_name", "")
+                    
+                    ws.cell(row=current_max_row, column=idx).value = val
                 
-                gov_val = db_rep.get("governorate", "")
+                for c in range(1, actual_max_col + 1):
+                    ws.cell(row=current_max_row, column=c).fill = green_fill
+                
                 date_val = format_dt(db_rep.get("created_at", ""))
-                
-                all_rows_data.append({
-                    "values": new_row,
-                    "fills": [green_fill] * ws.max_column,
-                    "gov": gov_val,
-                    "date": date_val
-                })
-
                 formatted_new_reports.append({
                     "number": db_rep.get("report_number", ""),
                     "gov": db_rep.get("governorate", ""),
                     "observer": db_rep.get("created_by_name", ""),
                     "date": date_val,
+                    "license": db_rep.get("license_number", ""),
                     "status": db_rep.get("status", "")
                 })
+            
+            actual_max_row = current_max_row
 
-        # Sort all rows by Governorate (custom order) then by date
-        all_rows_data.sort(key=lambda x: (get_gov_index(x["gov"]), x["date"]))
+        # Fix date format for entire columns
+        for d_col in date_cols_indices:
+            for row in range(header_row_idx + 1, actual_max_row + 1):
+                cell = ws.cell(row=row, column=d_col)
+                if cell.value:
+                    cell.number_format = 'yyyy-mm-dd'
 
-        # Clear existing rows below header
-        ws.delete_rows(header_row_idx + 1, ws.max_row)
-
-        # Write sorted rows back
-        for i, row_data in enumerate(all_rows_data, 1):
-            # Assign sequential number if serial col exists
-            if serial_col:
-                row_data["values"][serial_col - 1] = i
+        # --- Perfect Sort: Original Governorate Order + Chronological Date ---
+        if gov_col:
+            # 1. Capture the original governorate order from the ORIGINAL existing rows
+            original_max_row = actual_max_row - len(new_reports_data) if new_reports_data else actual_max_row
+            gov_order = {}
+            next_gov_idx = 0
+            for r in range(header_row_idx + 1, original_max_row + 1):
+                raw_gov = str(ws.cell(row=r, column=gov_col).value or "").strip()
+                if raw_gov:
+                    norm_gov = normalize_gov(raw_gov)
+                    if norm_gov not in gov_order:
+                        gov_order[norm_gov] = next_gov_idx
+                        next_gov_idx += 1
+            
+            sort_date_col = receive_date_col if receive_date_col else date_col
+            
+            data_rows = []
+            for r in range(header_row_idx + 1, actual_max_row + 1):
+                gov_val = str(ws.cell(row=r, column=gov_col).value or "").strip()
                 
-            ws.append(row_data["values"])
-            current_row = ws.max_row
+                date_val = ""
+                if sort_date_col:
+                    date_cell_val = ws.cell(row=r, column=sort_date_col).value
+                    dt_obj = format_dt_obj(date_cell_val)
+                    if dt_obj:
+                        if type(dt_obj).__name__ == "date":
+                            date_val = dt_obj.strftime("%Y-%m-%d")
+                        else:
+                            date_val = str(dt_obj)
+                    elif date_cell_val:
+                        date_val = str(date_cell_val).split("T")[0].split(" ")[0].strip()
+                
+                row_cells = []
+                for c in range(1, actual_max_col + 1):
+                    cell = ws.cell(row=r, column=c)
+                    row_cells.append({
+                        "value": cell.value,
+                        "_style": cell._style
+                    })
+                data_rows.append({
+                    "gov": gov_val,
+                    "date": date_val,
+                    "cells": row_cells
+                })
+                
+            # 2. Sort the rows perfectly
+            data_rows.sort(key=lambda x: (
+                1 if not x["gov"] else 0,              # Empty governorates to bottom
+                gov_order.get(normalize_gov(x["gov"]), 999999), # STRICTLY preserve the original Excel governorate order
+                1 if not x["date"] else 0,             # Empty dates to the bottom of the group
+                x["date"]                              # Chronological sorting of old + new dates
+            ))
             
-            for d_col in date_cols_indices:
-                ws.cell(row=current_row, column=d_col).number_format = 'yyyy-mm-dd'
-            
-            for col_idx, fill in enumerate(row_data["fills"], 1):
-                if fill:
-                    try:
-                        from copy import copy
-                        ws.cell(row=current_row, column=col_idx).fill = copy(fill)
-                    except:
-                        pass
+            # 3. Rewrite the entire sheet, ensuring serial numbers form a perfect 1 to N sequence
+            serial_counter = 1
+            for i, r_data in enumerate(data_rows):
+                r_idx = header_row_idx + 1 + i
+                for c_idx, c_data in enumerate(r_data["cells"]):
+                    cell = ws.cell(row=r_idx, column=c_idx + 1)
+                    
+                    if serial_col and (c_idx + 1) == serial_col:
+                        cell.value = serial_counter
+                    else:
+                        cell.value = c_data["value"]
+                        
+                    cell._style = c_data["_style"]
+                
+                serial_counter += 1
 
         import time
         from pathlib import Path
@@ -17935,8 +18381,14 @@ async def process_update_reports(
         filepath = upload_dir / filename
         wb.save(filepath)
 
+        updated_reports.sort(key=lambda x: (
+            str(x.get("gov") or ""),
+            str(x.get("date") or "")
+        ))
+
         return {
             "platform_total": len(db_reports),
+            "uploaded_excel_count": uploaded_rows_count,
             "new_reports_count": len(new_reports_data),
             "updated_reports_count": len(updated_reports),
             "new_reports": formatted_new_reports,
@@ -18228,7 +18680,579 @@ async def update_meeting(
     return {"message": "تم تعديل الاجتماع بنجاح", "meeting": meeting}
 
 
+# ============= مؤشرات الأداء وتحليل البيانات =============
+
+@api_router.get("/performance/location-duplicates")
+async def get_location_duplicates(
+    project: Optional[str] = Query(None),
+    governorate: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    تحليل تكرار البلاغات بناءً على تقارب المواقع الجغرافية.
+    يعتبر البلاغين في نفس الموقع إذا كان الفرق بين إحداثياتهم أقل من 50 متر (~0.00045 درجة).
+    """
+    try:
+        # بناء الفلتر الأساسي
+        query_filter = {
+            "is_deleted": {"$ne": True},
+            "permanently_deleted": {"$ne": True},
+            "latitude": {"$exists": True, "$ne": None, "$ne": ""},
+            "longitude": {"$exists": True, "$ne": None, "$ne": ""}
+        }
+
+        # فلتر المشروع
+        if project and project not in ["الكل", "جميع المشاريع"]:
+            proj_q = get_flexible_project_query(project)
+            if proj_q:
+                query_filter["project"] = proj_q
+
+        # فلتر المحافظة
+        if governorate and governorate not in ["الكل", "جميع المحافظات"]:
+            query_filter["governorate"] = {"$regex": governorate, "$options": "i"}
+
+        # فلتر التاريخ (من وإلى)
+        if date_from or date_to:
+            try:
+                date_filter = None
+                if date_from and date_to:
+                    d_from_obj = datetime.fromisoformat(date_from)
+                    d_to_obj = datetime.fromisoformat(date_to)
+                    d_next = d_to_obj + timedelta(days=1)
+                    date_filter = {
+                        "$or": [
+                            {"created_at": {"$gte": f"{date_from}T00:00:00", "$lt": d_next.strftime("%Y-%m-%dT00:00:00")}},
+                            {"created_at": {"$gte": d_from_obj, "$lt": d_next}}
+                        ]
+                    }
+                elif date_from:
+                    d_from_obj = datetime.fromisoformat(date_from)
+                    date_filter = {
+                        "$or": [
+                            {"created_at": {"$gte": f"{date_from}T00:00:00"}},
+                            {"created_at": {"$gte": d_from_obj}}
+                        ]
+                    }
+                elif date_to:
+                    d_to_obj = datetime.fromisoformat(date_to)
+                    d_next = d_to_obj + timedelta(days=1)
+                    date_filter = {
+                        "$or": [
+                            {"created_at": {"$lt": d_next.strftime("%Y-%m-%dT00:00:00")}},
+                            {"created_at": {"$lt": d_next}}
+                        ]
+                    }
+                
+                if date_filter:
+                    if "$and" in query_filter:
+                        query_filter["$and"].append(date_filter)
+                    else:
+                        query_filter["$and"] = [date_filter]
+            except Exception:
+                pass
+
+        # صلاحيات المستخدم
+        if current_user.role != "admin":
+            user_govs = current_user.governorates
+            if user_govs:
+                query_filter["governorate"] = {"$in": user_govs}
+
+        # جلب البلاغات مع الحقول الضرورية فقط (بدون الصور لتحسين الأداء)
+        cursor = db.reports.find(
+            query_filter,
+            {
+                "_id": 0, "id": 1, "report_number": 1, "license_number": 1,
+                "report_type": 1, "status": 1, "governorate": 1, "project": 1,
+                "contractor": 1, "latitude": 1, "longitude": 1, "neighborhood": 1,
+                "created_at": 1, "closed_at": 1
+            }
+        )
+        reports = await cursor.to_list(length=10000)
+
+        # دالة تحويل الإحداثيات
+        def parse_coord(val):
+            try:
+                return float(str(val).replace(",", ".").strip())
+            except Exception:
+                return None
+
+        # تحليل التكرار بناءً على القرب الجغرافي (5 أمتار لتغطية نسبة خطأ الـ GPS الطبيعية)
+        THRESHOLD = 0.000045  # ~5 أمتار
+
+        valid_reports = []
+        for r in reports:
+            lat = parse_coord(r.get("latitude"))
+            lon = parse_coord(r.get("longitude"))
+            if lat is not None and lon is not None:
+                r["_lat"] = lat
+                r["_lon"] = lon
+                valid_reports.append(r)
+
+        # تجميع البلاغات المتقاربة
+        groups = []
+        used = set()
+
+        for i, rep in enumerate(valid_reports):
+            if i in used:
+                continue
+            group = [rep]
+            used.add(i)
+            for j, other in enumerate(valid_reports):
+                if j in used or i == j:
+                    continue
+                if (abs(rep["_lat"] - other["_lat"]) <= THRESHOLD and
+                        abs(rep["_lon"] - other["_lon"]) <= THRESHOLD and
+                        rep.get("report_type") == other.get("report_type") and
+                        rep.get("governorate") == other.get("governorate") and
+                        rep.get("neighborhood") == other.get("neighborhood")):
+                    group.append(other)
+                    used.add(j)
+            if len(group) >= 2:
+                groups.append(group)
+
+        # إعداد النتائج
+        duplicate_locations = []
+        for grp in groups:
+            avg_lat = sum(r["_lat"] for r in grp) / len(grp)
+            avg_lon = sum(r["_lon"] for r in grp) / len(grp)
+            sample = grp[0]
+            duplicate_locations.append({
+                "count": len(grp),
+                "governorate": sample.get("governorate", ""),
+                "project": sample.get("project", ""),
+                "neighborhood": sample.get("neighborhood", ""),
+                "report_type": sample.get("report_type", ""),
+                "avg_lat": round(avg_lat, 6),
+                "avg_lon": round(avg_lon, 6),
+                "reports": [
+                    {
+                        "id": r.get("id", ""),
+                        "report_number": r.get("report_number", ""),
+                        "license_number": r.get("license_number", ""),
+                        "status": r.get("status", ""),
+                        "contractor": r.get("contractor", ""),
+                        "neighborhood": r.get("neighborhood", ""),
+                        "created_at": r.get("created_at").isoformat() if hasattr(r.get("created_at"), "isoformat") else str(r.get("created_at") or ""),
+                        "latitude": r.get("latitude", ""),
+                        "longitude": r.get("longitude", ""),
+                    }
+                    for r in grp
+                ]
+            })
+
+        # ترتيب حسب التكرار
+        duplicate_locations.sort(key=lambda x: -x["count"])
+
+        # إحصاءات عامة حسب المشروع والمحافظة والحي
+        gov_stats = {}
+        for loc in duplicate_locations:
+            proj = loc.get("project") or "غير محدد"
+            gov = loc.get("governorate") or "غير محدد"
+            neigh = loc.get("neighborhood") or "غير محدد"
+            key = f"{proj}_{gov}_{neigh}"
+            if key not in gov_stats:
+                gov_stats[key] = {"project": proj, "governorate": gov, "neighborhood": neigh, "duplicate_locations": 0, "duplicate_reports": 0}
+            gov_stats[key]["duplicate_locations"] += 1
+            gov_stats[key]["duplicate_reports"] += loc["count"]
+
+        # إحصاءات عامة حسب المشروع
+        proj_stats = {}
+        for loc in duplicate_locations:
+            proj = loc["project"]
+            if proj not in proj_stats:
+                proj_stats[proj] = {"project": proj, "duplicate_locations": 0, "duplicate_reports": 0}
+            proj_stats[proj]["duplicate_locations"] += 1
+            proj_stats[proj]["duplicate_reports"] += loc["count"]
+
+        # إجمالي البلاغات التي تم تحليلها
+        total_analyzed = len(valid_reports)
+        total_duplicates = sum(loc["count"] for loc in duplicate_locations)
+        total_unique_duplicated_locations = len(duplicate_locations)
+
+        return {
+            "total_analyzed": total_analyzed,
+            "total_duplicates": total_duplicates,
+            "total_unique_locations": total_unique_duplicated_locations,
+            "duplicate_locations": duplicate_locations,
+            "by_governorate": sorted(gov_stats.values(), key=lambda x: -x["duplicate_reports"]),
+            "by_project": sorted(proj_stats.values(), key=lambda x: -x["duplicate_reports"])
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"خطأ في التحليل: {str(e)}")
+
+
+@api_router.get("/performance/summary")
+async def get_performance_summary(
+    project: Optional[str] = Query(None),
+    governorate: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """ملخص مؤشرات الأداء العامة"""
+    try:
+        query_filter = {
+            "is_deleted": {"$ne": True},
+            "permanently_deleted": {"$ne": True}
+        }
+        if project and project not in ["الكل", "جميع المشاريع"]:
+            proj_q = get_flexible_project_query(project)
+            if proj_q:
+                query_filter["project"] = proj_q
+        if governorate and governorate not in ["الكل", "جميع المحافظات"]:
+            query_filter["governorate"] = {"$regex": governorate, "$options": "i"}
+        if date_from or date_to:
+            try:
+                date_filter = None
+                if date_from and date_to:
+                    d_from_obj = datetime.fromisoformat(date_from)
+                    d_to_obj = datetime.fromisoformat(date_to)
+                    d_next = d_to_obj + timedelta(days=1)
+                    date_filter = {
+                        "$or": [
+                            {"created_at": {"$gte": f"{date_from}T00:00:00", "$lt": d_next.strftime("%Y-%m-%dT00:00:00")}},
+                            {"created_at": {"$gte": d_from_obj, "$lt": d_next}}
+                        ]
+                    }
+                elif date_from:
+                    d_from_obj = datetime.fromisoformat(date_from)
+                    date_filter = {
+                        "$or": [
+                            {"created_at": {"$gte": f"{date_from}T00:00:00"}},
+                            {"created_at": {"$gte": d_from_obj}}
+                        ]
+                    }
+                elif date_to:
+                    d_to_obj = datetime.fromisoformat(date_to)
+                    d_next = d_to_obj + timedelta(days=1)
+                    date_filter = {
+                        "$or": [
+                            {"created_at": {"$lt": d_next.strftime("%Y-%m-%dT00:00:00")}},
+                            {"created_at": {"$lt": d_next}}
+                        ]
+                    }
+                
+                if date_filter:
+                    if "$and" in query_filter:
+                        query_filter["$and"].append(date_filter)
+                    else:
+                        query_filter["$and"] = [date_filter]
+            except Exception:
+                pass
+
+        if current_user.role != "admin":
+            user_govs = current_user.governorates
+            if user_govs:
+                query_filter["governorate"] = {"$in": user_govs}
+
+        # إجمالي البلاغات
+        total = await db.reports.count_documents(query_filter)
+
+        # البلاغات ذات إحداثيات
+        geo_filter = dict(query_filter)
+        geo_filter["latitude"] = {"$exists": True, "$ne": None, "$ne": ""}
+        geo_filter["longitude"] = {"$exists": True, "$ne": None, "$ne": ""}
+        geo_total = await db.reports.count_documents(geo_filter)
+
+        # حسب المحافظة والمشروع
+        pipeline = [
+            {"$match": query_filter},
+            {"$group": {"_id": {"project": "$project", "governorate": "$governorate"}, "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        gov_cursor = db.reports.aggregate(pipeline)
+        by_governorate = []
+        async for doc in gov_cursor:
+            proj = doc["_id"].get("project") or "غير محدد"
+            gov = doc["_id"].get("governorate") or "غير محدد"
+            by_governorate.append({"project": proj, "governorate": gov, "count": doc["count"]})
+
+        # حسب نوع البلاغ
+        type_pipeline = [
+            {"$match": query_filter},
+            {"$group": {"_id": "$report_type", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        type_cursor = db.reports.aggregate(type_pipeline)
+        by_type = []
+        async for doc in type_cursor:
+            by_type.append({"report_type": doc["_id"] or "غير محدد", "count": doc["count"]})
+
+        # حسب المشروع
+        proj_pipeline = [
+            {"$match": query_filter},
+            {"$group": {"_id": "$project", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        proj_cursor = db.reports.aggregate(proj_pipeline)
+        by_project = []
+        async for doc in proj_cursor:
+            by_project.append({"project": doc["_id"] or "غير محدد", "count": doc["count"]})
+
+        return {
+            "total": total,
+            "geo_total": geo_total,
+            "by_governorate": by_governorate,
+            "by_type": by_type,
+            "by_project": by_project
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/extract-image-coords")
+async def extract_image_coords(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    استخراج الإحداثيات والحي من الصورة:
+    1. EXIF GPS (فوري - للصور الملتقطة بالكاميرا)
+    2. OCR.space API (2-3 ثواني - لأي صورة تحتوي نص)
+    """
+    import io as _io, re as _re
+
+    image_bytes = await file.read()
+
+    # ════════════════════════════════════════════════
+    # STEP 1: EXIF GPS - فوري للصور الملتقطة بالكاميرا
+    # ════════════════════════════════════════════════
+    try:
+        from PIL import Image as _PIL
+        from PIL.ExifTags import TAGS as _TAGS, GPSTAGS as _GPSTAGS
+
+        _img = _PIL.open(_io.BytesIO(image_bytes))
+        _exif = _img._getexif() if hasattr(_img, '_getexif') else None
+        if _exif:
+            _gps = {}
+            for _t, _v in _exif.items():
+                if _TAGS.get(_t) == "GPSInfo":
+                    for _gt, _gv in _v.items():
+                        _gps[_GPSTAGS.get(_gt, _gt)] = _gv
+            def _tf(v):
+                try: return float(v)
+                except: return v[0]/v[1] if isinstance(v, tuple) else float(str(v))
+            def _dms(d): return _tf(d[0]) + _tf(d[1])/60 + _tf(d[2])/3600
+            if "GPSLatitude" in _gps and "GPSLongitude" in _gps:
+                _lat = _dms(_gps["GPSLatitude"])
+                _lon = _dms(_gps["GPSLongitude"])
+                if _gps.get("GPSLatitudeRef") == "S": _lat = -_lat
+                if _gps.get("GPSLongitudeRef") == "W": _lon = -_lon
+                print(f"[EXIF] ✅ GPS: {_lat}, {_lon}")
+                return {
+                    "success": True, "source": "exif",
+                    "lat": f"{_lat:.8f}".rstrip('0').rstrip('.'),
+                    "lon": f"{_lon:.8f}".rstrip('0').rstrip('.'),
+                    "neighborhood": "", "city": ""
+                }
+    except Exception as _e:
+        print(f"[EXIF] Error: {_e}")
+
+    # ════════════════════════════════════════════════
+    # STEP 2: OCR.space API - يقرأ النص من الصورة
+    # مجانية، تدعم العربية، 2-3 ثواني
+    # ════════════════════════════════════════════════
+    def _parse_coords_and_location(raw_text: str):
+        """استخراج الإحداثيات والحي من النص الخام"""
+        # تحويل الأرقام العربية
+        for _a, _w in zip('٠١٢٣٤٥٦٧٨٩', '0123456789'):
+            raw_text = raw_text.replace(_a, _w)
+
+        # تنظيف رموز الاتجاه
+        raw_text = _re.sub(r'[°ْ\'\"″′NSEW]', ' ', raw_text)
+
+        print(f"[OCR] Text: {raw_text[:300]}")
+
+        # البحث عن الإحداثيات
+        _coords = _re.findall(r'-?\d{1,3}[.,]\d{4,14}', raw_text)
+        _coords = [c.replace(',', '.') for c in _coords]
+
+        _lat_str, _lon_str = "", ""
+
+        # أولوية للأرقام ضمن نطاق المنطقة
+        for _c in _coords:
+            try:
+                _n = float(_c)
+                if not _lat_str and 10 <= _n <= 35: _lat_str = _c
+                elif not _lon_str and 30 <= _n <= 60: _lon_str = _c
+            except: pass
+
+        # إذا لم ينجح - خذ أول زوجين عشريين
+        if not _lat_str and len(_coords) >= 2:
+            _lat_str, _lon_str = _coords[0], _coords[1]
+        elif not _lat_str and len(_coords) == 1:
+            _lat_str = _coords[0]
+
+        # استخراج الحي والمدينة
+        _neigh, _city = "", ""
+
+        # الحي
+        _hm = _re.search(r'(?:حي|الحي)[:\s،,]+([^\n،,]{2,40})', raw_text)
+        if _hm: _neigh = _hm.group(1).strip()
+
+        # قائمة مدن شاملة
+        _cities = [
+            'ضرما','الرياض','جدة','مكة','المدينة','الدمام','الخبر','الظهران',
+            'الخرج','حوطة','الدوادمي','القويعية','عفيف','الزلفي','المجمعة',
+            'الوجه','تبوك','حائل','القصيم','بريدة','عنيزة','ينبع','رابغ',
+            'الطائف','أبها','خميس مشيط','نجران','جيزان','صبيا','الباحة'
+        ]
+        for _cn in _cities:
+            if _cn in raw_text:
+                _city = _cn
+                break
+
+        # الحي من الاسم المركب مثل "البديع الشرقي"
+        if not _neigh:
+            _hm2 = _re.search(r'(?:البديع|النهضة|العليا|الملقا|الورود|المروج|الربوة|السليمانية|الحمراء|الشميسي)[^\n]{0,20}', raw_text)
+            if _hm2: _neigh = _hm2.group(0).strip()
+
+        return _lat_str, _lon_str, _neigh, _city
+
+    # استدعاء OCR.space API
+    try:
+        import requests as _req
+
+        # تحديد نوع الصورة
+        _fname = file.filename or "image.jpg"
+        _ext = _fname.split('.')[-1].lower() if '.' in _fname else 'jpg'
+        _mime = file.content_type or f"image/{_ext}"
+
+        _ocr_resp = _req.post(
+            "https://api.ocr.space/parse/image",
+            files={"file": (_fname, _io.BytesIO(image_bytes), _mime)},
+            data={
+                "apikey": "helloworld",  # مفتاح مجاني
+                "language": "ara",       # عربي
+                "isOverlayRequired": "false",
+                "detectOrientation": "true",
+                "scale": "true",
+                "OCREngine": "2",        # محرك أقوى للعربي
+            },
+            timeout=15
+        )
+
+        if _ocr_resp.status_code == 200:
+            _ocr_data = _ocr_resp.json()
+            _parsed_results = _ocr_data.get("ParsedResults", [])
+            if _parsed_results:
+                _raw = _parsed_results[0].get("ParsedText", "")
+                if _raw.strip():
+                    _lat, _lon, _neigh, _city = _parse_coords_and_location(_raw)
+                    if _lat or _neigh:
+                        return {
+                            "success": True, "source": "ocr",
+                            "lat": _lat, "lon": _lon,
+                            "neighborhood": _neigh, "city": _city,
+                            "raw_text": _raw[:500]
+                        }
+    except Exception as _ocr_e:
+        print(f"[OCR.space] Error: {_ocr_e}")
+
+    # ════════════════════════════════════════════════
+    # STEP 3: احتياط - OCR.space بمحرك مختلف
+    # ════════════════════════════════════════════════
+    try:
+        import requests as _req2
+        _ocr_resp2 = _req2.post(
+            "https://api.ocr.space/parse/image",
+            files={"file": (file.filename or "img.jpg", _io.BytesIO(image_bytes), "image/jpeg")},
+            data={"apikey": "helloworld", "language": "eng", "OCREngine": "1", "scale": "true"},
+            timeout=15
+        )
+        if _ocr_resp2.status_code == 200:
+            _d2 = _ocr_resp2.json()
+            _r2 = _d2.get("ParsedResults", [{}])[0].get("ParsedText", "")
+            if _r2.strip():
+                _lat2, _lon2, _n2, _c2 = _parse_coords_and_location(_r2)
+                if _lat2:
+                    return {
+                        "success": True, "source": "ocr_eng",
+                        "lat": _lat2, "lon": _lon2,
+                        "neighborhood": _n2, "city": _c2
+                    }
+    except Exception as _e3:
+        print(f"[OCR fallback] {_e3}")
+
+    return {"success": False, "error": "لم يتم العثور على إحداثيات في الصورة"}
+
+
+# ══════════════════════════════════════════════════════════════════
+# AI IMAGE AUDIT ENDPOINT
+# ══════════════════════════════════════════════════════════════════
+@api_router.post("/ai-image-audit")
+async def ai_image_audit_endpoint(
+    file: UploadFile = File(...),
+    lang: str = Form("ar"),
+    current_user: User = Depends(get_current_user)
+):
+    import io, base64, json, re
+    import google.generativeai as genai
+    
+    if "ai_image_audit" not in (current_user.permissions or []) and not user_has_any_project_permission(current_user, "ai_image_audit"):
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية تدقيق الصور")
+        
+    try:
+        image_bytes = await file.read()
+        gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("EMERGENT_LLM_KEY")
+        if not gemini_key:
+            return {"success": False, "error": "مفتاح API للذكاء الاصطناعي غير متوفر"}
+
+        genai.configure(api_key=gemini_key)
+        # استخدام موديل متوفر وبدون ضغط كبير
+        model = genai.GenerativeModel("gemini-3-flash-preview")
+
+        # ضغط الصورة قبل إرسالها لـ Google API لتسريع العملية بشكل هائل
+        import asyncio
+        loop = asyncio.get_event_loop()
+        compressed_bytes = await loop.run_in_executor(thread_pool, compress_image, image_bytes)
+        
+        img_b64 = base64.b64encode(compressed_bytes).decode()
+        mime = file.content_type or "image/jpeg"
+
+        requested_language = "باللغة العربية" if lang == "ar" else "in English"
+        prompt = f"""قم بدور خبير عالمي وشرس جداً في الأدلة الجنائية الرقمية وتحليل الصور (Image Forensics).
+هناك من يحاول التلاعب بصور تقارير المقاولات باستخدام الذكاء الاصطناعي أو الفوتوشوب لإخفاء مخالفات. مهمتك كشفهم!
+ركز بشدة على ما يلي:
+1. "الأسفلت المزيف": ابحث عن رقع أسفلت (Asphalt Patches) تبدو مثالية جداً، مقصوصة بخطوط مستقيمة غير طبيعية، أو تبدو وكأنها "ملصقة" (Pasted/Floating) فوق الحفرية ولا تندمج طبيعياً مع التراب أو الشارع حولها. هذا تلاعب ذكاء اصطناعي!
+2. "المسح والإخفاء": ابحث عن بقع مموهة (Smudged/Blurred) أو أجزاء مكررة في الخلفية تدل على أنه تم مسح سيارة أو معدة من الموقع باستخدام الذكاء الاصطناعي (Generative Fill/Magic Eraser).
+3. "الإضافات الخارجية": نصوص بيضاء، أرقام بلاغات، أو إحداثيات ملصقة فوق الصورة.
+
+أجب بصيغة JSON فقط، {requested_language}، بالهيكل التالي:
+{{
+  "is_manipulated": true/false, // True إذا تم اكتشاف فوتوشوب، توليد أسفلت بالذكاء الاصطناعي، مسح معدات، أو إضافة نصوص
+  "scene_authentic": true/false, // False إذا كان هناك أي لعب في الأسفلت أو الحفرية أو مسح للمعدات. True فقط إذا كانت 100% طبيعية.
+  "software_used": "اسم التقنية المتوقعة (مثل Generative AI Asphalt, AI Eraser, Photoshop)",
+  "modifications": [
+    "قائمة بالأماكن التي تم تعديلها (مثل: إضافة مربع نص، تعديل بالفوتوشوب، أو توليد أجزاء بالذكاء الاصطناعي)"
+  ],
+  "details": "يجب أن تبدأ إجابتك بتأكيد صريح وواضح جداً عما إذا كانت الصورة للمشهد الحقيقي حقيقية 100% ولا يوجد فيها تلاعب أو استخدام للذكاء الاصطناعي، ثم وضح بشكل منفصل أي تلاعب تم اكتشافه أو تفاصيل حول استخدام الذكاء الاصطناعي التوليدي فيها."
+}}
+تأكد من أن الرد هو JSON صالح فقط بدون أي نصوص إضافية أو علامات Markdown. يجب أن تكون دقيقاً جداً وصادقاً ومقنعاً في تحليلك."""
+
+        response = model.generate_content([
+            {"mime_type": mime, "data": img_b64},
+            prompt
+        ])
+
+        raw = response.text.strip()
+        # محاولة استخراج JSON من النص
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+            return {"success": True, "result": data}
+        else:
+            return {"success": False, "error": "لم يتمكن الذكاء الاصطناعي من توليد تحليل صالح"}
+            
+    except Exception as e:
+        error_str = str(e)
+        print(f"[AI Audit] Error: {error_str}")
+        if "429" in error_str or "Quota exceeded" in error_str:
+            return {"success": False, "error": "عذراً! لقد استنفدت الحد المجاني للطلبات السريعة (5 طلبات في الدقيقة). يرجى الانتظار لمدة دقيقة واحدة فقط ثم المحاولة مرة أخرى."}
+        return {"success": False, "error": f"حدث خطأ أثناء فحص الصورة: {error_str}"}
+
 app.include_router(api_router)
-
-
-
