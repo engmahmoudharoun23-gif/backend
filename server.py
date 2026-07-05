@@ -5719,8 +5719,30 @@ async def get_report(
 # ==========================================
 async def log_audit_change(report_id: str, report_number: str, project: str, gov: str, action: str, old_value: str, new_value: str, user_id: str, user_name: str, license_number: str = ""):
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
         import uuid
+        
+        # Consolidation Logic: دمج السجلات المتكررة (مثل رفع عدة صور متتالية) في سجل واحد
+        if action in ["إضافة صور جديدة", "حذف صورة"]:
+            five_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+            recent_log = await db.audit_logs.find_one({
+                "report_id": report_id,
+                "modified_by": user_id,
+                "action": action,
+                "timestamp": {"$gte": five_mins_ago}
+            }, sort=[("timestamp", -1)])
+            
+            if recent_log:
+                # تحديث السجل الموجود بدلاً من إنشاء سطر جديد، مع الاحتفاظ بالقيمة القديمة الأصلية
+                await db.audit_logs.update_one(
+                    {"id": recent_log["id"]},
+                    {"$set": {
+                        "new_value": str(new_value) if new_value is not None else "",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }}
+                )
+                return
+                
         log_doc = {
             "id": str(uuid.uuid4()),
             "report_id": report_id,
