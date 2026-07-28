@@ -72,6 +72,7 @@ def get_settings() -> Settings:
 # Permissions Configuration
 ALL_PERMISSIONS = [
     {"key": "dashboard", "label": "لوحة التحكم", "group": "عام"},
+    {"key": "performance_indicators", "label": "مؤشرات الأداء وتحليل البيانات", "group": "عام"},
     {"key": "reports_view", "label": "عرض البلاغات", "group": "البلاغات"},
     {"key": "reports_add", "label": "إضافة بلاغ", "group": "البلاغات"},
     {"key": "reports_edit", "label": "تعديل البلاغات", "group": "البلاغات"},

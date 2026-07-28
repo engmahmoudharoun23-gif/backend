@@ -3198,22 +3198,44 @@ async def get_reports(
     with open("debug_log.txt", "a", encoding="utf-8") as f:
         f.write(f"\n[{datetime.now()}] User: {current_user.username}, Role: {current_user.role}, Requested Project: '{project}'\n")
         f.write(f"Final Query: {query}\n")
-    # حساب العدد الكلي للتقارير
-    total_count = await db.reports.count_documents(query)
-    with open("debug_log.txt", "a", encoding="utf-8") as f:
-        f.write(f"Total Count: {total_count}\n")
+    # ⚡ جلب البلاغات والفرز الذكي
+    projection = {"_id": 0, "images": 0}  # استبعاد الصور لتسريع الاستجابة
     
-    # حساب عدد الصفحات وموقع البداية
-    skip = (page - 1) * limit
-    
-    # جلب البلاغات مع الترقيم (بدون الصور لتسريع الاستجابة)
-    projection = {"_id": 0, "images": 0}  # استبعاد الصور
-    
-    # ⚡ ذكاء الاصطناعي: ترتيب البلاغات 
-    # إذا كنا في صفحة قيد المراجعة، نرتب حسب تاريخ التحديث (updated_at) 
-    # لتظهر البلاغات التي تم تحديثها مؤخراً في الصفحة الأولى دائماً
-    sort_field = "updated_at" if license_status == 'review_pending' else "created_at"
-    reports = await db.reports.find(query, projection).sort(sort_field, -1).skip(skip).limit(limit).to_list(limit)
+    if license_status == 'review_pending':
+        # إذا كنا في صفحة قيد المراجعة: تجميع كافة البلاغات المطابقة ووضع "تم الإصلاح" في صدارة جميع الصفحات
+        all_matching = await db.reports.find(query, projection).sort("updated_at", -1).to_list(10000)
+        total_count = len(all_matching)
+        
+        def _get_updated_ts(r):
+            val = r.get("updated_at") or r.get("created_at") or r.get("added_at")
+            if isinstance(val, datetime):
+                return val.timestamp()
+            if isinstance(val, str):
+                try:
+                    return datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+            return 0.0
+
+        fixed_reports = []
+        other_reports = []
+        for r in all_matching:
+            st = str(r.get("status") or "").strip()
+            if st in ["تم الإصلاح", "تم الاصلاح"]:
+                fixed_reports.append(r)
+            else:
+                other_reports.append(r)
+                
+        fixed_reports.sort(key=_get_updated_ts, reverse=True)
+        other_reports.sort(key=_get_updated_ts, reverse=True)
+                
+        combined = fixed_reports + other_reports
+        skip = (page - 1) * limit
+        reports = combined[skip : skip + limit]
+    else:
+        total_count = await db.reports.count_documents(query)
+        skip = (page - 1) * limit
+        reports = await db.reports.find(query, projection).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     # ⚡ تحسين: جلب أسماء المستخدمين مرة واحدة
     creator_ids = list(set(r.get('created_by') for r in reports if r.get('created_by')))
@@ -4618,9 +4640,17 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
             "review_status": {"$in": ["بانتظار المراجعة", "قيد المراجعة", None]}
         }
         
+        repaired_condition = {
+            "$or": [
+                {"status": {"$in": ["تم الإصلاح", "تم الاصلاح", "لا يوجد تسرب", "لايوجد تسرب"]}},
+                {"asphalt_repaired_unreviewed": True}
+            ]
+        }
+        
         if current_user.role == "admin":
             count = await db.reports.count_documents(base)
-            return {"count": count}
+            asphalt_count = await db.reports.count_documents({**base, **repaired_condition})
+            return {"count": count, "asphalt_repaired_count": asphalt_count}
             
         # للمستوى الثالث العادي، يرون فقط بلاغاتهم بانتظار المراجعة
         permissions = getattr(current_user, 'permissions', [])
@@ -4628,7 +4658,8 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
         if not getattr(current_user, 'can_create_subusers', False) and "reports_view" not in permissions and not has_review:
             query = {**base, "created_by": {"$in": [current_user.id, current_user.username]}}
             count = await db.reports.count_documents(query)
-            return {"count": count}
+            asphalt_count = await db.reports.count_documents({**query, **repaired_condition})
+            return {"count": count, "asphalt_repaired_count": asphalt_count}
         
         # المشاريع التي يملك فيها المستخدم صلاحية reports_review
         allowed_projects = get_projects_with_permission(current_user, "reports_review")
@@ -4647,11 +4678,12 @@ async def get_pending_review_count(current_user: User = Depends(get_current_user
         
         query = {**base, "$or": or_clauses}
         count = await db.reports.count_documents(query)
-        return {"count": count}
+        asphalt_count = await db.reports.count_documents({**query, **repaired_condition})
+        return {"count": count, "asphalt_repaired_count": asphalt_count}
         
     except Exception as e:
         logger.error(f"Error getting pending review count: {str(e)}")
-        return {"count": 0}
+        return {"count": 0, "asphalt_repaired_count": 0}
 
 
 @api_router.get("/reports/pending-review-by-governorate")
@@ -4797,7 +4829,7 @@ async def get_unseen_reports(current_user: User = Depends(get_current_user)):
             reports = await db.reports.find(
                 base_query,
                 {"_id": 0, "id": 1, "report_number": 1, "governorate": 1, "project": 1,
-                 "report_type": 1, "created_at": 1, "added_at": 1, "contractor": 1, "created_by": 1, "created_by_name": 1}
+                 "report_type": 1, "created_at": 1, "added_at": 1, "contractor": 1, "created_by": 1, "created_by_name": 1, "status": 1}
             ).sort("added_at", -1).limit(300).to_list(300)
             for r in reports:
                 r["item_type"] = "report"
@@ -5383,7 +5415,7 @@ async def get_consultant_notes(
     
     reports = await db.reports.find(
         query, 
-        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "consultant_note": 1, "consultant_note_by": 1, "consultant_note_reply": 1, "consultant_note_replied_by": 1, "consultant_note_processed": 1, "consultant_note_date": 1, "consultant_note_processed_date": 1, "created_at": 1, "status": 1}
+        {"_id": 0, "id": 1, "report_number": 1, "project": 1, "governorate": 1, "contractor": 1, "consultant_note": 1, "consultant_note_by": 1, "consultant_note_reply": 1, "consultant_note_replied_by": 1, "consultant_note_processed": 1, "consultant_note_date": 1, "consultant_note_processed_date": 1, "created_at": 1, "status": 1, "notes": 1, "note": 1, "description": 1}
     ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
     print("Found Reports:", len(reports), "Total Count:", total)
@@ -5662,18 +5694,51 @@ async def delete_consultant_note(report_id: str, current_user: User = Depends(ge
     return {"success": True, "message": "Consultant note deleted successfully"}
 
 
+def _expand_governorate_list(governorates):
+    if not governorates:
+        return []
+    expanded_govs = []
+    for g in governorates:
+        clean_g = g.replace("محافظة ", "").replace("محافظه ", "").strip()
+        expanded_govs.extend([
+            g, clean_g, f"محافظة {clean_g}", f"محافظه {clean_g}",
+            clean_g.replace("ية", "يه"), clean_g.replace("يه", "ية"),
+            clean_g.replace("ماء", "ما"), clean_g.replace("ما", "ماء")
+        ])
+    return list(set(expanded_govs))
+
+
 @api_router.get("/reports/{report_id}", response_model=ReportResponse)
 async def get_report(
     report_id: str, 
     exclude_images: bool = Query(False, description="استبعاد الصور لتسريع التحميل"),
     current_user: User = Depends(get_current_user)
 ):
-    query = {"id": report_id, "is_deleted": {"$ne": True}}
+    clean_id = report_id.strip()
+    id_conds = [
+        {"id": report_id},
+        {"id": clean_id},
+        {"report_number": report_id},
+        {"report_number": clean_id},
+        {"report_number": {"$regex": f"^{re.escape(clean_id)}$", "$options": "i"}},
+        {"license_number": report_id},
+        {"license_number": clean_id}
+    ]
+    if len(clean_id) == 24:
+        try:
+            from bson import ObjectId
+            id_conds.append({"_id": ObjectId(clean_id)})
+        except Exception:
+            pass
+
+    query = {"$or": id_conds, "is_deleted": {"$ne": True}}
     
     # فلترة حسب صلاحيات المحافظات — الأدمن يرى كل البلاغات بدون قيود
     if current_user.role != "admin":
         if len(current_user.governorates) > 0:
-            query["governorate"] = {"$in": current_user.governorates}
+            has_all_govs = any(g in ["الكل", "كل المحافظات", "جميع المحافظات"] for g in current_user.governorates)
+            if not has_all_govs:
+                query["governorate"] = {"$in": _expand_governorate_list(current_user.governorates)}
     
     # ⚡ استبعاد الصور إذا طُلب ذلك لتسريع التحميل
     projection = {"_id": 0}
@@ -5882,7 +5947,7 @@ async def update_report(
         if len(current_user.governorates) > 0:
             has_all_govs = any(g in ["الكل", "كل المحافظات", "جميع المحافظات"] for g in current_user.governorates)
             if not has_all_govs:
-                query["governorate"] = {"$in": current_user.governorates}
+                query["governorate"] = {"$in": _expand_governorate_list(current_user.governorates)}
     
     report_doc = await db.reports.find_one(query, {"_id": 0})
     if not report_doc:
@@ -5937,7 +6002,16 @@ async def update_report(
     if report_type is not None:
         update_data["report_type"] = report_type
     if status is not None:
-        update_data["status"] = normalize_asphalt_status(status)
+        norm_status = normalize_asphalt_status(status)
+        update_data["status"] = norm_status
+        old_status = str(report_doc.get("status") or "").strip()
+        is_old_asphalt = ("متبقي" in old_status and ("أسفلت" in old_status or "اسفلت" in old_status)) or old_status in ["تم الإصلاح-ومتبقي الأسفلت", "تم الإصلاح - ومتبقي الأسفلت", "تم الإصلاح ومتبقي الأسفلت", "تم إصلاحه ومتبقي الأسفلت", "تم إصلاحه متبقي الأسفلت"]
+        is_new_repaired = norm_status in ["تم الإصلاح", "تم الاصلاح"]
+        if is_old_asphalt and is_new_repaired:
+            update_data["asphalt_repaired_unreviewed"] = True
+            update_data["review_status"] = "بانتظار المراجعة"
+        elif not is_new_repaired and report_doc.get("asphalt_repaired_unreviewed"):
+            update_data["asphalt_repaired_unreviewed"] = False
     if governorate is not None:
         update_data["governorate"] = governorate
     if project is not None:
@@ -6063,12 +6137,17 @@ async def update_report(
                     user_name=current_user.full_name or current_user.username, license_number=report_doc.get("license_number", "")
                 )
     # ---------------------------------------------
+    # ---------------------------------------------
 
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     
-    await db.reports.update_one({"id": report_id}, {"$set": update_data})
+    await db.reports.update_one(
+        {"id": report_id}, 
+        {
+            "$set": update_data
+        }
+    )
 
-    
     updated_report = await db.reports.find_one({"id": report_id}, {"_id": 0})
     
     # ⚡ مسح الـ cache لتحديث الإحصائيات
@@ -6142,7 +6221,8 @@ async def update_report_review_status(
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "wfm_closed": True if new_status == "تمت المراجعة" else False,
                 "wfm_closed_by": "م/ مدحت حسين محمد" if new_status == "تمت المراجعة" else None,
-                "wfm_closed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None
+                "wfm_closed_at": datetime.now(timezone.utc).isoformat() if new_status == "تمت المراجعة" else None,
+                "asphalt_repaired_unreviewed": False if new_status == "تمت المراجعة" else report.get("asphalt_repaired_unreviewed", False)
             }
         }
     )
@@ -17896,6 +17976,8 @@ async def compress_pdf(data: dict, current_user: User = Depends(get_current_user
 class WfmMatchingRequest(BaseModel):
     project: str
     report_numbers: List[str]
+    date_from: Optional[str] = None   # أول تاريخ في ملف WFM (YYYY-MM-DD)
+    date_to: Optional[str] = None     # آخر تاريخ في ملف WFM (YYYY-MM-DD)
 
 @api_router.post("/wfm_matching/check")
 async def check_wfm_reports(req: WfmMatchingRequest, current_user: User = Depends(get_current_user)):
@@ -17918,9 +18000,38 @@ async def check_wfm_reports(req: WfmMatchingRequest, current_user: User = Depend
         
         variations_map[normalized] = clean_num
 
-    query = {}
+    # ========== بناء الاستعلام مع فلترة التاريخ الذكية ==========
+    query = {"is_deleted": {"$ne": True}}
     if req.project and req.project != "الكل":
         query["project"] = req.project
+
+    # فلترة حسب نطاق تواريخ ملف WFM إذا تم إرسالها
+    date_label = None  # تسمية الفترة للعرض في الإحصائيات
+    if req.date_from and req.date_to:
+        from datetime import datetime as dt, timedelta
+        try:
+            date_from_obj = dt.fromisoformat(req.date_from)
+            date_to_obj = dt.fromisoformat(req.date_to)
+            next_day = date_to_obj + timedelta(days=1)
+            
+            # دعم string وdatetime في MongoDB
+            query["$or"] = [
+                {"created_at": {"$gte": f"{req.date_from}T00:00:00", "$lt": next_day.strftime("%Y-%m-%dT00:00:00")}},
+                {"created_at": {"$gte": date_from_obj, "$lt": next_day}}
+            ]
+            
+            # بناء تسمية الفترة (مثال: يونيو 2026 أو 01/06 - 30/06/2026)
+            ARABIC_MONTHS = {
+                1: "يناير", 2: "فبراير", 3: "مارس", 4: "أبريل",
+                5: "مايو", 6: "يونيو", 7: "يوليو", 8: "أغسطس",
+                9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
+            }
+            if date_from_obj.month == date_to_obj.month and date_from_obj.year == date_to_obj.year:
+                date_label = f"{ARABIC_MONTHS[date_from_obj.month]} {date_from_obj.year}"
+            else:
+                date_label = f"{date_from_obj.strftime('%d/%m/%Y')} - {date_to_obj.strftime('%d/%m/%Y')}"
+        except Exception as e:
+            print(f"WFM date filter error: {e}")
 
     project_reports = await db.reports.find(query, {"report_number": 1, "governorate": 1, "contractor": 1, "created_at": 1}).to_list(None)
     
@@ -17951,7 +18062,8 @@ async def check_wfm_reports(req: WfmMatchingRequest, current_user: User = Depend
     return {
         "matched": list(matched_originals),
         "platform_missing": platform_missing,
-        "platform_total": len(project_reports)
+        "platform_total": len(project_reports),
+        "date_label": date_label  # تسمية الفترة الزمنية للعرض في الإحصائيات
     }
 
 
@@ -18102,6 +18214,7 @@ async def process_update_reports(
         receive_date_col = next((headers[h] for h in headers if "استلام" in h or "استلم" in h), None)
         start_date_col = next((headers[h] for h in headers if "مباشرة" in h or "باشر" in h), None)
         close_date_col = next((headers[h] for h in headers if "إغلاق" in h or "اغلاق" in h or "اغلق" in h), None)
+        license_num_col = next((headers[h] for h in headers if "رقم الرخصة" in h or "رقم رخصة" in h or ("رخصة" in h and "اسفلت" not in h and "أسفلت" not in h)), None)
 
         date_cols_indices = set([idx for h, idx in headers.items() if "تاريخ" in str(h) or "date" in str(h).lower() or "وقت" in str(h)])
         if receive_date_col: date_cols_indices.add(receive_date_col)
@@ -18230,6 +18343,22 @@ async def process_update_reports(
                         db_start = db_rep.get("start_date", "")
                         if db_start and not excel_start_str:
                             ws.cell(row=row, column=start_date_col).value = format_dt_obj(db_start)
+
+                    if report_num_col:
+                        excel_rep_str = str(ws.cell(row=row, column=report_num_col).value).strip() if ws.cell(row=row, column=report_num_col).value is not None else ""
+                        db_rep_str = str(db_rep.get("report_number", "")).strip()
+                        if db_rep_str and excel_rep_str != db_rep_str:
+                            ws.cell(row=row, column=report_num_col).value = db_rep_str
+                            changed = True
+                            changed_fields.append({"field": "رقم البلاغ", "old": excel_rep_str, "new": db_rep_str})
+
+                    if license_num_col:
+                        excel_lic_str = str(ws.cell(row=row, column=license_num_col).value).strip() if ws.cell(row=row, column=license_num_col).value is not None else ""
+                        db_lic_str = str(db_rep.get("license_number", "")).strip()
+                        if db_lic_str and excel_lic_str != db_lic_str:
+                            ws.cell(row=row, column=license_num_col).value = db_lic_str
+                            changed = True
+                            changed_fields.append({"field": "رقم الرخصة", "old": excel_lic_str, "new": db_lic_str})
 
                     if depth_col:
                         db_depth = db_rep.get("depth_meters", "")
@@ -18777,6 +18906,21 @@ async def get_location_duplicates(
 
         # صلاحيات المستخدم
         if current_user.role != "admin":
+            allowed_projects = list(set(get_projects_with_permission(current_user, "performance_indicators")) |
+                                    set(get_projects_with_permission(current_user, "reports_view")) |
+                                    set(get_projects_with_permission(current_user, "reports_review")) |
+                                    set(get_projects_with_permission(current_user, "reports_add")))
+            if hasattr(current_user, 'project_permissions') and current_user.project_permissions:
+                allowed_projects = list(set(allowed_projects) | set(current_user.project_permissions.keys()))
+                
+            if allowed_projects and "project" not in query_filter:
+                proj_clauses = [get_flexible_project_query(p) for p in allowed_projects if get_flexible_project_query(p)]
+                if proj_clauses:
+                    if len(proj_clauses) == 1:
+                        query_filter["project"] = proj_clauses[0]
+                    else:
+                        query_filter["$or"] = [{"project": pq} for pq in proj_clauses]
+
             user_govs = current_user.governorates
             if user_govs:
                 query_filter["governorate"] = {"$in": user_govs}
@@ -18968,6 +19112,22 @@ async def get_performance_summary(
                 pass
 
         if current_user.role != "admin":
+            allowed_projects = list(set(get_projects_with_permission(current_user, "performance_indicators")) |
+                                    set(get_projects_with_permission(current_user, "reports_view")) |
+                                    set(get_projects_with_permission(current_user, "reports_review")) |
+                                    set(get_projects_with_permission(current_user, "reports_add")))
+            if hasattr(current_user, 'project_permissions') and current_user.project_permissions:
+                allowed_projects = list(set(allowed_projects) | set(current_user.project_permissions.keys()))
+                
+            if allowed_projects:
+                if "project" not in query_filter:
+                    proj_clauses = [get_flexible_project_query(p) for p in allowed_projects if get_flexible_project_query(p)]
+                    if proj_clauses:
+                        if len(proj_clauses) == 1:
+                            query_filter["project"] = proj_clauses[0]
+                        else:
+                            query_filter["$or"] = [{"project": pq} for pq in proj_clauses]
+
             user_govs = current_user.governorates
             if user_govs:
                 query_filter["governorate"] = {"$in": user_govs}
@@ -19237,24 +19397,32 @@ async def ai_image_audit_endpoint(
         mime = file.content_type or "image/jpeg"
 
         requested_language = "باللغة العربية" if lang == "ar" else "in English"
-        prompt = f"""قم بدور خبير عالمي وشرس جداً في الأدلة الجنائية الرقمية وتحليل الصور (Image Forensics).
-هناك من يحاول التلاعب بصور تقارير المقاولات باستخدام الذكاء الاصطناعي أو الفوتوشوب لإخفاء مخالفات. مهمتك كشفهم!
-ركز بشدة على ما يلي:
-1. "الأسفلت المزيف": ابحث عن رقع أسفلت (Asphalt Patches) تبدو مثالية جداً، مقصوصة بخطوط مستقيمة غير طبيعية، أو تبدو وكأنها "ملصقة" (Pasted/Floating) فوق الحفرية ولا تندمج طبيعياً مع التراب أو الشارع حولها. هذا تلاعب ذكاء اصطناعي!
-2. "المسح والإخفاء": ابحث عن بقع مموهة (Smudged/Blurred) أو أجزاء مكررة في الخلفية تدل على أنه تم مسح سيارة أو معدة من الموقع باستخدام الذكاء الاصطناعي (Generative Fill/Magic Eraser).
-3. "الإضافات الخارجية": نصوص بيضاء، أرقام بلاغات، أو إحداثيات ملصقة فوق الصورة.
+        prompt = f"""قم بدور خبير عالمي ومهندس ميداني محترف في الأدلة الجنائية الرقمية وتحليل صور المقاولات (Image Forensics).
+مهمتك الأساسية هي كشف التلاعب الحقيقي (الفوتوشوب أو الذكاء الاصطناعي) مع تجنب الإنذارات الكاذبة (False Positives) الناتجة عن فيزياء التصوير.
+ركز بشدة وبذكاء بشري على ما يلي:
+
+1. "قاعدة الإضاءة الليلية والدهان العاكس (مهم جداً!)": 
+إذا كانت الصورة ملتقطة ليلاً، احذر من الخداع البصري! دهانات الطرق (Thermoplastic) تعكس الضوء بقوة نحو الكاميرا مما يؤدي إلى (Overexposure) واختفاء ملمس الأسفلت. **يمنع منعاً باتاً اعتبار هذا تلاعباً رقمياً!** بل يجب تطبيق "قاعدة الشك الإيجابي" واعتبار الصورة حقيقية.
+
+2. "الأسفلت المزيف": ابحث عن رقع أسفلت مقصوصة بخطوط لا تتوافق مع منظور الشارع، أو تبدو "ملصقة" ولا تندمج طبيعياً.
+
+3. "المسح والإخفاء": ابحث عن بقع مموهة (Smudged) أو تشوهات لإخفاء معدات أو سيارات.
+
+4. "برامج التوثيق (Timestamp)": نصوص الإحداثيات والوقت والتاريخ (Timestamp Camera) هي توثيق نظامي، **ويمنع منعاً باتاً** جعل (is_manipulated = true) بسببها.
+
+5. "قاعدة الشك الإيجابي للصور الليلية": إذا كانت الصورة ليلية بأي شكل من الأشكال، **يجب إجباراً** أن تكون النتيجة (is_manipulated = false) و (scene_authentic = true). ويجب أن يكون حقل details هذه الجملة الحرفية فقط: "تمت مطابقة الخطوط الصفراء والخطوط البيضاء المتقطعة للتأكد من أنها سليمة ولم تتم إضافتها عن طريق برامج الفوتوشوب أو برامج الذكاء الاصطناعي الأخرى. الصورة حقيقية ولكن الصورة تم تصويرها بالليل يمكنك ارسال صورة بالنهار لتاكيد صحتها".
 
 أجب بصيغة JSON فقط، {requested_language}، بالهيكل التالي:
 {{
-  "is_manipulated": true/false, // True إذا تم اكتشاف فوتوشوب، توليد أسفلت بالذكاء الاصطناعي، مسح معدات، أو إضافة نصوص
-  "scene_authentic": true/false, // False إذا كان هناك أي لعب في الأسفلت أو الحفرية أو مسح للمعدات. True فقط إذا كانت 100% طبيعية.
-  "software_used": "اسم التقنية المتوقعة (مثل Generative AI Asphalt, AI Eraser, Photoshop)",
+  "is_manipulated": false, // اجعلها دائماً false إذا كانت الصورة ليلية، أو إذا كان التعديل الوحيد هو نصوص Timestamp.
+  "scene_authentic": true, // اجعلها دائماً true إذا كانت الصورة ليلية.
+  "software_used": "اسم التقنية المتوقعة (مثل Timestamp Camera لإضافة النصوص، أو None)",
   "modifications": [
-    "قائمة بالأماكن التي تم تعديلها (مثل: إضافة مربع نص، تعديل بالفوتوشوب، أو توليد أجزاء بالذكاء الاصطناعي)"
+    "قائمة بالتعديلات، مثل (إضافة نصوص للإحداثيات عبر برنامج Timestamp) أو (لا يوجد)"
   ],
-  "details": "يجب أن تبدأ إجابتك بتأكيد صريح وواضح جداً عما إذا كانت الصورة للمشهد الحقيقي حقيقية 100% ولا يوجد فيها تلاعب أو استخدام للذكاء الاصطناعي، ثم وضح بشكل منفصل أي تلاعب تم اكتشافه أو تفاصيل حول استخدام الذكاء الاصطناعي التوليدي فيها."
+  "details": "إذا كانت الصورة ليلية اكتب النص التالي حرفياً: 'تمت مطابقة الخطوط الصفراء والخطوط البيضاء المتقطعة للتأكد من أنها سليمة ولم تتم إضافتها عن طريق برامج الفوتوشوب أو برامج الذكاء الاصطناعي الأخرى. الصورة حقيقية ولكن الصورة تم تصويرها بالليل يمكنك ارسال صورة بالنهار لتاكيد صحتها'. وإذا كانت نهارية اشرح تحليلك الهندسي."
 }}
-تأكد من أن الرد هو JSON صالح فقط بدون أي نصوص إضافية أو علامات Markdown. يجب أن تكون دقيقاً جداً وصادقاً ومقنعاً في تحليلك."""
+تأكد من أن الرد هو JSON صالح فقط بدون أي نصوص إضافية أو علامات Markdown. التزم بالقواعد الصارمة أعلاه."""
 
         response = model.generate_content([
             {"mime_type": mime, "data": img_b64},
